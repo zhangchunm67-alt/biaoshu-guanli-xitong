@@ -156,6 +156,18 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn('旧版校验提示', shown['warnings'])
         self.assertEqual('待确认', view['status'])
 
+    def test_write_responses_already_include_automatic_matches(self):
+        self.profile(name='介绍一')
+        self.profile(name='介绍二')
+        p = self.profile_project()
+        row = next(m for m in p['mappings'] if m['category_id'] == 'company_profile')
+        # Several valid versions: the write itself asks for a manual choice,
+        # so a later step does not change a row the user just reviewed.
+        self.assertEqual(('fill', 'blocked', []), (row['action'], row['status'], row['material_ids']))
+        saved, _ = self.request('PATCH', '/api/projects/' + p['id'] + '/mappings',
+                                {'mappings': [dict(m, confirmed=m['status'] != 'blocked') for m in p['mappings']]})
+        self.assertEqual(saved, self.request('GET', '/api/projects/' + p['id'])[0])
+
     def test_synchronous_export_does_not_block_other_requests(self):
         import engine
         from unittest.mock import patch

@@ -873,6 +873,7 @@ class Store(SpecialLibrary):
                 original.write_bytes(source_raw)
                 project['template_source_storage'] = str(original.relative_to(self.root))
             self.scan(project)
+            self.sync_material_matches(project)
             self.put('project', project)
             self.db.commit()
         except Exception:
@@ -884,7 +885,7 @@ class Store(SpecialLibrary):
         return self.public_project(project)
 
     def rescan(self, key):
-        value = self.scan(self.require('project', key))
+        value = self.sync_material_matches(self.scan(self.require('project', key)))
         self.put('project', value)
         self.db.commit()
         return self.public_project(value)
@@ -937,6 +938,8 @@ class Store(SpecialLibrary):
             if requested.get(row['id']) and row.get('status') == 'blocked':
                 raise ValueError('该栏目尚不能确认：' + '；'.join(row.get('issues', [])))
         project['mappings'] = validated
+        # Apply automatic matches now, so the saved review is what later steps see.
+        project = self.sync_material_matches(project)
         project['updated_at'] = now()
         project['status'] = '已确认' if self.project_reviewed(project) else '待确认'
         self.put('project', project)
