@@ -1,0 +1,15 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+const source=fs.readFileSync(require('node:path').join(__dirname,'../static/app.js'),'utf8');
+const code=source.slice(source.indexOf('function exportRemaining'),source.indexOf('function paintExportTasks'));
+const ctx={esc:x=>String(x??'')};vm.createContext(ctx);vm.runInContext(code,ctx);
+assert.match(ctx.exportRemaining({status:'running',remaining_seconds:35}),/预计还需约 35 秒/);
+assert.match(ctx.exportRemaining({status:'running',remaining_seconds:61}),/1 分钟/);
+assert.match(ctx.exportRemaining({status:'queued'}),/排队中/);
+assert.match(ctx.exportRemaining({status:'running',remaining_seconds:null}),/重新估算/);
+assert.equal(ctx.exportRemaining({status:'completed'}),'');
+assert.match(ctx.exportTaskContent({status:'running',progress:20,remaining_seconds:10}),/后台运行/);
+assert.doesNotMatch(ctx.exportTaskContent({status:'running',progress:20,remaining_seconds:10}),/已用/);
+assert.match(ctx.exportTaskContent({status:'completed',progress:100,result:{download_url:'/file',report_url:'/report'}}),/下载 Word 文件/);
+console.log('PASS: remaining-time estimates, queued/completed states, background copy and download links');

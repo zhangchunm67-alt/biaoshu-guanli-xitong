@@ -1,0 +1,13 @@
+{
+  "name": "tengbao-local-bid-manager",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local bid material manager and guarded official credit-page capture",
+  "scripts": {
+    "test:credit": "node --test tests/test_credit_capture.cjs",
+    "test:workflow": "node tests/test_project_flow.cjs"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

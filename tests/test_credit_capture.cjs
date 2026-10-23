@@ -1,0 +1,16 @@
+'use strict';
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const {SOURCES,classify,parseArgs,exactSource}=require('../scripts/credit_capture.cjs');
+const source=SOURCES[1],subject='北京腾宝科技有限公司';
+const base={url:source.url,http_status:200,body:'查询结果',submitted:true,query_value:subject,challenge:false,result_scope_verified:true,result_transition_verified:true,result_text:'查询结果\n未查询到相关记录',result_rows:[]};
+test('CAPTCHA overrides even apparent empty results',()=>{const r=classify({...base,challenge:true},subject,source);assert.equal(r.status,'blocked');assert.equal(r.query_completed,false);});
+test('HTTP denial is not no records',()=>{assert.equal(classify({...base,http_status:403},subject,source).status,'blocked');assert.equal(classify({...base,http_status:412},subject,source).status,'blocked');});
+test('empty table or generic heading is unverified',()=>{assert.equal(classify({...base,result_text:'查询结果'},subject,source).status,'unverified');assert.equal(classify({...base,result_text:''},subject,source).status,'unverified');});
+test('stale pre-query zero results never pass',()=>{assert.equal(classify({...base,result_transition_verified:false},subject,source).status,'unverified');});
+test('wrong subject and unsubmitted query cannot pass',()=>{assert.equal(classify({...base,query_value:'另一家公司'},subject,source).status,'unverified');assert.equal(classify({...base,submitted:false},subject,source).status,'unverified');});
+test('only explicit scoped zero result is accepted before screenshot verification',()=>{const r=classify(base,subject,source);assert.equal(r.status,'no_records');assert.equal(r.result_verified,true);assert.equal(r.screenshot_verified,false);assert.equal(classify({...base,result_scope_verified:false},subject,source).status,'unverified');});
+test('matching results are not clean records and contradictions fail closed',()=>{assert.equal(classify({...base,result_text:'查询结果\n共1条记录',result_rows:[subject+' 处罚信息']},subject,source).status,'records_found');assert.equal(classify({...base,result_rows:[subject+' 处罚信息']},subject,source).status,'unverified');});
+test('redirected pages including another official path cannot pass',()=>{assert.equal(exactSource(source.url+'?x=1',source),true);assert.equal(exactSource('https://www.creditchina.gov.cn/',source),false);assert.equal(classify({...base,url:'https://example.com/'},subject,source).status,'unverified');});
+test('court requires all provinces and a validated result scope',()=>{const court=SOURCES[0];assert.equal(classify({...base,url:court.url,province:'北京'},subject,court).status,'unverified');});
+test('CLI refuses unknown URLs, missing values and relative output',()=>{assert.throws(()=>parseArgs(['--subject',subject,'--url','https://example.com']));assert.throws(()=>parseArgs(['--subject',subject,'--output-dir','relative']));assert.equal(parseArgs(['--subject',subject,'--output-dir','/tmp/credit-test']).subject,subject);});
