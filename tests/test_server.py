@@ -101,26 +101,89 @@ class ServerTests(unittest.TestCase):
         self.assertEqual([chosen], result['material_ids'])
         self.assertTrue(result['confirmed'])
 
+    def restart_migration(self):
+        # Rule upgrades run once at startup; reading a project never writes.
+        with self.httpd.store.lock:
+            self.httpd.store.migrate_projects()
+
     def test_legacy_missing_recovers_and_ambiguous_versions_require_selection(self):
         p = self.profile_project()
         material = self.profile()
         stored = self.httpd.store.require('project', p['id'])
         row = next(m for m in stored['mappings'] if m['category_id'] == 'company_profile')
         row.update(action='missing', material_ids=[], confirmed=True)
+        stored.pop('sync_version', None)  # A project saved by an earlier version.
         self.httpd.store.put('project', stored)
         self.httpd.store.db.commit()
+        self.restart_migration()
         updated, _ = self.request('GET', '/api/projects/' + p['id'])
         result = next(m for m in updated['mappings'] if m['id'] == row['id'])
         self.assertEqual([material['id']], result['material_ids'])
         self.assertFalse(result['confirmed'])
         self.profile(name='另一版本')
         row.update(action='missing', material_ids=[], confirmed=True)
+        stored.pop('sync_version', None)  # A project saved by an earlier version.
         self.httpd.store.put('project', stored)
         self.httpd.store.db.commit()
+        self.restart_migration()
         updated, _ = self.request('GET', '/api/projects/' + p['id'])
         result = next(m for m in updated['mappings'] if m['id'] == row['id'])
         self.assertEqual(('fill', 'blocked', False), (result['action'], result['status'], result['confirmed']))
         self.assertEqual([], result['material_ids'])
+
+    def stored_rows(self):
+        return self.httpd.store.db.execute('SELECT kind, id, payload FROM objects ORDER BY kind, id').fetchall()
+
+    def test_reads_never_write_but_show_rechecked_confirmation(self):
+        p = self.profile_project()
+        material = self.profile()
+        row = next(m for m in p['mappings'] if m['category_id'] == 'company_profile')
+        self.request('PATCH', '/api/projects/' + p['id'] + '/mappings',
+                     {'mappings': [dict(row, action='fill', material_ids=[material['id']], confirmed=True)]})
+        # A rule or date change makes the stored check stale without any write.
+        stored = self.httpd.store.require('project', p['id'])
+        target = next(m for m in stored['mappings'] if m['id'] == row['id'])
+        target['warnings'] = ['旧版校验提示']
+        self.httpd.store.put('project', stored)
+        self.httpd.store.db.commit()
+        before = self.stored_rows()
+        for path in ('/api/bootstrap', '/api/projects/' + p['id']):
+            self.request('GET', path)
+        self.assertEqual(before, self.stored_rows())
+        view, _ = self.request('GET', '/api/projects/' + p['id'])
+        shown = next(m for m in view['mappings'] if m['id'] == row['id'])
+        self.assertFalse(shown['confirmed'])
+        self.assertNotIn('旧版校验提示', shown['warnings'])
+        self.assertEqual('待确认', view['status'])
+
+    def test_synchronous_export_does_not_block_other_requests(self):
+        import engine
+        from unittest.mock import patch
+        p = self.profile_project()
+        rows = [dict(m, action='skip', confirmed=True) for m in p['mappings']]
+        self.request('PATCH', '/api/projects/' + p['id'] + '/mappings', {'mappings': rows})
+        self.request('PATCH', '/api/projects/' + p['id'] + '/special-categories',
+                     {'category_ids': [], 'no_special_materials': True})
+        entered, release, result = threading.Event(), threading.Event(), {}
+        original = engine.export_document
+        def slow(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+            return original(*args, **kwargs)
+        def run():
+            result['export'] = self.request('POST', '/api/projects/' + p['id'] + '/export', {'mode': 'draft'})[0]
+        with patch('engine.export_document', side_effect=slow):
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            # Previously the whole export held the store lock and this timed out.
+            state, _ = self.request('GET', '/api/bootstrap')
+            self.assertEqual(1, len(state['projects']))
+            release.set()
+            worker.join(15)
+        self.assertEqual('draft', result['export']['mode'])
+        exported, _ = self.request('GET', '/api/projects/' + p['id'])
+        self.assertEqual('已导出', exported['status'])
 
     def test_invalid_material_not_automatically_selected_and_append_recovers(self):
         p = self.profile_project()

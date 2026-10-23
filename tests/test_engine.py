@@ -43,6 +43,25 @@ class EngineTests(unittest.TestCase):
         value.update(updates)
         return value
 
+    def test_image_check_decodes_each_file_version_once(self):
+        from unittest.mock import patch
+        path = self.root / "page.png"
+        Image.new("RGB", (30, 20), "white").save(path)
+        files = [dict(id="f", name="page.png", path=str(path), rotation=0)]
+        material = self.material(mode="page", files=files)
+        heading = {"id": "h", "title": "公司介绍", "category_ids": ["company_profile"]}
+        row = dict(id="r", category_id="company_profile", locator_id="h", action="fill",
+                   material_ids=["material"])
+        with patch("engine.Image.open", wraps=Image.open) as opened:
+            for _ in range(5):
+                checked = engine.validate_mappings([row], [material], [heading], self.categories("company_profile"))
+                self.assertEqual("ready", checked[0]["status"], checked[0]["issues"])
+            self.assertEqual(1, opened.call_count)
+            path.write_bytes(b"not an image")  # A changed file is checked again.
+            checked = engine.validate_mappings([row], [material], [heading], self.categories("company_profile"))
+            self.assertEqual("blocked", checked[0]["status"])
+            self.assertEqual(2, opened.call_count)
+
     def scan(self, categories, materials):
         return engine.scan_document(self.template, categories, materials)
 

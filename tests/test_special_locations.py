@@ -157,7 +157,8 @@ class SpecialLocationTests(unittest.TestCase):
         rows['I01'].pop('location_match', None)
         legacy.pop('special_locator_version')
         self.store.put('project', legacy)
-        upgraded = self.store.public_project(legacy)
+        self.store.migrate_project(legacy)
+        upgraded = self.store.public_project(self.store.require('project', p['id']))
         rows = {r['category_id']: r for r in upgraded['mappings']}
         self.assertEqual('同类业绩汇总表', rows['I01']['title'])
         self.assertTrue(rows['I01']['locator_id'])

@@ -44,6 +44,8 @@ MAX_DOCX = 30 * 1024 * 1024
 MAX_PIXELS = 40_000_000
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 IMAGE_FORMATS = {'PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF'}
+# Bump when stored mappings need a one-time re-validation after a rule change.
+MAPPING_SYNC_VERSION = 1
 
 
 def now():
@@ -199,6 +201,7 @@ class Store(SpecialLibrary):
             self.credit = CreditService(self)
             self.location_preview = LocationPreview()
             self.migrate_special()
+            self.migrate_projects()
             self.export_jobs = ExportJobs(self)
 
     def close(self):
@@ -403,36 +406,104 @@ class Store(SpecialLibrary):
         self.put('project', project)
         return project
 
-    def public_project(self, project):
+    @staticmethod
+    def sync_version():
+        import engine
+        return [engine.COMMON_LOCATOR_VERSION, engine.SPECIAL_LOCATOR_VERSION, MAPPING_SYNC_VERSION]
+
+    def migrate_project(self, project):
+        """Upgrade one stored project to the current rules; a no-op once stamped."""
+        import engine
+        current = (project.get('sync_version') == self.sync_version()
+                   and project.get('common_locator_version') == engine.COMMON_LOCATOR_VERSION
+                   and (not project.get('special_selection_confirmed')
+                        or project.get('special_locator_version') == engine.SPECIAL_LOCATOR_VERSION))
+        if current:
+            return project
         project = self.sync_common_locations(project)
         project = self.sync_special_locations(project)
         project = self.sync_material_matches(project)
-        self.db.commit()
+        project['sync_version'] = self.sync_version()
+        self.put('project', project)
+        return project
+
+    def migrate_projects(self):
+        """Run rule upgrades at startup so that reading a project never writes."""
+        for project in self.all('project'):
+            try:
+                self.migrate_project(project)
+                self.db.commit()
+            except Exception:
+                # A damaged template must not stop the service; the project keeps
+                # its stored state and is retried on the next start.
+                self.db.rollback()
+
+    def read_context(self):
+        """Shared rows for rendering several projects in one request."""
+        materials, categories = self.all('material'), self.all('category')
+        special = {c['id'] for c in categories if c['layer'] == 'special'}
+        # Special libraries are large; only materials a project selected can be validated.
+        selected = {mid for project in self.all('project') for row in project['mappings']
+                    for mid in row.get('material_ids', [])}
+        files = {f['id']: f for f in self.all('file')}
+        internal = {}
+        for material in copy.deepcopy(materials):
+            if material.get('category_id') in special and material['id'] not in selected:
+                continue
+            material['files'] = [copy.deepcopy(files[fid]) if fid in files else self.require('file', fid)
+                                 for fid in material.pop('file_ids', [])]
+            for f in material['files']:
+                f['path'] = str(self.path(f['storage']))
+            internal[material['id']] = material
+        return {'materials': materials, 'internal': internal, 'categories': categories,
+                'industries': self.all('industry'), 'exports': self.all('export')}
+
+    def public_project(self, project, context=None):
+        """Read-only view: current validation is shown, nothing is persisted."""
+        import engine
+        context = context or self.read_context()
+        categories = context['categories']
+        by_category = {c['id']: c for c in categories}
+        special_ids = set(project.get('special_category_ids', []))
+        selected_ids = {mid for row in project['mappings'] for mid in row.get('material_ids', [])}
+        materials = [m for m in context['internal'].values()
+                     if (by_category.get(m.get('category_id')) or {}).get('layer') != 'special'
+                     or m['id'] in selected_ids]
+        matching = [c for c in categories if c['layer'] == 'common' or c['id'] in special_ids]
         value = copy.deepcopy(project)
+        rows = engine.validate_mappings(value['mappings'], materials, value['headings'], matching)
+        for old, row in zip(project['mappings'], rows):
+            # Same rule as sync_material_matches: a changed check needs a new review.
+            if any(old.get(k) != row.get(k) for k in ('action', 'material_ids', 'status', 'issues', 'warnings')):
+                row['confirmed'] = False
+        value['mappings'] = rows
+        if project.get('status') != '已导出' or rows != project['mappings']:
+            value['status'] = '已确认' if self.project_reviewed(value) else '待确认'
         value.pop('template_storage', None)
         value.pop('template_source_storage', None)
         if project.get('template_import_kind') == 'converted_doc':
             value['warnings'] = ['此模板已从旧版 .doc 转换；导出后请在 Word 中核对表格、分页和目录。', *value.get('warnings', [])]
         value.setdefault('special_category_ids', [])
         value.setdefault('special_selection_confirmed', False)
-        selected_categories = set(value['special_category_ids'])
-        industry_ids = {c.get('industry_id') for c in self.all('category') if c['id'] in selected_categories}
-        value['special_industry_ids'] = [i['id'] for i in self.all('industry') if i['id'] in industry_ids]
+        industry_ids = {c.get('industry_id') for c in categories if c['id'] in special_ids}
+        value['special_industry_ids'] = [i['id'] for i in context['industries'] if i['id'] in industry_ids]
         selected = {mid for row in value['mappings'] if row.get('layer') == 'special'
                     for mid in row.get('material_ids', [])}
-        value['selected_special_materials'] = [self.public_material(m) for m in self.all('material')
+        value['selected_special_materials'] = [self.public_material(m) for m in context['materials']
                                                if m['id'] in selected]
-        value['exports'] = [v for v in self.all('export') if v['project_id'] == project['id']]
+        value['exports'] = [v for v in context['exports'] if v['project_id'] == project['id']]
         return value
 
     def bootstrap(self):
         categories = sorted(self.all('category'), key=lambda c: c['sort_order'])
-        materials = [self.public_material(v) for v in self.all('material') if not self.is_special(v)]
-        projects = [self.public_project(v) for v in reversed(self.all('project'))]
-        exports = list(reversed(self.all('export')))
+        context = self.read_context()
+        layers = {c['id']: c['layer'] for c in context['categories']}
+        materials = [self.public_material(v) for v in context['materials'] if layers.get(v.get('category_id')) != 'special']
+        projects = [self.public_project(v, context) for v in reversed(self.all('project'))]
+        exports = list(reversed(context['exports']))
         source = self.get('meta', 'source_status') or {'state': 'not_imported', 'message': '此数据目录未导入示例材料'}
         source.pop('id', None)
-        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': self.all('industry'), 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(self.is_special(m) and not m.get('archived') for m in self.all('material')), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': len(exports), 'source_status': source}}
+        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': context['industries'], 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(layers.get(m.get('category_id')) == 'special' and not m.get('archived') for m in context['materials']), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': len(exports), 'source_status': source}}
 
     def create_files(self, material_id, files, seed=False):
         if not isinstance(files, list) or len(files) > 100:
@@ -677,6 +748,7 @@ class Store(SpecialLibrary):
         project.update(result)
         project['special_locator_version'] = engine.SPECIAL_LOCATOR_VERSION
         project['common_locator_version'] = engine.COMMON_LOCATOR_VERSION
+        project['sync_version'] = self.sync_version()
         for row in project['mappings']:
             row['confirmed'] = False
         project['updated_at'] = now()
@@ -831,6 +903,9 @@ class Store(SpecialLibrary):
                 raise ValueError('包含未知或重复栏目，请重新加载项目')
             seen.add(update['id'])
             current = by_id[update['id']]
+            if update.get('confirmed') is True:
+                # This save is the review the retired text-generation settings required.
+                current.pop('authorization', None)
             if 'locator_id' in update and update['locator_id'] != current.get('locator_id'):
                 current['location_match'] = {'status': 'manual', 'reason': '位置已由人工调整', 'candidates': []}
             if any(field in update and update[field] != current.get(field) for field in ('action', 'material_ids')):
@@ -895,7 +970,11 @@ class Store(SpecialLibrary):
         import engine
         if snapshot is None:
             with self.lock:
-                snapshot = self.prepare_export(key, body)
+                try:
+                    snapshot = self.prepare_export(key, body)
+                except Exception:
+                    self.db.rollback()
+                    raise
         project, materials, categories, mappings, mode = snapshot
         template = self.path(project['template_storage'])
         key_export = uid('export')
@@ -1080,8 +1159,6 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(store.select_special_categories(bits[2], body))
                 if method == 'POST' and bits[3] == 'export-jobs':
                     return self.json_response(store.export_jobs.start(bits[2], body), 202)
-                if method == 'POST' and bits[3] == 'export':
-                    return self.json_response(store.export(bits[2], body), 201)
         if method == 'GET' and not path.startswith('/api/'):
             allowed = {'/': ('index.html', 'text/html; charset=utf-8'), '/index.html': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8')}
             target = allowed.get(path)
@@ -1095,6 +1172,18 @@ class Handler(BaseHTTPRequestHandler):
         preview_route = re.fullmatch(
             r'/api/projects/([^/]+)/location-preview(?:/([a-f0-9]{64})/pages/([0-9]+))?',
             urlsplit(self.path).path)
+        export_route = re.fullmatch(r'/api/projects/([^/]+)/export', urlsplit(self.path).path)
+        if export_route and self.command == 'POST':
+            # Document assembly takes the store lock only to snapshot and to record
+            # the result, so other requests keep working during a long export.
+            try:
+                self.validate_origin(True)
+                body = self.body()
+                return self.json_response(self.server.store.export(export_route[1], body), 201)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:
+                return self.request_error(exc)
         if preview_route:
             # Rendering must never hold the database lock or freeze other app requests.
             try:

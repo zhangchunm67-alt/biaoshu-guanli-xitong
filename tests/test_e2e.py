@@ -15,6 +15,9 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 APP = Path(__file__).resolve().parents[1]
+# The seed workflow reads the original delivery package next to the code.
+SOURCE_DATA = all(path.exists() for path in (
+    APP.parent / "标书自动填充/示例/材料台账.xlsx", APP.parent / "材料", APP.parent / "填充测试文档.docx"))
 
 
 class FullWorkflow(unittest.TestCase):
@@ -60,6 +63,7 @@ class FullWorkflow(unittest.TestCase):
             blob = res.read()
             return blob if raw else json.loads(blob)
 
+    @unittest.skipUnless(SOURCE_DATA, "需要父目录中的原始交付材料（台账、材料目录、填充测试文档）")
     def test_seed_confirm_export_repeat_and_persist(self):
         state = self.request("GET", "/api/bootstrap")
         self.assertEqual(10, len([c for c in state["categories"] if c["layer"]=="common"]))

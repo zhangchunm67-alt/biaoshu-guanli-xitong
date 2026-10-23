@@ -160,8 +160,10 @@ class AuthorizationImagesTests(unittest.TestCase):
             row.update(action='fill', material_ids=ids, confirmed=True, note='保留备注',
                        authorization={'enabled': True}, authorization_preview={'body_lines': ['旧正文']})
             locator, mapping_id = row['locator_id'], row['id']
+            raw.pop('sync_version')  # Saved by the earlier text-generation version.
             store.put('project', raw)
             store.db.commit()
+            store.migrate_projects()  # Runs at startup.
             reopened = store.public_project(store.require('project', project['id']))
             migrated = next(r for r in reopened['mappings'] if r['id'] == mapping_id)
             self.assertEqual('ready', migrated['status'], migrated['issues'])

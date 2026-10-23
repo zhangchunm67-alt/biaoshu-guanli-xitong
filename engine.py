@@ -12,6 +12,7 @@ import io
 import os
 import re
 import tempfile
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -43,6 +44,31 @@ _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 SPECIAL_LOCATOR_VERSION = 3
 COMMON_LOCATOR_VERSION = 4
+# Stored images are write-once; decoding each one on every validation made reads
+# scale with projects x rows x candidates x images.
+_IMAGE_CHECKS = {}
+_IMAGE_CHECKS_LOCK = threading.Lock()
+_IMAGE_CHECKS_LIMIT = 20000
+
+
+def _image_readable(path):
+    """Image.verify() once per file version, keyed by path, size and mtime."""
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    with _IMAGE_CHECKS_LOCK:
+        if key in _IMAGE_CHECKS:
+            return _IMAGE_CHECKS[key]
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        result = True
+    except Exception:
+        result = False
+    with _IMAGE_CHECKS_LOCK:
+        if len(_IMAGE_CHECKS) >= _IMAGE_CHECKS_LIMIT:
+            _IMAGE_CHECKS.clear()
+        _IMAGE_CHECKS[key] = result
+    return result
 
 
 def _common_title(text):
@@ -541,8 +567,8 @@ def _check_material(material, category_id, required, heading, special=False):
                 rotation = int(file.get("rotation") or 0)
                 if rotation % 90:
                     raise ValueError("rotation")
-                with Image.open(path) as image:
-                    image.verify()
+                if not _image_readable(path):
+                    raise ValueError("image")
             except Exception:
                 errors.append(f"{name}：图片损坏或旋转值无效（{label}）。")
     else:
