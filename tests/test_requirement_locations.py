@@ -159,6 +159,48 @@ class RequirementLocationTests(unittest.TestCase):
         checked=engine.validate_mappings([r],[m],x['headings'],self.categories)[0]
         self.assertEqual('ready',checked['status'])
 
+    def audit_doc(self):
+        d=Document();d.add_paragraph('第四章 投标文件格式');d.add_paragraph('财务审计报告')
+        d.add_paragraph('提供2023或2024年度经审计的财务报告。')
+        return d
+
+    def audit(self, key, year):
+        return dict(id=key,category_id='audit_report',name=f'{year}年审计报告',subject=engine.EXPECTED_SUBJECT,
+                    mode='text',content='报告',files=[],years=[year],valid_until='长期')
+
+    def test_alternative_audit_years_recommend_the_latest_available(self):
+        cases = [
+            ([('a22',2022),('a23',2023),('a24',2024)], ['a24']),
+            ([('a22',2022),('a23',2023)], ['a23']),      # Newest acceptable year actually held.
+            ([('a24',2024),('b24',2024),('a23',2023)], []),  # Two 2024 versions: manual choice.
+            ([('a22',2022),('a21',2021)], []),            # No acceptable year at all.
+        ]
+        for held, expected in cases:
+            with self.subTest(held=held):
+                r=self.row(self.scan(self.audit_doc(),[self.audit(k,y) for k,y in held]),'audit_report')
+                self.assertEqual(expected,r['material_ids'])
+                if expected:
+                    self.assertEqual(('fill','ready'),(r['action'],r['status']),r['issues'])
+                    self.assertTrue(any('原文接受 2023 或 2024' in w for w in r['warnings']),r['warnings'])
+                else:
+                    self.assertNotEqual('ready',r['status'])
+
+    def test_material_sync_recommends_latest_alternative_year(self):
+        import base64,io
+        raw=io.BytesIO();self.audit_doc().save(raw)
+        for key,year in [('x',2023),('y',2024)]:
+            body={k:v for k,v in self.audit(key,year).items() if k not in {'id','files'}}
+            self.store.material(body)
+        latest=next(m['id'] for m in self.store.all('material') if m['years']==[2024])
+        p=self.store.create_project(dict(name='年度二选一',filename='t.docx',data=base64.b64encode(raw.getvalue()).decode()))
+        self.assertEqual([latest],self.row(p,'audit_report')['material_ids'])
+        # A project saved before the recommendation existed is filled by the sync, too.
+        stored=self.store.require('project',p['id'])
+        row=next(r for r in stored['mappings'] if r['category_id']=='audit_report')
+        row.update(action='missing',material_ids=[],confirmed=False)
+        synced=self.store.sync_material_matches(stored)
+        self.assertEqual([latest],self.row(synced,'audit_report')['material_ids'])
+
     def test_definition_personal_social_and_contract_are_not_corporate_requests(self):
         d=Document()
         for text in ['如无分支机构（具有营业执照及正式员工）的，填写无分支机构。',

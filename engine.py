@@ -446,6 +446,8 @@ def scan_document(template_path, categories, materials, special_category_ids=())
                         row.update(material_ids=[m["id"] for m in candidates], action="fill")
                     else:
                         row["note"] = "存在同年度多个版本，请人工选择材料。"
+                elif len(candidates) > 1 and recommend_by_year_options(row, candidates, headings):
+                    row.update(material_ids=recommend_by_year_options(row, candidates, headings), action="fill")
                 elif len(candidates) > 1:
                     row["note"] = "存在多个可用版本，请人工选择材料。"
             mappings.append(row)
@@ -466,6 +468,35 @@ def _material_years(material):
         except (ValueError, TypeError):
             pass
     return result
+
+
+def year_options(row, headings=()):
+    """Alternative audit years accepted by the tender, e.g. "2023或2024年度"."""
+    if row.get('category_id') != 'audit_report':
+        return []
+    heading = next((h for h in headings if h.get('id') == row.get('locator_id')), None) if row.get('locator_id') else None
+    requirement = (heading or {}).get('requirement') or row.get('requirement') or {}
+    return requirement.get('year_options') or []
+
+
+def recommend_by_year_options(row, candidates, headings=()):
+    """Recommend the latest acceptable year when exactly one material covers it.
+
+    Several versions of that year stay a manual choice; an older year is only
+    used when no candidate covers a newer one.
+    """
+    for option in sorted(year_options(row, headings), key=lambda o: sorted(o, reverse=True), reverse=True):
+        picks = []
+        for year in sorted(option):
+            hits = [m for m in candidates if year in _material_years(m)]
+            if len(hits) > 1:
+                return None
+            if not hits:
+                break
+            picks.append(hits[0]["id"])
+        else:
+            return _unique(picks)
+    return None
 
 
 def _attachment_only(material):
@@ -693,6 +724,9 @@ def validate_mappings(mappings, materials, headings, categories=None):
                 errors.append("缺少要求年度：" + "、".join(map(str, missing_years)) + "。")
             if year_options and not any(set(option) <= covered for option in year_options):
                 errors.append('缺少可接受年度：' + ' 或 '.join('、'.join(map(str, option)) for option in year_options) + '。')
+            elif year_options and covered:
+                warnings.append('原文接受 ' + ' 或 '.join('、'.join(map(str, option)) for option in year_options) +
+                                ' 年度，当前选用 ' + '、'.join(map(str, sorted(covered))) + ' 年度；请核对是否符合本项目要求。')
             row["status"] = "blocked" if errors else "ready"
         elif action == "skip":
             row["status"] = "skipped" if not errors else "blocked"

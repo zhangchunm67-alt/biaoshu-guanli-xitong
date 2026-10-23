@@ -295,6 +295,8 @@ class Store(SpecialLibrary):
                 if all(sum(y in item.get('years', []) for item in candidates) <= 1 for y in years):
                     candidates.sort(key=lambda item: (min(item.get('years') or [9999]), item['id']))
                     ids = [item['id'] for item in candidates]
+            elif len(candidates) > 1:
+                ids = engine.recommend_by_year_options(row, candidates, project['headings']) or []
             if candidates:
                 row.update(action='fill', material_ids=ids)
         rows = engine.validate_mappings(rows, materials, project['headings'], categories)
