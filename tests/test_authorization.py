@@ -144,6 +144,88 @@ class AuthorizationImagesTests(unittest.TestCase):
         row, scan = self.prepare(doc)
         self.assertTrue(any('丙某' in e and '乙某' in e for e in self.checked(row, scan)['issues']))
 
+    def legal_row(self, doc):
+        doc.save(self.source)
+        scan = engine.scan_document(self.source, self.categories, self.materials)
+        rows = [r for r in scan['mappings'] if r['category_id'] == 'legal_identity']
+        self.assertEqual(1, len(rows))
+        return dict(rows[0], action='fill', material_ids=['legal_identity'], confirmed=True), scan
+
+    def certificate(self, body):
+        doc = Document()
+        doc.add_heading('法定代表人身份证明', 1)
+        doc.add_paragraph(body)
+        doc.add_paragraph('附：法定代表人身份证正反面复印件')
+        doc.add_table(rows=1, cols=2).style = 'Table Grid'
+        doc.add_paragraph('投标人：（盖章）')
+        return doc
+
+    def test_agent_named_without_punctuation_is_compared(self):
+        doc = Document()
+        doc.add_heading('法定代表人授权委托书', 1)
+        doc.add_paragraph('本人甲某系北京腾宝科技有限公司的法定代表人，现委托丙某为我方代理人。')
+        row, scan = self.prepare(doc)
+        row['material_ids'] = ['authorization']
+        issues = self.checked(row, scan)['issues']
+        self.assertTrue(any('丙某' in e and '乙某' in e for e in issues), issues)
+
+    def test_legal_representative_id_must_match_certificate_and_authorization(self):
+        row, scan = self.legal_row(self.certificate('兹证明丁某系北京腾宝科技有限公司的法定代表人。'))
+        checked = self.checked(row, scan)
+        self.assertEqual('blocked', checked['status'])
+        self.assertTrue(any('原文法定代表人为丁某' in e and '甲某' in e for e in checked['issues']), checked['issues'])
+        row, scan = self.legal_row(self.certificate('兹证明甲某系北京腾宝科技有限公司的法定代表人。'))
+        self.assertEqual('ready', self.checked(row, scan)['status'])
+        # The legal representative's ID placed in an authorization form uses that form's body.
+        doc = Document()
+        doc.add_heading('法定代表人授权委托书', 1)
+        doc.add_paragraph('本人丁某系北京腾宝科技有限公司的法定代表人，现委托乙某为我方代理人。')
+        row, scan = self.prepare(doc)
+        row['material_ids'] = ['legal_identity']
+        issues = self.checked(row, scan)['issues']
+        self.assertTrue(any('丁某' in e and '甲某' in e for e in issues), issues)
+
+    def test_unnamed_material_warns_and_blank_template_is_not_compared(self):
+        materials = copy.deepcopy(self.materials)
+        materials[0]['name'] = '身份证正反面附件'
+        row, scan = self.legal_row(self.certificate('兹证明丁某系北京腾宝科技有限公司的法定代表人。'))
+        checked = self.checked(row, scan, materials)
+        self.assertEqual('ready', checked['status'], checked['issues'])
+        self.assertTrue(any('未能从材料名称识别证件人员' in w and '丁某' in w for w in checked['warnings']))
+        row, scan = self.legal_row(self.certificate('兹证明（姓名）系（投标人名称）的法定代表人。'))
+        checked = self.checked(row, scan)
+        self.assertEqual('ready', checked['status'], checked['issues'])
+        self.assertFalse(any('请核对是否为本人' in w for w in checked['warnings']))
+
+    def test_store_backfills_names_for_projects_saved_before_the_check(self):
+        import base64
+        from server import Store
+        store = Store(self.root / 'names', seed=False)
+        try:
+            material = self.materials[0]
+            body = {k: v for k, v in material.items() if k not in {'id', 'files'}}
+            body['files'] = [dict(name=f['name'], data=base64.b64encode(Path(f['path']).read_bytes()).decode())
+                             for f in material['files']]
+            mid = store.material(body)['id']
+            self.certificate('兹证明丁某系北京腾宝科技有限公司的法定代表人。').save(self.source)
+            project = store.create_project(dict(name='旧项目', filename='t.docx',
+                                                data=base64.b64encode(self.source.read_bytes()).decode()))
+            raw = store.require('project', project['id'])
+            row = next(r for r in raw['mappings'] if r['category_id'] == 'legal_identity')
+            row.update(action='fill', material_ids=[mid], confirmed=True, status='ready', issues=[])
+            for heading in raw['headings']:
+                heading.pop('legal_text', None)  # Saved before headings carried names.
+            raw.pop('sync_version')
+            store.put('project', raw)
+            store.db.commit()
+            store.migrate_projects()  # Runs at startup.
+            migrated = next(r for r in store.require('project', project['id'])['mappings'] if r['id'] == row['id'])
+            self.assertEqual('blocked', migrated['status'])
+            self.assertFalse(migrated['confirmed'])
+            self.assertTrue(any('丁某' in e for e in migrated['issues']))
+        finally:
+            store.close()
+
     def test_store_migrates_old_project_and_ignores_cached_client_fields(self):
         from server import Store
         store = Store(self.root / 'store', seed=False)

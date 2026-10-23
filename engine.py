@@ -338,12 +338,18 @@ def _inspect(document, categories):
                 owner = max(parents, key=lambda r: r['_path'])
                 for key in ('legal_body_present','authorization_body_present'):
                     record[key] = owner[key]
+                context = '\n'.join(_text(e) for e in owner['_own'])
                 if 'authorization' in record['category_ids']:
-                    record['_authorization_context'] = '\n'.join(_text(e) for e in owner['_own'])
+                    record['_authorization_context'] = context
+                if 'legal_identity' in record['category_ids']:
+                    record['_legal_context'] = context
     import authorization
     for record in records:
         if 'authorization' in record['category_ids']:
             authorization.describe(record)
+        # The certificate or authorization body names the person whose ID belongs here.
+        record['legal_text'] = ((record.get('_legal_context') or '\n'.join(_text(e) for e in record['_own']))[:4000]
+                                if 'legal_identity' in record['category_ids'] else '')
     return records, skipped_toc
 
 
@@ -581,12 +587,18 @@ def _check_material(material, category_id, required, heading, special=False):
             errors.append(f"{name}：身份证附件不能替代证明/授权正文，目标节未识别到相应文书正文。")
         else:
             warnings.append(f"{name}：仅作为身份证附件；原证明/授权正文、人员、日期和签章须单独核对。")
-        if category_id == 'authorization' and heading.get('authorization_text'):
-            import authorization
-            _, original_agent = authorization._names(re.sub(r'\s+', '', heading['authorization_text']))
-            selected_agent = authorization.person(material)
-            if original_agent and selected_agent and original_agent != selected_agent:
-                errors.append(f'原授权正文代理人为{original_agent}，所选证件为{selected_agent}；请核对人员，原文保留。')
+        import authorization
+        if category_id == 'authorization':
+            role, expected = '原授权正文代理人', authorization.agent_name(re.sub(r'\s+', '', heading.get('authorization_text') or ''))
+        else:
+            # A legal-representative ID may also sit inside an authorization form.
+            source = heading.get('legal_text') or heading.get('authorization_text') or ''
+            role, expected = '原文法定代表人', authorization.legal_name(re.sub(r'\s+', '', source))
+        selected = authorization.person(material)
+        if expected and selected and expected != selected:
+            errors.append(f'{role}为{expected}，所选证件为{selected}；请核对人员，原文保留。')
+        elif expected and not selected:
+            warnings.append(f'{name}：{role}为{expected}，未能从材料名称识别证件人员（建议命名为“姓名（法定代表人/委托代理人）身份证”），请核对是否为本人。')
     return errors, warnings
 
 
@@ -688,6 +700,9 @@ def validate_mappings(mappings, materials, headings, categories=None):
         else:
             row["status"] = "missing" if not errors else "blocked"
             errors.append("本栏目待补材料。" if heading else "模板未识别到本栏目位置，需人工核对；初稿将在末尾列出。")
+            available = sum(m.get("category_id") == category_id for m in materials)
+            if heading and available and row.get("auto_match") is not False:
+                warnings.append(f"材料库有 {available} 份本栏目材料未自动选用（可能人员、年度或有效期不符）；可手动选择查看具体原因。")
         if category_id == "audit_report" and not row["required_years"] and not year_options:
             warnings.append("目标审计栏目未注明年度，不默认采用2023/2024年；请按本项目要求核对。")
         if row.get("existing_content"):

@@ -45,7 +45,7 @@ MAX_PIXELS = 40_000_000
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 IMAGE_FORMATS = {'PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF'}
 # Bump when stored mappings need a one-time re-validation after a rule change.
-MAPPING_SYNC_VERSION = 1
+MAPPING_SYNC_VERSION = 2  # 2: headings carry legal_text for ID name checks
 
 
 def now():
@@ -422,10 +422,25 @@ class Store(SpecialLibrary):
             return project
         project = self.sync_common_locations(project)
         project = self.sync_special_locations(project)
+        self.refresh_heading_texts(project)
         project = self.sync_material_matches(project)
         project['sync_version'] = self.sync_version()
         self.put('project', project)
         return project
+
+    def refresh_heading_texts(self, project):
+        """Backfill person text read from the unchanged template; locations stay as they are."""
+        import engine
+        source = self.path(project['template_storage'])
+        if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != project['template_hash']:
+            return
+        scanned = engine.scan_document(source, self.matching_categories(project),
+            self.internal_materials(include_special=True, project=project), project.get('special_category_ids', []))
+        fresh = {h['id']: h for h in scanned['headings']}
+        for heading in project['headings']:
+            if heading['id'] in fresh:
+                for key in ('legal_text', 'authorization_text'):
+                    heading[key] = fresh[heading['id']].get(key, '')
 
     def migrate_projects(self):
         """Run rule upgrades at startup so that reading a project never writes."""
