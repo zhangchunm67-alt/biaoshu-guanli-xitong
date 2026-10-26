@@ -192,6 +192,38 @@ class AuthorizationImagesTests(unittest.TestCase):
                     else:
                         self.assertEqual(('', 'missing'), (image['locator_id'], image['status']))
 
+    def test_review_index_in_format_chapter_ends_at_numbered_response_forms(self):
+        # Anonymized structure of a real framework: the format chapter opens
+        # with a review index before the numbered response forms.
+        lines = ['第三章 评标办法', '形式评审标准', '法定代表人（负责人）授权委托书',
+                 '第六章 投标文件格式', '一、商务文件', '形式评审标准', '法定代表人（负责人）身份证明',
+                 '法定代表人（负责人）授权委托书', '资格评审标准', '营业执照（或其他证明文件）', '同类业绩',
+                 '（一）投标函', '致：招标人。我方已仔细研究招标文件。',
+                 '（二）法定代表人（负责人）身份证明', '法定代表人（负责人）身份证明', '兹证明甲某为本单位法定代表人。',
+                 '（三）法定代表人（负责人）授权委托书', '法定代表人（负责人）授权委托书',
+                 '本授权书声明：现委托乙某办理投标事项。', '日期：',
+                 '附：委托代理人身份证或护照等身份证明文件扫描件（身份证需同时提供正反面）', '（四）结束']
+        doc = Document()
+        paragraphs = [doc.add_paragraph(line) for line in lines]
+        doc.save(self.source)
+        categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],
+                                             layer='special', enabled=True)]
+        scan = engine.scan_document(self.source, categories, self.materials, ['text_template'])
+
+        def locator(index):
+            p = paragraphs[index]._p
+            return 'p:' + '.'.join(map(str, engine._xml_path(p, doc.element.body))) + ':' + engine._digest(p)
+        located = {}
+        for row in scan['mappings']:
+            located.setdefault(row['category_id'], []).append(row['locator_id'])
+        self.assertEqual([locator(11), locator(17)], located['text_template'])
+        self.assertEqual(['at:authorization:' + locator(20)], located['authorization'])
+        self.assertEqual([locator(14)], located['legal_identity'])
+        self.assertFalse({locator(i) for i in (2, 6, 7, 9)} & {l for ls in located.values() for l in ls})
+        image = next(r for r in scan['mappings'] if r['category_id'] == 'authorization')
+        checked = self.checked(dict(image, action='fill', material_ids=['authorization']), scan)
+        self.assertEqual('ready', checked['status'], checked['issues'])
+
     def test_expired_missing_or_text_materials_still_block(self):
         row, scan = self.prepare(self.form())
         for change in [{'valid_until': '2000-01-01'}, {'files': []}, {'mode': 'text', 'content': '正文'}]:

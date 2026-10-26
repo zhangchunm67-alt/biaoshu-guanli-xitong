@@ -14,6 +14,8 @@ _REQUEST = re.compile(r'提供|提交|出具|附[上后：:]?|后附|须附|应�
 _IMAGE = re.compile(r'复印件|扫描件|影印件|电子件|正反面|双面|照片|粘贴|证书|合同.{0,16}(?:证明|关键页)|证明材料')
 _COPY = re.compile(r'后附|附[：:]|附上|须附|应附|需附|粘贴|复印件|扫描件|影印件|电子件')
 _SIGNATURE = re.compile(r'^(?:投标人|供应商|法定代表人|委托代理人|日期|年月日|年\s*月\s*日)')
+_RESPONSE_FORM = re.compile(r'^(?:[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.．])'
+                            r'.{1,40}?(?:函|书|证明|表|方案|声明|承诺|报价|简介|介绍|材料|资料|文件|执照|证书)$')
 _AGENT = r'(?:委托代理人|授权代理人|被授权人|授权代表|代理人|受托人)'
 _ID_DOC = r'(?:身份证(?!号)|护照)'
 _AGENT_ID = re.compile(_AGENT + r'.{0,18}?' + _ID_DOC + r'|' + _ID_DOC + r'.{0,12}' + _AGENT)
@@ -311,13 +313,23 @@ def resolve(document, records, categories, toc_elements=()):
     top = [r for r in records if len(r['_path']) == 1 and r['kind'] != 'placeholder']
     explicit_forms = any(region_title(r['title']) == 'form' for r in top)
     mode = ''
+    form_chapter = False
     regions = {}
     for r in top:
         region = region_title(r['title'])
+        chapter = re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)', compact(r['title']))
         if region:
             mode = region
-        elif re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)',compact(r['title'])):
+            # A review index inside the format chapter does not leave it.
+            if region != 'scoring' or chapter:
+                form_chapter = region == 'form'
+        elif chapter:
             mode = ''
+            form_chapter = False
+        elif mode == 'scoring' and form_chapter and _RESPONSE_FORM.match(compact(r['title'])):
+            # A review index inside the format chapter ends at the first
+            # numbered response form, such as （一）投标函.
+            mode = 'form'
         elif not explicit_forms and _ATTACHMENT.match(compact(r['title'])) and mode != 'contract' and not re.search(r'评分|评审|须知', r['title']):
             mode = 'form'
         regions[r['_path'][0]] = mode

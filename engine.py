@@ -41,8 +41,8 @@ for _category in DEFAULT_CATEGORIES:
 _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
-SPECIAL_LOCATOR_VERSION = 6
-COMMON_LOCATOR_VERSION = 8
+SPECIAL_LOCATOR_VERSION = 7
+COMMON_LOCATOR_VERSION = 9
 
 
 def _common_title(text):
