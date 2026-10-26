@@ -42,7 +42,7 @@ _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 SPECIAL_LOCATOR_VERSION = 5
-COMMON_LOCATOR_VERSION = 6
+COMMON_LOCATOR_VERSION = 7
 
 
 def _common_title(text):
@@ -55,7 +55,7 @@ def _common_title(text):
 def _common_variant(title, category_id):
     target = _common_title(title)
     if category_id == 'tax_social':
-        target = re.sub(r'\d{1,2}月(?:至|到|[-—–~])\d{1,2}月|\d{1,2}月', '', target)
+        target = re.sub(r'\d{1,2}月?(?:至|到|[-—–~～])\d{1,2}月|\d{1,2}月', '', target)
     patterns = {
         'business_license': r'(?:(?:投标人|投标方|供应商|企业法人|企业|公司)的?)?营业执照(?:正副本|正本|副本)?(?:彩色)?(?:复印件|扫描件|影印件)?',
         'company_profile': r'(?:(?:投标人|投标方|供应商)的?)?(?:公司|企业)(?:介绍|简介|概况)',
@@ -402,6 +402,9 @@ def scan_document(template_path, categories, materials, special_category_ids=())
                 row['required_years'] = list(row['requirement'].get('required_years', []))
             if hit and hit.get('location_match') and category.get('layer', 'common') == 'common':
                 row['location_match'] = copy.deepcopy(hit['location_match'])
+            if not hit and category['id'] == 'authorization':
+                row.update(title='被授权人身份证附件', location_match={'status': 'not_found', 'candidates': [],
+                    'reason': '授权委托书正文由文字模板填写；原文未单独标注被授权人身份证附件位置，不插入图片。'})
             if category.get("layer") == "special":
                 row.update(auto_match=False, action="fill",
                            note="", layer="special", location_match=(
@@ -423,7 +426,7 @@ def scan_document(template_path, categories, materials, special_category_ids=())
                 if ids:
                     row.update(material_ids=ids, action='fill')
                 elif candidates:
-                    row['note'] = '材料版本或覆盖范围需要核对，请人工选择材料。'
+                    row['note'] = '存在重叠版本或需按截止日核对缴费期限，请人工选择材料。'
             mappings.append(row)
     mappings = validate_mappings(mappings, materials, headings, enabled)
     return {"headings": headings, "mappings": mappings, "requirements": requirements,

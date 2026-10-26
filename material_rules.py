@@ -16,15 +16,22 @@ def tax_kinds(text):
     return kinds
 
 
+_RANGE = r'(?:至|到|[-—–~～])'
+
+
 def months(text):
     text = re.sub(r'\s+', '', text or '')
     found = set()
-    pattern = r'(20\d{2})年(\d{1,2})月(?:至|到|[-—–~])(?:(20\d{2})年)?(\d{1,2})月'
-    for m in re.finditer(pattern, text):
-        y, a, end_year, b = m.groups()
+
+    def span(y, a, end_year, b):
         start, end = int(y) * 12 + int(a) - 1, int(end_year or y) * 12 + int(b) - 1
         if 1 <= int(a) <= 12 and 1 <= int(b) <= 12 and 0 <= end - start <= 120:
             found.update(range(start, end + 1))
+    for m in re.finditer(r'(20\d{2})年(\d{1,2})月' + _RANGE + r'(?:(20\d{2})年)?(\d{1,2})月', text):
+        span(*m.groups())
+    # 2025年1-6月 shares one year and one trailing 月.
+    for m in re.finditer(r'(20\d{2})年(\d{1,2})' + _RANGE + r'(\d{1,2})月', text):
+        span(m[1], m[2], None, m[3])
     for m in re.finditer(r'(20\d{2})年((?:\d{1,2}[、，,])*\d{1,2})月', text):
         found.update(int(m[1]) * 12 + int(n) - 1 for n in re.split('[、，,]', m[2]) if 1 <= int(n) <= 12)
     return found
@@ -100,7 +107,11 @@ def partial_issue(issue):
 
 
 def automatic_ids(row, candidates, headings, categories):
-    """Only select a unique valid set; overlapping versions remain manual."""
+    """Preselect a unique set, even when it covers the requirement only in part.
+
+    Overlapping versions remain manual; missing years, kinds or months stay
+    visible as issues on the preselected row.
+    """
     import engine
     if not candidates:
         return []
@@ -128,4 +139,5 @@ def automatic_ids(row, candidates, headings, categories):
             return []
     ids = [m['id'] for m in sorted(candidates, key=lambda m: (min(engine._material_years(m) or [9999]), m['id']))]
     probe = dict(row, action='fill', material_ids=ids)
-    return ids if engine.validate_mappings([probe], candidates, headings, categories)[0]['status'] == 'ready' else []
+    checked = engine.validate_mappings([probe], candidates, headings, categories)[0]
+    return ids if all(partial_issue(issue) for issue in checked['issues']) else []

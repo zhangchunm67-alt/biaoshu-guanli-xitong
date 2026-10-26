@@ -98,6 +98,8 @@ class TocLocationTests(unittest.TestCase):
             document.add_paragraph(title)
             document.add_paragraph('本授权书声明：现委托李四办理本项目投标事项。' if cid == 'authorization'
                                    else '本节原有内容保持不变。')
+            if cid == 'authorization':
+                document.add_paragraph('附：被授权人身份证复印件')
         document.add_paragraph('（五）结束附件')
         ends = [title for title, _ in titles[1:]] + ['（五）结束附件']
         return [(title, end, cid) for (title, cid), end in zip(titles, ends)]
@@ -108,33 +110,55 @@ class TocLocationTests(unittest.TestCase):
         entry = document.add_paragraph('授权委托书', style='TOC 1')
         document.add_paragraph('一、授权委托书')
         document.add_paragraph('本授权书声明：现委托李四办理本项目投标事项。')
+        document.add_paragraph('附：被授权人身份证复印件')
         document.add_paragraph('二、结束附件')
         scanned = self.scan(document)
         self.assert_directory_unselectable(document, scanned, [entry])
         self.export_and_assert_windows(document, scanned, {'authorization': 1},
                                        [('一、授权委托书', '二、结束附件', 'authorization')])
 
+    @staticmethod
+    def add_field_char(paragraph, kind, instruction=''):
+        run = paragraph.add_run()
+        char = OxmlElement('w:fldChar')
+        char.set(qn('w:fldCharType'), kind)
+        run._r.append(char)
+        if instruction:
+            text = OxmlElement('w:instrText')
+            text.text = instruction
+            separate = OxmlElement('w:fldChar')
+            separate.set(qn('w:fldCharType'), 'separate')
+            run._r.extend([text, separate])
+
     def test_toc_field_spanning_plain_paragraphs_excludes_result_entries(self):
         document = Document()
-        field_start = document.add_paragraph()
-        run = field_start.add_run()
-        begin = OxmlElement('w:fldChar')
-        begin.set(qn('w:fldCharType'), 'begin')
-        instruction = OxmlElement('w:instrText')
-        instruction.text = ' TOC \\o "1-3" '
-        separate = OxmlElement('w:fldChar')
-        separate.set(qn('w:fldCharType'), 'separate')
-        run._r.extend([begin, instruction, separate])
+        self.add_field_char(document.add_paragraph(), 'begin', ' TOC \\o "1-3" ')
         entries = [document.add_paragraph(title) for title in ['授权委托书', '营业执照']]
-        field_end = document.add_paragraph()
-        end = OxmlElement('w:fldChar')
-        end.set(qn('w:fldCharType'), 'end')
-        field_end.add_run()._r.append(end)
+        self.add_field_char(document.add_paragraph(), 'end')
         windows = self.add_body_sections(document)
         scanned = self.scan(document)
         self.assert_directory_unselectable(document, scanned, entries)
         self.export_and_assert_windows(document, scanned,
                                        {cid: 1 for _, _, cid in windows}, windows)
+
+    def test_toc_field_end_merged_into_first_body_title_keeps_that_title(self):
+        document = Document()
+        self.add_field_char(document.add_paragraph(), 'begin', ' TOC \\o "1-3" ')
+        entries = [document.add_paragraph(title) for title in ['营业执照', '公司简介']]
+        # Deleting the blank line after a Word TOC leaves its field end here.
+        merged = document.add_paragraph()
+        self.add_field_char(merged, 'end')
+        merged.add_run('（一）营业执照')
+        document.add_paragraph('本节原有内容保持不变。')
+        document.add_paragraph('（二）公司简介')
+        document.add_paragraph('本节原有内容保持不变。')
+        document.add_paragraph('（三）结束附件')
+        scanned = self.scan(document)
+        self.assert_directory_unselectable(document, scanned, entries)
+        self.assertIn(self.locator(document, merged), {h['id'] for h in scanned['headings']})
+        self.export_and_assert_windows(document, scanned, {'business_license': 1, 'company_profile': 1},
+                                       [('（一）营业执照', '（二）公司简介', 'business_license'),
+                                        ('（二）公司简介', '（三）结束附件', 'company_profile')])
 
     def test_manual_directory_without_page_numbers_covers_common_and_special(self):
         document = Document()
@@ -181,6 +205,7 @@ class TocLocationTests(unittest.TestCase):
         document.add_paragraph('兹证明本单位法定代表人的身份。')
         document.add_paragraph('（四）授权委托书格式')
         document.add_paragraph('本授权书声明：现委托李四办理本项目投标事项。')
+        document.add_paragraph('附：被授权人身份证复印件')
         document.add_paragraph('（五）资格证明文件')
         document.add_paragraph('（1）投标人基本情况表')
         document.add_paragraph('本节基本情况由商务人员核对。')
@@ -206,9 +231,11 @@ class TocLocationTests(unittest.TestCase):
         document.add_paragraph('一、商务部分')
         document.add_paragraph('授权委托书')
         document.add_paragraph('本授权书声明：现委托李四办理本项目商务事项。')
+        document.add_paragraph('附：被授权人身份证复印件')
         document.add_paragraph('二、服务方案部分')
         document.add_paragraph('授权委托书')
         document.add_paragraph('本授权书声明：现委托李四办理本项目服务事项。')
+        document.add_paragraph('附：被授权人身份证复印件')
         document.add_paragraph('三、结束附件')
         scanned = self.scan(document)
         self.assert_directory_unselectable(document, scanned, entries)
@@ -243,7 +270,7 @@ class TocLocationTests(unittest.TestCase):
 
     def test_material_list_without_a_directory_or_later_body_remains_fillable(self):
         document = Document()
-        titles = [('法人代表授权书（加盖公章）；', 'authorization'),
+        titles = [('被授权人身份证复印件（加盖公章）；', 'authorization'),
                   ('营业执照副本复印件（加盖公章）；', 'business_license'),
                   ('公司简介；', 'company_profile')]
         for title, _ in titles:
@@ -261,6 +288,7 @@ class TocLocationTests(unittest.TestCase):
             document.add_paragraph(section)
             document.add_paragraph('授权委托书')
             document.add_paragraph('本授权书声明：现委托李四办理本项目投标事项。')
+            document.add_paragraph('附：被授权人身份证复印件')
         document.add_paragraph('三、结束附件')
         scanned = self.scan(document)
         self.export_and_assert_windows(document, scanned, {'authorization': 2},
@@ -273,6 +301,7 @@ class TocLocationTests(unittest.TestCase):
         entry = document.add_paragraph('授权委托书')
         document.add_paragraph('授权委托书')
         document.add_paragraph('本授权书声明：现委托李四办理本项目投标事项。')
+        document.add_paragraph('附：被授权人身份证复印件')
         scanned = self.scan(document)
         source_bytes = self.source.read_bytes()
         row = next(r for r in scanned['mappings'] if r['category_id'] == 'authorization')

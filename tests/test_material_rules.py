@@ -67,6 +67,9 @@ class MaterialRuleTests(unittest.TestCase):
             [tax], scanned['headings'], self.categories)[0]
         self.assertEqual('blocked', checked['status'])
         self.assertIn('缺少要求凭证：社保。', checked['issues'])
+        partial = self.tax_rows(self.scan(['税收和社会保障资金缴纳凭证'], [tax]))[0]
+        self.assertEqual([tax['id']], partial['material_ids'])
+        self.assertIn('缺少要求凭证：社保。', partial['issues'])
 
     def test_specific_month_uses_period_not_year_or_payment_date(self):
         august = self.material('2026年8月社保缴费凭证', description='交易日期：2026年9月18日')
@@ -91,7 +94,22 @@ class MaterialRuleTests(unittest.TestCase):
         self.assertEqual(12, len(months(record['name'])))
         self.assertEqual(2, len(months('2025年7、8月')))
         row = self.tax_rows(self.scan(['2026年8月至9月社保缴费证明'], [august]))[0]
-        self.assertFalse(row['material_ids'])
+        self.assertEqual(([august['id']], 'blocked'), (row['material_ids'], row['status']))
+        self.assertIn('缺少要求月份：社保 2026年9月。', row['issues'])
+
+    def test_short_month_ranges_share_the_year(self):
+        for text in ['2026年8-9月', '2026年8至9月', '2026年8～9月', '2026年8月-9月']:
+            self.assertEqual(2, len(months(text)), text)
+        self.assertFalse(months('2026年9-8月'))
+        right = self.material('2026年8-9月社保缴费凭证')
+        wrong = self.material('2025年12月社保缴费凭证')
+        scanned = self.scan(['2026年8-9月社保缴费证明'], [right, wrong])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual([right['id']], row['material_ids'])
+        self.assertEqual('ready', row['status'])
+        bad = engine.validate_mappings([dict(row, material_ids=[wrong['id']])],
+            [right, wrong], scanned['headings'], self.categories)[0]
+        self.assertIn('2025年12月社保缴费凭证：缴费所属月份与目标要求不符。', bad['issues'])
 
     def test_overlapping_social_versions_require_manual_selection(self):
         a = self.material('2026年8月社保缴费凭证')
@@ -147,6 +165,8 @@ class MaterialRuleTests(unittest.TestCase):
             doc.add_heading(category['name'], 2)
             doc.add_paragraph('本授权书声明：现委托李四办理投标事项。' if category['id'] == 'authorization'
                 else '兹证明张三为本单位法定代表人。' if category['id'] == 'legal_identity' else '本栏目原有说明。')
+            if category['id'] == 'authorization':
+                doc.add_paragraph('附：被授权人身份证复印件')
             material = self.material(category['name'] + '测试图片', category['id'])
             material['years'] = [2023, 2024, 2025, 2026]
             materials.append(material)

@@ -14,6 +14,14 @@ _REQUEST = re.compile(r'提供|提交|出具|附[上后：:]?|后附|须附|应�
 _IMAGE = re.compile(r'复印件|扫描件|影印件|电子件|正反面|双面|照片|粘贴|证书|合同.{0,16}(?:证明|关键页)|证明材料')
 _COPY = re.compile(r'后附|附[：:]|附上|须附|应附|需附|粘贴|复印件|扫描件|影印件|电子件')
 _SIGNATURE = re.compile(r'^(?:投标人|供应商|法定代表人|委托代理人|日期|年月日|年\s*月\s*日)')
+_AGENT = r'(?:委托代理人|被授权人|授权代表|代理人|受托人)'
+_AGENT_ID = re.compile(_AGENT + r'.{0,18}(?:身份证|护照)|(?:身份证|护照).{0,12}' + _AGENT)
+
+
+def agent_identity_target(title, attachment):
+    """Authorization images are agent ID copies; the letter itself takes a text template."""
+    value = compact(title)
+    return bool(_AGENT_ID.search(value) and (attachment or not re.search(r'授权(?:委托)?书', value)))
 
 
 def family(category):
@@ -345,6 +353,15 @@ def resolve(document, records, categories, toc_elements=()):
                  legal_body_present=bool(re.search(r'兹证明|(?:系|为).{0,35}法定代表人', compact(txt))),
                  authorization_body_present=bool(re.search(r'本授权(?:委托)?书|本人.{0,40}系|现委托|现授权委托|兹授权', compact(txt))))
     reqs = requirements(records, categories)
+    # An agent ID label after an authorization letter is that letter's attachment
+    # slot, also in bid frameworks without an explicit 投标文件格式 region.
+    letter = False
+    for r in top:
+        if r['authorization_body_present']:
+            letter = True
+        elif r['_structural'] or region_title(r['title']) or _ATTACHMENT.match(compact(r['title'])):
+            letter = False
+        r['_after_letter'] = letter and not r['authorization_body_present']
     extra = []
     for r in records:
         if r['kind'] != 'placeholder':
@@ -367,7 +384,8 @@ def resolve(document, records, categories, toc_elements=()):
                 continue
             aliases = cid in engine._category_ids(r['title'], [category])
             score, reason = engine._special_score(r['title'], category) if category.get('layer')=='special' else (130 if aliases else 0, '栏目名称或别名')
-            form = r['_region'] == 'form' or any(_form_table(e) for e in r['_own']) or r['legal_body_present'] or r['authorization_body_present']
+            form = (r['_region'] == 'form' or any(_form_table(e) for e in r['_own']) or r['legal_body_present']
+                    or r['authorization_body_present'] or (key == 'authorization' and r.get('_after_letter')))
             # Table clauses identify requirements. An empty adjacent answer/score
             # cell alone does not authorize inserting images into that cell.
             if r['_inside_table']:
@@ -434,6 +452,8 @@ def resolve(document, records, categories, toc_elements=()):
             precise = [(r,s,why) for r,s,why in candidates if r.get('_attachment')]
         filtered = []
         for r,s,why in candidates:
+            if key == 'authorization' and not agent_identity_target(r['title'], r.get('_attachment')):
+                continue
             if key == 'tax_social':
                 from material_rules import tax_kinds
                 number = re.match(r'^(\d+(?:\.\d+)*)[.、]', compact(r['title']))
@@ -479,6 +499,8 @@ def resolve(document, records, categories, toc_elements=()):
                 score = entry_score(r['title'],category)
                 if not score or r['kind']=='placeholder' or r['_region'] in {'contract','scoring'}:
                     continue
+                if key == 'authorization' and not agent_identity_target(r['title'], True):
+                    continue
                 table = next((a for a in r['_element'].iterancestors() if a.tag==qn('w:tbl')),None)
                 if table is not None and re.search(r'评分|得分|分值|评审|满分',engine._text(table)):
                     continue
@@ -497,7 +519,9 @@ def resolve(document, records, categories, toc_elements=()):
                 extra.append(slot)
                 filtered.append(slot)
         # The appendix is used only when no matching entry or form slot exists.
-        if not filtered and not has_token and reqs[cid]['status']!='not_detected' and category.get('layer','common')=='common':
+        # Agent ID copies without a labelled slot stay missing, not appended.
+        if (not filtered and not has_token and reqs[cid]['status']!='not_detected'
+                and category.get('layer','common')=='common' and key != 'authorization'):
             digest = hashlib.sha256(document.element.body.xml.encode()).hexdigest()[:16]
             name = '法定代表人身份证附件（证明正文另行核对）' if cid=='legal_identity' else category['name']
             extra.append({'id':f'ca:{cid}:{digest}','title':'文末新增材料区 · '+name,

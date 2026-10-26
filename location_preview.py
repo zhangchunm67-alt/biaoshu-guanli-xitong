@@ -88,11 +88,46 @@ class LocationPreview:
         self._temporary = tempfile.TemporaryDirectory(prefix='bid-page-preview-')
         self.root = Path(self._temporary.name)
         self.cache = OrderedDict()
+        # Inline previews ask once per review card. Hash each template version
+        # and recognize its locations once, not on every card request.
+        self._recognized = OrderedDict()
+        self._digests = OrderedDict()
+        self._recognized_lock = threading.Lock()
 
     def close(self):
         with _RENDER_LOCK:
             self.cache.clear()
             self._temporary.cleanup()
+        with self._recognized_lock:
+            self._recognized.clear()
+            self._digests.clear()
+
+    def _verify(self, source, template_hash):
+        stat = Path(source).stat()
+        identity = (str(source), stat.st_size, stat.st_mtime_ns)
+        with self._recognized_lock:
+            digest = self._digests.get(identity)
+            if digest is None:
+                digest = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+                self._digests[identity] = digest
+                while len(self._digests) > 16:
+                    self._digests.popitem(last=False)
+        if digest != template_hash:
+            raise ValueError('模板已变化，请重新上传或扫描后再预览。')
+
+    def _recognize(self, source, template_hash, categories):
+        """Shared read-only document and public records for one template and category set."""
+        rules = hashlib.sha256(json.dumps(categories, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+        key = (template_hash, rules)
+        with self._recognized_lock:
+            if key not in self._recognized:
+                document = engine._read_template(source)
+                records, _ = engine._inspect(document, categories)
+                self._recognized[key] = (document, {r['id']: r for r in records if r['_public']})
+                while len(self._recognized) > 2:
+                    self._recognized.popitem(last=False)
+            self._recognized.move_to_end(key)
+            return self._recognized[key]
 
     @staticmethod
     def key(template_hash):
@@ -166,8 +201,7 @@ class LocationPreview:
 
     def describe(self, snapshot):
         source = snapshot['template']
-        if hashlib.sha256(Path(source).read_bytes()).hexdigest() != snapshot['template_hash']:
-            raise ValueError('模板已变化，请重新上传或扫描后再预览。')
+        self._verify(source, snapshot['template_hash'])
         if not snapshot['locator_id']:
             with _RENDER_LOCK:
                 entry = self._build(source, snapshot['template_hash'])
@@ -176,9 +210,8 @@ class LocationPreview:
                         'title': '标书原页',
                         'description': '尚未选择插入位置。可先翻页查看原文，再从上方选择位置查看标记。',
                         'template_name': snapshot['template_name']}
-        document = engine._read_template(source)
-        records, _ = engine._inspect(document, snapshot['categories'])
-        record = next((r for r in records if r['id'] == snapshot['locator_id'] and r['_public']), None)
+        document, records = self._recognize(source, snapshot['template_hash'], snapshot['categories'])
+        record = records.get(snapshot['locator_id'])
         if record is None:
             raise ValueError('所选插入位置已失效，请重新扫描后再选择。')
         if record['kind'] == 'common_appendix':

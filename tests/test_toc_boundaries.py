@@ -78,8 +78,9 @@ class TocBoundaryTests(unittest.TestCase):
         table.cell(0, 1).text = '3'
         table.cell(1, 0).text = '营业执照'
         table.cell(1, 1).text = '4'
-        authorization = document.add_paragraph('授权委托书格式')
+        document.add_paragraph('授权委托书格式')
         document.add_paragraph('本授权书声明：现委托李四办理投标事项。')
+        agent_id = document.add_paragraph('附：被授权人身份证复印件')
         license_heading = document.add_paragraph('营业执照（图片粘贴位置）')
         document.add_paragraph('三、结束附件')
         scanned = self.scan(document)
@@ -92,10 +93,11 @@ class TocBoundaryTests(unittest.TestCase):
                     for target in [locator, *['at:' + c['id'] + ':' + locator for c in self.categories]]:
                         self.assertNotIn(target, selectable)
                         self.assertNotIn(target, selected)
-        for cid, paragraph in [('authorization', authorization), ('business_license', license_heading)]:
+        for cid, locator in [('authorization', 'at:authorization:' + self.locator(document, agent_id)),
+                             ('business_license', self.locator(document, license_heading))]:
             matching = [row for row in scanned['mappings'] if row['category_id'] == cid]
             self.assertEqual(1, len(matching))
-            self.assertEqual(self.locator(document, paragraph), matching[0]['locator_id'])
+            self.assertEqual(locator, matching[0]['locator_id'])
         result = self.export(scanned, {'authorization', 'business_license'})
         self.assertFalse(list(result.tables[0]._tbl.iter(qn('a:blip'))))
         self.assertEqual([['授权委托书', '3'], ['营业执照', '4']],
@@ -111,13 +113,14 @@ class TocBoundaryTests(unittest.TestCase):
                 document = Document()
                 document.add_paragraph(directory_title)
                 directory = document.add_paragraph('授权委托书')
-                body = document.add_paragraph('（四）授权委托书格式')
+                document.add_paragraph('（四）授权委托书格式')
                 document.add_paragraph('本授权书声明：现委托李四办理投标事项。')
+                agent_id = document.add_paragraph('附：被授权人身份证复印件')
                 document.add_paragraph('（五）结束附件')
                 scanned = self.scan(document)
                 matching = [row for row in scanned['mappings'] if row['category_id'] == 'authorization']
                 self.assertEqual(1, len(matching))
-                self.assertEqual(self.locator(document, body), matching[0]['locator_id'])
+                self.assertEqual('at:authorization:' + self.locator(document, agent_id), matching[0]['locator_id'])
                 self.assertNotIn(self.locator(document, directory), {h['id'] for h in scanned['headings']})
                 result = self.export(scanned, {'authorization'})
                 children = list(result.element.body)
@@ -136,11 +139,12 @@ class TocBoundaryTests(unittest.TestCase):
                      '对应页码', '备注或说明', '注：格式仅供参考。', '附件1：报价格式',
                      '报价一览表', '此处保留报价内容。', '附件2：授权格式']:
             document.add_paragraph(text)
-        actual = document.add_paragraph('法定代表人授权委托书')
+        document.add_paragraph('法定代表人授权委托书')
         document.add_paragraph('本授权书声明：现委托李四办理投标事项。')
+        agent_id = document.add_paragraph('附：被授权人身份证复印件')
         scanned = self.scan(document)
         rows = [r for r in scanned['mappings'] if r['category_id'] == 'authorization']
-        self.assertEqual([self.locator(document, actual)], [r['locator_id'] for r in rows])
+        self.assertEqual(['at:authorization:' + self.locator(document, agent_id)], [r['locator_id'] for r in rows])
         self.assertTrue(all(self.locator(document, p) not in {h['id'] for h in scanned['headings']} for p in entries))
 
 

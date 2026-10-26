@@ -8,6 +8,16 @@ from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
 
+def _text_after(paragraph, marker):
+    seen = False
+    for node in paragraph.iter():
+        if node is marker:
+            seen = True
+        elif seen and node.tag == qn('w:t') and (node.text or '').strip():
+            return True
+    return False
+
+
 def excluded_paragraphs(document):
     import engine
     import recognition
@@ -34,7 +44,12 @@ def excluded_paragraphs(document):
             elif kind == 'end' and stack:
                 frame = stack.pop()
                 if re.search(r'\bTOC\b', frame['instruction'], re.I):
-                    excluded.update(frame['paragraphs'])
+                    paragraphs = frame['paragraphs']
+                    if current is not None and _text_after(current, node):
+                        # Deleting the blank line after a TOC merges the field
+                        # end into the first body heading; keep that heading.
+                        paragraphs = paragraphs - {current}
+                    excluded.update(paragraphs)
         elif node.tag == qn('w:instrText') and stack:
             stack[-1]['instruction'] += node.text or ''
     for frame in stack:

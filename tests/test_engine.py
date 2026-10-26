@@ -82,6 +82,10 @@ class EngineTests(unittest.TestCase):
         row = scanned["mappings"][0]
         self.assertEqual(row["status"], "ready")
         self.assertEqual(row["material_ids"], ["2023", "2024"])
+        # Partial coverage is still preselected; the missing year stays visible.
+        partial = self.scan(categories, [second])["mappings"][0]
+        self.assertEqual((["2024"], "blocked"), (partial["material_ids"], partial["status"]))
+        self.assertIn("缺少要求年度：2023。", partial["issues"])
         row.update(material_ids=["2023"], required_years=[2023])
         checked = engine.validate_mappings([row], [first], scanned["headings"], categories)[0]
         self.assertEqual(checked["required_years"], [2023, 2024])
