@@ -1,0 +1,335 @@
+"""Evidence type, period and real output boundaries within shared categories."""
+import copy
+import tempfile
+import unittest
+from pathlib import Path
+
+from docx import Document
+from docx.oxml.ns import qn
+from PIL import Image
+
+import engine
+from material_rules import months
+
+
+class MaterialRuleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='bid-material-rules-')
+        self.root = Path(self.temp.name)
+        self.path = self.root / 'source.docx'
+        self.categories = copy.deepcopy(engine.DEFAULT_CATEGORIES) + [dict(
+            id='text_template', name='文书模板', aliases=['投标函', '授权书', '承诺函'],
+            layer='special', enabled=True)]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def material(self, name, cid='tax_social', **extra):
+        path = self.root / (str(len(list(self.root.glob('*.png')))) + '.png')
+        Image.new('RGB', (120, 80), (len(list(self.root.glob('*.png'))) * 30, 90, 120)).save(path)
+        return dict(id=path.stem, name=name, category_id=cid, subject=engine.EXPECTED_SUBJECT,
+                    mode='page', files=[dict(path=str(path), name=path.name)],
+                    years=[2025, 2026], valid_until='长期', **extra)
+
+    def scan(self, labels, materials):
+        doc = Document()
+        doc.add_heading('第五章 投标文件格式', 1)
+        for label in labels:
+            doc.add_heading(label, 2)
+            doc.add_paragraph('本栏目原有内容。')
+        doc.save(self.path)
+        return engine.scan_document(self.path, self.categories, materials, ['text_template'])
+
+    def tax_rows(self, scanned):
+        return [r for r in scanned['mappings'] if r['category_id'] == 'tax_social']
+
+    def test_tax_and_social_cannot_substitute_for_each_other(self):
+        tax = self.material('2026年9月完税证明')
+        social = self.material('2026年8月社保缴费凭证')
+        scanned = self.scan(['纳税证明', '社保缴费证明'], [tax, social])
+        rows = self.tax_rows(scanned)
+        self.assertEqual(2, len(rows))
+        for row, correct, wrong in zip(rows, [tax, social], [social, tax]):
+            self.assertEqual([correct['id']], row['material_ids'])
+            checked = engine.validate_mappings([dict(row, material_ids=[wrong['id']], action='fill')],
+                [tax, social], scanned['headings'], self.categories)[0]
+            self.assertEqual('blocked', checked['status'])
+            self.assertTrue(any('类型不符' in s for s in checked['issues']))
+
+    def test_combined_slot_requires_both_and_selects_unique_complement(self):
+        tax = self.material('2026年9月完税证明')
+        social = self.material('2026年8月社保缴费凭证')
+        scanned = self.scan(['税收和社会保障资金缴纳凭证'], [tax, social])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual('ready', row['status'])
+        self.assertEqual({tax['id'], social['id']}, set(row['material_ids']))
+        checked = engine.validate_mappings([dict(row, material_ids=[tax['id']])],
+            [tax], scanned['headings'], self.categories)[0]
+        self.assertEqual('blocked', checked['status'])
+        self.assertIn('缺少要求凭证：社保。', checked['issues'])
+        partial = self.tax_rows(self.scan(['税收和社会保障资金缴纳凭证'], [tax]))[0]
+        self.assertEqual([tax['id']], partial['material_ids'])
+        self.assertIn('缺少要求凭证：社保。', partial['issues'])
+
+    def test_specific_month_uses_period_not_year_or_payment_date(self):
+        august = self.material('2026年8月社保缴费凭证', description='交易日期：2026年9月18日')
+        september = self.material('2026年9月社保缴费凭证')
+        scanned = self.scan(['2026年8月社保缴费证明'], [august, september])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual([august['id']], row['material_ids'])
+        bad = engine.validate_mappings([dict(row, material_ids=[september['id']])],
+            [august, september], scanned['headings'], self.categories)[0]
+        self.assertEqual('blocked', bad['status'])
+        unknown = self.material('社保缴费凭证')
+        self.assertFalse(self.tax_rows(self.scan(['2026年8月社保缴费证明'], [unknown]))[0]['material_ids'])
+
+    def test_period_range_and_partial_coverage(self):
+        record = self.material('单位社保缴费证明（2025年9月至2026年8月）')
+        row = self.tax_rows(self.scan(['2026年8月社保缴费证明'], [record]))[0]
+        self.assertEqual([record['id']], row['material_ids'])
+        august = self.material('2026年8月社保缴费凭证')
+        september = self.material('2026年9月社保缴费凭证')
+        scanned = self.scan(['2026年8月至9月社保缴费证明'], [august, september])
+        self.assertEqual('ready', self.tax_rows(scanned)[0]['status'])
+        self.assertEqual(12, len(months(record['name'])))
+        self.assertEqual(2, len(months('2025年7、8月')))
+        row = self.tax_rows(self.scan(['2026年8月至9月社保缴费证明'], [august]))[0]
+        self.assertEqual(([august['id']], 'blocked'), (row['material_ids'], row['status']))
+        self.assertIn('缺少要求月份：社保 2026年9月。', row['issues'])
+
+    def test_short_month_ranges_share_the_year(self):
+        for text in ['2026年8-9月', '2026年8至9月', '2026年8～9月', '2026年8月-9月']:
+            self.assertEqual(2, len(months(text)), text)
+        self.assertFalse(months('2026年9-8月'))
+        right = self.material('2026年8-9月社保缴费凭证')
+        wrong = self.material('2025年12月社保缴费凭证')
+        scanned = self.scan(['2026年8-9月社保缴费证明'], [right, wrong])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual([right['id']], row['material_ids'])
+        self.assertEqual('ready', row['status'])
+        bad = engine.validate_mappings([dict(row, material_ids=[wrong['id']])],
+            [right, wrong], scanned['headings'], self.categories)[0]
+        self.assertIn('2025年12月社保缴费凭证：缴费所属月份与目标要求不符。', bad['issues'])
+
+    def scan_lines(self, lines, materials):
+        doc = Document()
+        for line in lines:
+            doc.add_paragraph(line)
+        doc.save(self.path)
+        return engine.scan_document(self.path, self.categories, materials, ['text_template'])
+
+    def test_incomplete_ranges_are_not_read_as_single_months(self):
+        self.assertEqual(3, len(months('2025年12-2026年2月')))
+        self.assertFalse(months('2026年9月至8月'))
+        september = self.material('2026年9月社保缴费凭证')
+        row = self.tax_rows(self.scan(['2026年9月至8月社保缴费证明'], [september]))[0]
+        self.assertFalse(row['material_ids'])
+        # The review card warns before any material is chosen.
+        self.assertTrue(any('无法完整识别' in w for w in row['warnings']), row)
+        checked = engine.validate_mappings([dict(row, action='fill', material_ids=[september['id']])],
+            [september], self.scan(['2026年9月至8月社保缴费证明'], [])['headings'], self.categories)[0]
+        self.assertTrue(any('无法完整识别' in w for w in checked['warnings']), checked)
+
+    def test_appendix_keeps_the_requirement_type_and_period(self):
+        wrong_tax, social = self.material('2026年9月完税证明'), self.material('2026年9月社保缴费凭证')
+        right = self.material('2025年1-6月完税证明')
+        lines = ['第一章 投标人须知', '供应商须提供2025年1月至6月的纳税证明。']
+        row = self.tax_rows(self.scan_lines(lines, [wrong_tax, social]))[0]
+        self.assertTrue(row['locator_id'].startswith('ca:tax_social:'))
+        self.assertFalse(row['material_ids'])
+        scanned = self.scan_lines(lines, [wrong_tax, social, right])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual(([right['id']], 'ready'), (row['material_ids'], row['status']))
+        for material, issue in [(wrong_tax, '缴费所属月份与目标要求不符'), (social, '纳税与社保凭证类型不符')]:
+            bad = engine.validate_mappings([dict(row, material_ids=[material['id']])],
+                [material], scanned['headings'], self.categories)[0]
+            self.assertTrue(any(issue in s for s in bad['issues']), bad['issues'])
+        relative = self.tax_rows(self.scan_lines(['第一章 投标人须知', '供应商须提供近六个月的纳税证明。'], [right]))[0]
+        self.assertFalse(relative['material_ids'])
+
+    def test_relative_period_ignores_submission_dates(self):
+        old, submitted = self.material('2025年1月社保缴费凭证'), self.material('2026年9月社保缴费凭证')
+        scanned = self.scan_lines(['第五章 投标文件格式', '近六个月社保缴费证明',
+                                   '社保缴费证明应于2026年9月提交。'], [old, submitted])
+        row = self.tax_rows(scanned)[0]
+        self.assertFalse(row['material_ids'])
+        checked = engine.validate_mappings([dict(row, action='fill', material_ids=[old['id']])],
+            [old, submitted], scanned['headings'], self.categories)[0]
+        self.assertFalse(any('所属月份' in s for s in checked['issues']), checked['issues'])
+        self.assertTrue(any('相对月份' in w for w in checked['warnings']))
+
+    def test_range_end_survives_deadline_wording(self):
+        january, half = self.material('2025年1月社保缴费凭证'), self.material('2025年1-6月社保缴费凭证')
+        lines = ['第五章 投标文件格式', '社保缴费证明', '社保缴费证明所属期自2025年1月至2025年6月截止。']
+        row = self.tax_rows(self.scan_lines(lines, [january]))[0]
+        self.assertEqual('blocked', row['status'])
+        self.assertTrue(any(s.startswith('缺少要求月份：社保 2025年2月') for s in row['issues']), row['issues'])
+        row = self.tax_rows(self.scan_lines(lines, [half]))[0]
+        self.assertEqual(([half['id']], 'ready'), (row['material_ids'], row['status']))
+
+    def test_each_kind_keeps_its_own_months(self):
+        tax, social = self.material('2025年1月至3月完税证明'), self.material('2025年4月至6月社保缴费凭证')
+        row = self.tax_rows(self.scan(['2025年1月至3月纳税证明及2025年4月至6月社保缴费证明'], [tax, social]))[0]
+        self.assertEqual(({tax['id'], social['id']}, 'ready'), (set(row['material_ids']), row['status']))
+        shared = self.tax_rows(self.scan(['2025年1月至6月的纳税和社保缴费证明'], [tax, social]))[0]
+        self.assertIn('缺少要求月份：纳税 2025年4月、2025年5月、2025年6月。', shared['issues'])
+
+    def test_listed_months_stay_with_their_evidence(self):
+        jan, feb = self.material('2025年1月完税证明'), self.material('2025年2月完税证明')
+        lines = ['第五章 投标文件格式', '纳税证明', '纳税证明缴费所属期为2025年1月和2025年2月。']
+        scanned = self.scan_lines(lines, [jan, feb])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual(([jan['id'], feb['id']], 'ready'), (row['material_ids'], row['status']))
+        manual = engine.validate_mappings([dict(row, material_ids=[jan['id'], feb['id']])],
+            [jan, feb], scanned['headings'], self.categories)[0]
+        self.assertEqual('ready', manual['status'], manual['issues'])
+        partial = self.tax_rows(self.scan_lines(lines, [jan]))[0]
+        self.assertEqual(([jan['id']], 'blocked'), (partial['material_ids'], partial['status']))
+        self.assertIn('缺少要求月份：纳税 2025年2月。', partial['issues'])
+        social = self.material('2025年3月社保缴费凭证')
+        mixed = self.tax_rows(self.scan(['2025年1月和2025年2月的纳税证明及2025年3月的社保缴费证明'], [feb, social]))[0]
+        self.assertIn('缺少要求月份：纳税 2025年1月。', mixed['issues'])
+
+    def test_month_modifiers_keep_the_period_with_its_evidence(self):
+        lines = ['第五章 投标文件格式', '纳税和社保缴费证明',
+                 '2025年1月纳税证明及2025年2月份的社保缴费证明和2025年3月社保缴费证明。']
+        tax, social = self.material('2025年1月完税证明'), self.material('2025年2月至3月社保缴费凭证')
+        row = self.tax_rows(self.scan_lines(lines, [tax, social]))[0]
+        self.assertEqual(({tax['id'], social['id']}, 'ready', []),
+                         (set(row['material_ids']), row['status'], row['issues']))
+        early_tax, late_social = self.material('2025年1月至2月完税证明'), self.material('2025年3月社保缴费凭证')
+        row = self.tax_rows(self.scan_lines(lines, [early_tax, late_social]))[0]
+        self.assertEqual('blocked', row['status'])
+        self.assertIn('缺少要求月份：社保 2025年2月。', row['issues'])
+        for modifier in ['份的', '期间的', '所属期的']:
+            with self.subTest(modifier=modifier):
+                text = '2025年1月纳税证明及2025年2月' + modifier + '社保缴费证明'
+                row = self.tax_rows(self.scan_lines(['第五章 投标文件格式', '纳税和社保缴费证明', text],
+                                                    [tax, self.material('2025年2月社保缴费凭证')]))[0]
+                self.assertEqual(('ready', []), (row['status'], row['issues']))
+
+    def test_each_sentence_constrains_only_the_evidence_it_names(self):
+        tax, social = self.material('2025年1月完税证明'), self.material('2025年2月社保缴费凭证')
+        for text in ['供应商须提供2025年1月的纳税证明。供应商须提供2025年2月的社保缴费证明。',
+                     '供应商须提供2025年1月的纳税证明，2025年2月的社保缴费证明。',
+                     '供应商须提供2025年1月的纳税证明；2025年2月的社保缴费证明。']:
+            with self.subTest(text=text):
+                row = self.tax_rows(self.scan_lines(['第一章 投标人须知'] + text.rstrip('。').split('。'),
+                                                    [tax, social]))[0]
+                self.assertEqual(({tax['id'], social['id']}, 'ready', []),
+                                 (set(row['material_ids']), row['status'], row['issues']))
+
+    def test_complementary_years_are_one_set_and_same_year_versions_overlap(self):
+        first, second = self.material('2025年纳税证明'), self.material('2026年纳税证明')
+        first['years'], second['years'] = [2025], [2026]
+        row = self.tax_rows(self.scan(['2025-2026年纳税证明'], [first, second]))[0]
+        self.assertEqual(([first['id'], second['id']], 'ready'), (row['material_ids'], row['status']))
+        again = self.material('2025年纳税证明（补开）')
+        again['years'] = [2025]
+        self.assertFalse(self.tax_rows(self.scan(['2025-2026年纳税证明'], [first, again, second]))[0]['material_ids'])
+
+    def test_overlapping_social_versions_require_manual_selection(self):
+        a = self.material('2026年8月社保缴费凭证')
+        b = self.material('单位社保缴费证明（2025年9月至2026年8月）')
+        row = self.tax_rows(self.scan(['社保缴费证明'], [a, b]))[0]
+        self.assertFalse(row['material_ids'])
+
+    def test_decimal_subsections_receive_their_own_evidence(self):
+        doc = Document()
+        for title in ['第五章 投标文件格式', '4.税收和社会保障资金缴纳凭证',
+                      '4.1提供近6个月任意一个月的税收缴纳凭证，依法免税的，应提供证明文件。',
+                      '4.2提供近6个月任意一个月的社会保障资金缴纳凭证，依法免缴的，应提供证明文件。',
+                      '5.其他材料']:
+            doc.add_paragraph(title)
+        doc.save(self.path)
+        mats = [self.material('2026年9月完税证明'), self.material('2026年8月社保缴费凭证')]
+        scanned = engine.scan_document(self.path, self.categories, mats)
+        rows = self.tax_rows(scanned)
+        self.assertEqual(2, len(rows))
+        self.assertTrue(all(not row['material_ids'] for row in rows))
+        rows = [dict(row, action='fill', material_ids=[material['id']]) for row, material in zip(rows, mats)]
+        original = self.path.read_bytes()
+        output = self.root / 'result.docx'
+        engine.export_document(self.path, output, rows, mats, categories=self.categories)
+        result = Document(output)
+        body = list(result.element.body)
+        positions = [next(i for i, e in enumerate(body) if engine._text(e).startswith(prefix)) for prefix in ['4.1', '4.2', '5.']]
+        for n, material in enumerate(mats):
+            pictures = [b for e in body[positions[n]:positions[n + 1]] for b in e.iter(qn('a:blip'))]
+            self.assertEqual(1, len(pictures))
+            self.assertEqual(Path(material['files'][0]['path']).read_bytes(), result.part.related_parts[pictures[0].get(qn('r:embed'))].blob)
+        self.assertEqual(original, self.path.read_bytes())
+
+    def test_text_templates_keep_each_body_slot_and_reject_wrong_type(self):
+        scanned = self.scan(['投标函', '授权书', '承诺函'], [])
+        rows = [r for r in scanned['mappings'] if r['category_id'] == 'text_template']
+        self.assertEqual(['投标函', '授权书', '承诺函'], [r['title'] for r in rows])
+        material = dict(id='letter', category_id='text_template', name='投标函参考模板',
+            subject=engine.EXPECTED_SUBJECT, mode='text', content='投标函测试正文', files=[], years=[], valid_until='长期')
+        for row in rows:
+            checked = engine.validate_mappings([dict(row, action='fill', material_ids=['letter'])],
+                [material], scanned['headings'], self.categories)[0]
+            self.assertEqual('ready' if row['title'] == '投标函' else 'blocked', checked['status'])
+        titles = ['附件1：投标函', '附件3：法定代表人授权书', '附件5：承诺书']
+        numbered = self.scan(titles, [])
+        self.assertEqual(titles, [r['title'] for r in numbered['mappings'] if r['category_id'] == 'text_template'])
+
+    def test_outer_label_and_form_title_are_one_text_slot(self):
+        letter = dict(id='auth', category_id='text_template', name='法定代表人授权委托书模板',
+            subject=engine.EXPECTED_SUBJECT, mode='text', content='授权书模板正文', files=[], years=[], valid_until='长期')
+        scanned = self.scan_lines(['第六章 投标文件格式', '附件3：法定代表人授权书', '法定代表人授权委托书',
+                                   '本授权书声明：现委托乙某办理投标事项。', '附件4：其他'], [letter])
+        rows = [r for r in scanned['mappings'] if r['category_id'] == 'text_template']
+        self.assertEqual(['法定代表人授权委托书'], [r['title'] for r in rows])
+        filled = [dict(r, action='fill', material_ids=['auth']) for r in rows]
+        output = self.root / 'letter.docx'
+        engine.export_document(self.path, output, filled, [letter], categories=self.categories)
+        self.assertEqual(1, [p.text for p in Document(output).paragraphs].count('授权书模板正文'))
+        separate = self.scan_lines(['第六章 投标文件格式', '附件1：投标函', '附件2：投标函', '附件3：其他'], [])
+        self.assertEqual(['附件1：投标函', '附件2：投标函'],
+                         [r['title'] for r in separate['mappings'] if r['category_id'] == 'text_template'])
+        # Two different commitments of the same kind stay two slots.
+        self.categories[-1]['aliases'] += ['保密承诺函', '廉洁承诺函']
+        letters = self.scan_lines(['第六章 投标文件格式', '（一）保密承诺函', '廉洁承诺函', '签署本函。', '附件2：其他'], [])
+        self.assertEqual(['（一）保密承诺函', '廉洁承诺函'],
+                         [r['title'] for r in letters['mappings'] if r['category_id'] == 'text_template'])
+
+    def test_all_seven_categories_skip_directory_and_preserve_body_windows(self):
+        doc = Document()
+        doc.add_paragraph('目录')
+        for category in engine.DEFAULT_CATEGORIES:
+            doc.add_paragraph(category['name'])
+        doc.add_heading('第五章 投标文件格式', 1)
+        materials = []
+        for category in engine.DEFAULT_CATEGORIES:
+            doc.add_heading(category['name'], 2)
+            doc.add_paragraph('本授权书声明：现委托李四办理投标事项。' if category['id'] == 'authorization'
+                else '兹证明张三为本单位法定代表人。' if category['id'] == 'legal_identity' else '本栏目原有说明。')
+            if category['id'] == 'authorization':
+                doc.add_paragraph('附：被授权人身份证复印件')
+            material = self.material(category['name'] + '测试图片', category['id'])
+            material['years'] = [2023, 2024, 2025, 2026]
+            materials.append(material)
+        doc.add_heading('结束附件', 1)
+        doc.save(self.path)
+        original = self.path.read_bytes()
+        scanned = engine.scan_document(self.path, self.categories, materials)
+        self.assertEqual(7, len(scanned['mappings']))
+        self.assertTrue(all(r['status'] == 'ready' for r in scanned['mappings']), scanned['mappings'])
+        output = self.root / 'all.docx'
+        engine.export_document(self.path, output, scanned['mappings'], materials, categories=self.categories)
+        result = Document(output)
+        nodes = list(result.element.body)
+        start = next(i for i, e in enumerate(nodes) if engine._text(e) == '第五章 投标文件格式')
+        self.assertFalse(any(list(e.iter(qn('a:blip'))) for e in nodes[:start]))
+        positions = [next(i for i, e in enumerate(nodes) if i > start and engine._text(e) == c['name']) for c in engine.DEFAULT_CATEGORIES]
+        positions.append(next(i for i, e in enumerate(nodes) if engine._text(e) == '结束附件'))
+        for n, material in enumerate(materials):
+            blips = [b for e in nodes[positions[n]:positions[n + 1]] for b in e.iter(qn('a:blip'))]
+            self.assertEqual(1, len(blips))
+            self.assertEqual(Path(material['files'][0]['path']).read_bytes(), result.part.related_parts[blips[0].get(qn('r:embed'))].blob)
+        self.assertEqual(original, self.path.read_bytes())
+
+
+if __name__ == '__main__':
+    unittest.main()

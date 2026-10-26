@@ -41,8 +41,8 @@ for _category in DEFAULT_CATEGORIES:
 _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
-SPECIAL_LOCATOR_VERSION = 3
-COMMON_LOCATOR_VERSION = 4
+SPECIAL_LOCATOR_VERSION = 9
+COMMON_LOCATOR_VERSION = 11
 
 
 def _common_title(text):
@@ -54,11 +54,14 @@ def _common_title(text):
 
 def _common_variant(title, category_id):
     target = _common_title(title)
+    if category_id == 'tax_social':
+        target = re.sub(r'\d{1,2}月?(?:至|到|[-—–~～])\d{1,2}月|\d{1,2}月', '', target)
     patterns = {
         'business_license': r'(?:(?:投标人|投标方|供应商|企业法人|企业|公司)的?)?营业执照(?:正副本|正本|副本)?(?:彩色)?(?:复印件|扫描件|影印件)?',
         'company_profile': r'(?:(?:投标人|投标方|供应商)的?)?(?:公司|企业)(?:介绍|简介|概况)',
         'legal_identity': r'(?:法定代表人|法人代表|法人|负责人)(?:身份证明书?|证明书|身份证(?:正反面)?(?:复印件|扫描件)?)',
-        'authorization': r'(?:法定代表人|法人代表|法人|负责人)?授权(?:委托)?书',
+        'authorization': r'(?:法定代表人|法人代表|法人|负责人)?授权(?:委托)?书(?:格式)?',
+        'tax_social': r'(?:依法)?(?:缴纳)?(?:(?:税收|纳税|税款)(?:和|及|与)?(?:社会保障资金|社会保险|社保)?|社会保障资金|社会保险|社保)(?:缴纳|缴费)?(?:证明(?:材料)?|凭证|记录)|完税(?:证明|凭证)',
     }
     return bool(category_id in patterns and re.fullmatch(patterns[category_id], target))
 
@@ -66,6 +69,10 @@ def _common_variant(title, category_id):
 def _special_score(title, category):
     """Match complete evidence-section titles, never a keyword in prose."""
     target = _normal(title, remove_years=True)
+    if category['id'] == 'text_template' and re.fullmatch(
+            r'(?:[（(]?(?:附件|附表|格式)[一二三四五六七八九十百零〇\d]+[）)]?[：:、.．\-]*)?'
+            r'(?:(?:法定代表人)?授权(?:委托)?书(?:格式)?|投标函|承诺[函书])', target):
+        return 130, '文书类型与正文标题'
     if target in {_normal(n, True) for n in [category['name'], *category.get('aliases', [])]}:
         return 130, '栏目名称或已配置别名'
     if len(target) > 50 or re.search(r'[。；;，,]', target):
@@ -257,10 +264,13 @@ def _page_size(document, top_index):
     return int(section.page_width - section.left_margin - section.right_margin), int(section.page_height - section.top_margin - section.bottom_margin)
 
 
-def _inspect(document, categories):
+def _inspect(document, categories, toc_elements=None):
     """Private records retain XML objects; public headings are JSON-only."""
     import recognition
+    from document_toc import excluded_paragraphs
     body = document.element.body
+    if toc_elements is None:
+        toc_elements = excluded_paragraphs(document)
     records = []
     common = [c for c in categories if c.get('layer', 'common') != 'special']
     special = [c for c in categories if c.get('layer') == 'special']
@@ -270,7 +280,7 @@ def _inspect(document, categories):
         title = _text(element).strip()
         if not title:
             continue
-        if _is_toc(element, paragraph):
+        if element in toc_elements:
             skipped_toc += 1
             continue
         path = _xml_path(element, body)
@@ -299,7 +309,7 @@ def _inspect(document, categories):
                           category_ids=_category_ids(token.group(1), common), _special_scores={},
                           _token=token.group(0), _occurrence=occurrence, _public=True)
             records.append(record)
-    recognition.resolve(document, records, categories)
+    recognition.resolve(document, records, categories, toc_elements)
     # A token and a role-specific attachment retain their enclosing original
     # authorization text for name checks, without moving their write-back anchor.
     for record in records:
@@ -327,7 +337,7 @@ def _public(record):
 
 def _read_template(path):
     try:
-        return Document(str(path))
+        return Document(path if hasattr(path, 'read') else str(path))
     except Exception as exc:
         raise ValueError("无法读取 Word 模板，请使用有效的 .docx 文件。") from exc
 
@@ -349,12 +359,14 @@ def _document_warnings(document, records, skipped_toc):
 
 def scan_document(template_path, categories, materials, special_category_ids=()):
     from recognition import family
+    from document_toc import excluded_paragraphs, excluded_locator_ids
     selected = set(special_category_ids)
     enabled = [dict(c) for c in categories if
                (c.get("layer", "common") == "common" or c["id"] in selected)
                and c.get("enabled", True)]
     document = _read_template(template_path)
-    records, skipped = _inspect(document, enabled)
+    toc_elements = excluded_paragraphs(document)
+    records, skipped = _inspect(document, enabled, toc_elements)
     requirements = records[0].get('_requirements', {}) if records else {}
     headings = [_public(r) for r in records if r["_public"]]
     mappings = []
@@ -371,7 +383,7 @@ def scan_document(template_path, categories, materials, special_category_ids=())
             locations[cid] = ('', match)
     for category in enabled:
         hits = [r for r in records if category["id"] in r["category_ids"]]
-        if category.get('layer') == 'special':
+        if category.get('layer') == 'special' and category['id'] != 'text_template':
             hits = [r for r in hits if r['id'] == locations[category['id']][0]]
         # An explicit token is the insertion point for its enclosing same-category section.
         tokens = [r for r in hits if r["kind"] == "placeholder"]
@@ -391,10 +403,16 @@ def scan_document(template_path, categories, materials, special_category_ids=())
                 row['required_years'] = list(row['requirement'].get('required_years', []))
             if hit and hit.get('location_match') and category.get('layer', 'common') == 'common':
                 row['location_match'] = copy.deepcopy(hit['location_match'])
+            if not hit and category['id'] == 'authorization':
+                row.update(title='被授权人身份证附件', location_match={'status': 'not_found', 'candidates': [],
+                    'reason': '授权委托书正文由文字模板填写；原文未单独标注被授权人身份证附件位置，不插入图片。'})
             if category.get("layer") == "special":
                 row.update(auto_match=False, action="fill",
-                           note="", layer="special", location_match=locations[category['id']][1])
+                           note="", layer="special", location_match=(
+                               copy.deepcopy(hit.get('location_match', {'status': 'matched', 'candidates': []}))
+                               if hit and category['id'] == 'text_template' else locations[category['id']][1]))
             elif hit:
+                from material_rules import partial_issue, automatic_ids
                 candidates = []
                 for material in materials:
                     if material.get("category_id") != category["id"]:
@@ -402,23 +420,18 @@ def scan_document(template_path, categories, materials, special_category_ids=())
                     probe = dict(row, material_ids=[material["id"]], action="fill")
                     checked = validate_mappings([probe], [material], headings, enabled)[0]
                     # In a multi-year column a single valid year may be a partial candidate.
-                    severe = [s for s in checked["issues"] if not s.startswith("缺少要求年度：")]
+                    severe = [s for s in checked["issues"] if not partial_issue(s)]
                     if not severe:
                         candidates.append(material)
-                if len(candidates) == 1:
-                    row.update(material_ids=[candidates[0]["id"]], action="fill")
-                elif candidates and row["required_years"]:
-                    counts = {y: sum(y in _material_years(m) for m in candidates) for y in row["required_years"]}
-                    if all(count <= 1 for count in counts.values()):
-                        candidates.sort(key=lambda m: (min(_material_years(m) or [9999]), str(m["id"])))
-                        row.update(material_ids=[m["id"] for m in candidates], action="fill")
-                    else:
-                        row["note"] = "存在同年度多个版本，请人工选择材料。"
-                elif len(candidates) > 1:
-                    row["note"] = "存在多个可用版本，请人工选择材料。"
+                ids = automatic_ids(row, candidates, headings, enabled)
+                if ids:
+                    row.update(material_ids=ids, action='fill')
+                elif candidates:
+                    row['note'] = '存在重叠版本或需按截止日核对缴费期限，请人工选择材料。'
             mappings.append(row)
     mappings = validate_mappings(mappings, materials, headings, enabled)
     return {"headings": headings, "mappings": mappings, "requirements": requirements,
+            "excluded_locator_ids": excluded_locator_ids(document, toc_elements, categories),
             "warnings": _document_warnings(document, records, skipped)}
 
 
@@ -486,6 +499,14 @@ def material_form_feedback(material, file_count=0):
 def _check_material(material, category_id, required, heading, special=False):
     errors, warnings = [], []
     name = str(material.get("name") or material.get("id") or "材料")
+    if category_id == 'tax_social':
+        from material_rules import tax_errors
+        errors.extend(tax_errors(material, heading))
+    if category_id == 'text_template':
+        from material_rules import text_kind
+        wanted, actual = text_kind(heading.get('title', '')), text_kind(name)
+        if wanted and actual != wanted:
+            errors.append(f'{name}：文书类型与目标栏目不符，请选择对应模板。')
     if material.get("category_id") != category_id and not (
             special and category_id in material.get("linked_category_ids", [])):
         errors.append(f"{name}：材料所属栏目不符。")
@@ -610,6 +631,11 @@ def validate_mappings(mappings, materials, headings, categories=None):
         year_options = requirement.get('year_options', []) if category_id == 'audit_report' else []
         if year_options:
             row['required_years'] = []
+        if category_id == 'tax_social' and heading:
+            from material_rules import period_issue
+            # Shown before any material is chosen, not only on a selected one.
+            if period_issue(heading):
+                warnings.append(period_issue(heading))
         action = row.get("action")
         if action not in {"fill", "missing", "skip"}:
             errors.append("处理方式无效。")
@@ -631,6 +657,7 @@ def validate_mappings(mappings, materials, headings, categories=None):
             if category_id == 'authorization' and heading and heading.get('authorization_has_images'):
                 errors.append('原授权书已含证件图片，系统保留原件；请先核对已有附件，避免重复或混用人员。')
             covered = set()
+            valid_materials = []
             for material_id in ids:
                 material = by_material.get(material_id)
                 if not material:
@@ -650,6 +677,10 @@ def validate_mappings(mappings, materials, headings, categories=None):
                 warnings.extend(warns)
                 if not errs:
                     covered.update(_material_years(material))
+                    valid_materials.append(material)
+            if category_id == 'tax_social' and heading:
+                from material_rules import tax_coverage_errors
+                errors.extend(tax_coverage_errors(valid_materials, heading))
             missing_years = sorted(set(row["required_years"]) - covered)
             if missing_years:
                 errors.append("缺少要求年度：" + "、".join(map(str, missing_years)) + "。")
@@ -842,7 +873,7 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
         raise ValueError("不能覆盖原始 Word 模板。")
     if not mappings:
         raise ValueError("没有可导出的栏目，请先扫描模板。")
-    if any(row.get("confirmed") is not True for row in mappings):
+    if mode == "reviewed" and any(row.get("confirmed") is not True for row in mappings):
         raise ValueError("所有栏目必须先逐项确认后才能导出。")
     report = progress or (lambda percent, stage: None)
     report(5, "正在读取模板")
@@ -863,7 +894,7 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
     by_locator = {r["id"]: r for r in records}
     public = [_public(r) for r in records]
     checked = validate_mappings(mappings, materials, public, categories)
-    if any(row.get('confirmed') is not True for row in checked):
+    if mode == 'reviewed' and any(row.get('confirmed') is not True for row in checked):
         raise ValueError('填充方式已变更，请重新核对并确认栏目后再导出。')
     invalid = [r for r in checked if r["status"] == "blocked"]
     if invalid:

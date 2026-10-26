@@ -248,7 +248,7 @@ class Store(SpecialLibrary):
     def common_reviewed(self, project):
         rows = [r for r in project['mappings']
                 if (self.get('category', r['category_id']) or {}).get('layer') == 'common']
-        return bool(rows) and all(r.get('confirmed') and r.get('status') != 'blocked' for r in rows)
+        return bool(rows) and all(r.get('status') != 'blocked' for r in rows)
 
     def project_reviewed(self, project):
         rows = project['mappings']
@@ -267,6 +267,7 @@ class Store(SpecialLibrary):
     def sync_material_matches(self, project):
         """Fill unresolved automatic matches without changing manual selections."""
         import engine
+        from material_rules import partial_issue, automatic_ids
         materials, categories = self.internal_materials(include_special=True, project=project), self.matching_categories(project)
         original = copy.deepcopy(project['mappings'])
         rows = engine.validate_mappings(original, materials, project['headings'], categories)
@@ -282,16 +283,9 @@ class Store(SpecialLibrary):
                     continue
                 probe = dict(row, action='fill', material_ids=[item['id']])
                 checked = engine.validate_mappings([probe], materials, project['headings'], categories)[0]
-                if not [issue for issue in checked['issues'] if not issue.startswith('缺少要求年度：')]:
+                if not [issue for issue in checked['issues'] if not partial_issue(issue)]:
                     candidates.append(item)
-            ids = []
-            if len(candidates) == 1:
-                ids = [candidates[0]['id']]
-            elif candidates and row.get('required_years'):
-                years = row['required_years']
-                if all(sum(y in item.get('years', []) for item in candidates) <= 1 for y in years):
-                    candidates.sort(key=lambda item: (min(item.get('years') or [9999]), item['id']))
-                    ids = [item['id'] for item in candidates]
+            ids = automatic_ids(row, candidates, project['headings'], categories)
             if candidates:
                 row.update(action='fill', material_ids=ids)
         rows = engine.validate_mappings(rows, materials, project['headings'], categories)
@@ -320,10 +314,11 @@ class Store(SpecialLibrary):
             self.put('project', project)
 
     def refresh_location_rows(self, project, scanned, layer):
-        """Upgrade known automatic locations; never replace a recorded manual choice."""
+        """Upgrade automatic locations and invalidate proven directory targets."""
+        excluded = set(scanned.get('excluded_locator_ids', []))
         proposals = {}
         for row in scanned['mappings']:
-            if row.get('layer', 'common') == layer:
+            if row.get('layer', 'common') == layer and row.get('locator_id') not in excluded:
                 proposals.setdefault(row['category_id'], []).append(row)
         requirements = scanned.get('requirements', {})
         project.setdefault('requirements', {}).update(requirements)
@@ -335,9 +330,19 @@ class Store(SpecialLibrary):
             old_locator = row.get('locator_id', '')
             match_status = row.get('location_match', {}).get('status')
             manual = match_status == 'manual' or (old_locator and not match_status)
-            if manual or row.get('action') == 'skip' or (layer == 'common' and row.get('auto_match') is False and row.get('action')=='missing'):
-                continue
+            directory = old_locator in excluded
+            preserve_choice = (manual or row.get('action') == 'skip' or
+                (row.get('action') == 'missing' and (directory or (layer == 'common' and row.get('auto_match') is False))))
             choices = proposals.get(row['category_id'], [])
+            if directory and preserve_choice:
+                row.update(locator_id='', confirmed=False, location_match={
+                    'status': 'ambiguous', 'reason': '原位置属于目录，不能插入材料；请核对正文位置',
+                    'candidates': [{'locator_id': r['locator_id'], 'title': r['title']} for r in choices if r['locator_id']]})
+                if occupied.get(old_locator) == row['id']:
+                    occupied.pop(old_locator)
+                continue
+            if preserve_choice:
+                continue
             same = [r for r in choices if r.get('locator_id') == old_locator and old_locator]
             proposal = same[0] if same else choices[0] if len(choices) == 1 else None
             if proposal:
@@ -345,7 +350,7 @@ class Store(SpecialLibrary):
                 match = copy.deepcopy(proposal.get('location_match', {}))
                 if locator and occupied.get(locator, row['id']) != row['id']:
                     locator = ''
-                    match.update(status='ambiguous', reason='新识别位置已被其他核对项使用，请核对', candidates=[])
+                    match.update(status='ambiguous', reason=('原位置属于目录，正文位置已被其他核对项使用，请核对' if directory else '新识别位置已被其他核对项使用，请核对'), candidates=[])
                 row.update(locator_id=locator, title=proposal['title'], confirmed=False,
                            existing_content=proposal['existing_content'], location_match=match)
                 if old_locator and occupied.get(old_locator) == row['id']:
@@ -354,10 +359,25 @@ class Store(SpecialLibrary):
                     occupied[locator] = row['id']
             elif old_locator:
                 row.update(locator_id='', confirmed=False, location_match={
-                    'status': 'ambiguous', 'reason': '原自动位置已失效，请核对新识别的候选位置',
+                    'status': 'ambiguous', 'reason': ('原位置属于目录，不能插入材料；请核对正文位置' if directory else '原自动位置已失效，请核对新识别的候选位置'),
                     'candidates': [{'locator_id': r['locator_id'], 'title': r['title']} for r in choices if r['locator_id']]})
+                if occupied.get(old_locator) == row['id']:
+                    occupied.pop(old_locator)
         if any(not r.get('confirmed') for r in project['mappings']):
             project['status'] = '待确认'
+        # Shared tax/social and text-template categories can acquire distinct
+        # body slots under the new rules. Keep existing decisions and surface
+        # newly discovered slots instead of silently dropping them.
+        represented = {(r['category_id'], r.get('locator_id')) for r in project['mappings']}
+        existing_ids = {r['id'] for r in project['mappings']}
+        for fresh in scanned['mappings']:
+            if (fresh.get('layer', 'common') == layer
+                    and fresh['category_id'] in {'tax_social', 'text_template'}
+                    and fresh.get('locator_id')
+                    and (fresh['category_id'], fresh['locator_id']) not in represented
+                    and fresh['id'] not in existing_ids):
+                project['mappings'].append(copy.deepcopy(fresh))
+                project['status'] = '待确认'
 
     def sync_special_locations(self, project):
         """Backfill unresolved legacy positions once, preserving every user decision."""
@@ -371,9 +391,10 @@ class Store(SpecialLibrary):
         scanned = engine.scan_document(source, self.matching_categories(project),
             self.internal_materials(include_special=True, project=project), project.get('special_category_ids', []))
         self.refresh_location_rows(project, scanned, 'special')
-        # Include newly recognized plain-text headings without dropping old manual choices.
-        headings = {h['id']: h for h in project['headings']}
-        headings.update({h['id']: h for h in scanned['headings']})
+        # Keep old manual targets unless the new scan proves they are directory entries.
+        excluded = set(scanned.get('excluded_locator_ids', []))
+        headings = {h['id']: h for h in project['headings'] if h['id'] not in excluded}
+        headings.update({h['id']: h for h in scanned['headings'] if h['id'] not in excluded})
         project['headings'] = list(headings.values())
         project['special_locator_version'] = engine.SPECIAL_LOCATOR_VERSION
         self.put('project', project)
@@ -390,8 +411,9 @@ class Store(SpecialLibrary):
         scanned = engine.scan_document(source, self.matching_categories(project),
             self.internal_materials(include_special=True, project=project), project.get('special_category_ids', []))
         self.refresh_location_rows(project, scanned, 'common')
-        headings = {h['id']: h for h in project['headings']}
-        headings.update({h['id']: h for h in scanned['headings']})
+        excluded = set(scanned.get('excluded_locator_ids', []))
+        headings = {h['id']: h for h in project['headings'] if h['id'] not in excluded}
+        headings.update({h['id']: h for h in scanned['headings'] if h['id'] not in excluded})
         project['headings'] = list(headings.values())
         fresh_authorization = {h['id'] for h in scanned['headings'] if 'authorization' in h.get('category_ids', [])}
         for heading in project['headings']:
@@ -683,6 +705,18 @@ class Store(SpecialLibrary):
         project['status'] = '待确认'
         return project
 
+    def prepare_text_materials(self, key):
+        """Open text review directly using the enabled library categories."""
+        categories = sorted(self.all('category'), key=lambda c: c['sort_order'])
+        text_categories = {'text_template'}
+        for material in self.all('material'):
+            if material.get('mode') == 'text' and not material.get('archived'):
+                text_categories.update([material['category_id'], *material.get('linked_category_ids', [])])
+        ids = [c['id'] for c in categories if c.get('layer') == 'special' and c.get('enabled')
+               and c['id'] in text_categories]
+        return self.select_special_categories(key, {
+            'category_ids': ids, 'no_special_materials': not ids})
+
     def select_special_categories(self, key, body):
         import engine
         project = self.sync_material_matches(self.require('project', key))
@@ -876,12 +910,14 @@ class Store(SpecialLibrary):
         project = self.sync_material_matches(self.require('project', key))
         self.db.commit()
         if not project.get('special_selection_confirmed'):
-            raise ValueError('请先完成专用材料分类选择及核对，再导出标书。')
+            raise ValueError('请先进入文字材料核对，再导出标书。')
         materials = self.internal_materials(include_special=True, project=project)
         categories = self.matching_categories(project)
         mappings = engine.validate_mappings(project['mappings'], materials, project['headings'], categories)
-        if not mappings or any(not v.get('confirmed') for v in mappings):
-            raise ValueError('请先逐项确认全部栏目，再导出标书')
+        if not mappings:
+            raise ValueError('没有可导出的栏目，请先扫描模板')
+        if mode == 'reviewed' and any(not v.get('confirmed') for v in mappings):
+            raise ValueError('未经人工核对的材料请导出初稿')
         if any(v.get('status') == 'blocked' for v in mappings):
             raise ValueError('存在不满足要求的材料或定位，请修正后再导出')
         if mode == 'reviewed' and any(v.get('action') == 'missing' or v.get('status') == 'missing' for v in mappings):
@@ -1078,6 +1114,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(store.update_mappings(bits[2], body))
                 if method == 'PATCH' and bits[3] == 'special-categories':
                     return self.json_response(store.select_special_categories(bits[2], body))
+                if method == 'POST' and bits[3] == 'text-materials':
+                    return self.json_response(store.prepare_text_materials(bits[2]))
                 if method == 'POST' and bits[3] == 'export-jobs':
                     return self.json_response(store.export_jobs.start(bits[2], body), 202)
                 if method == 'POST' and bits[3] == 'export':

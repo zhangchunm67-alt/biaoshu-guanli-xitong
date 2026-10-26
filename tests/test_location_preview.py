@@ -4,6 +4,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -180,6 +181,25 @@ class RenderedLocationTests(unittest.TestCase):
                     page.close()
         finally:
             pdf.close()
+
+    def test_card_previews_share_one_recognition_and_detect_changed_files(self):
+        rows = [r for r in self.scan['mappings'] if r['category_id'] == 'company_profile']
+        self.preview._recognized.clear()
+        with patch.object(engine, '_inspect', wraps=engine._inspect) as inspect:
+            first, second = [self.preview.describe(self.snapshot(r['locator_id'])) for r in rows]
+            self.assertEqual(1, inspect.call_count)
+            self.preview.describe(self.snapshot(rows[0]['locator_id'], categories=self.categories[:-1]))
+            self.assertEqual(2, inspect.call_count)
+        self.assertEqual(([1], [2]), (first['target_pages'], second['target_pages']))
+        copy_path = self.root / 'changed.docx'
+        copy_path.write_bytes(self.raw)
+        self.preview.describe(self.snapshot(rows[0]['locator_id'], template=copy_path))
+        # Same size and restored mtime: only the bytes reveal the replacement.
+        stat = copy_path.stat()
+        copy_path.write_bytes(self.raw[:-1] + bytes([self.raw[-1] ^ 1]))
+        os.utime(copy_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        with self.assertRaisesRegex(ValueError, '已变化'):
+            self.preview.describe(self.snapshot(rows[0]['locator_id'], template=copy_path))
 
     def test_invalid_locator_stale_hash_and_bad_page_fail_explicitly(self):
         with self.assertRaisesRegex(ValueError, '已失效'):

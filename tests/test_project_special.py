@@ -58,10 +58,10 @@ class ProjectSpecialTests(unittest.TestCase):
         return self.store.update_mappings(self.p['id'], {'mappings': [row]})
 
     def test_sequence_and_explicit_empty_selection(self):
-        with self.assertRaisesRegex(ValueError, '通用材料'):
-            self.select(['I01'])
+        self.assertFalse(self.current()['mappings'][0]['confirmed'])
+        self.assertTrue(self.store.common_reviewed(self.current()))
         self.common_confirm()
-        with self.assertRaisesRegex(ValueError, '专用材料分类'):
+        with self.assertRaisesRegex(ValueError, '文字材料核对'):
             self.store.export(self.p['id'], {'mode': 'reviewed'})
         for body in ({'category_ids': []}, {'category_ids': ['company_profile']},
                      {'category_ids': ['I01', 'I01']}, {'category_ids': ['I01'], 'no_special_materials': True}):
@@ -156,7 +156,7 @@ class ProjectSpecialTests(unittest.TestCase):
         p = self.current()
         self.assertFalse(p['special_selection_confirmed'])
         self.assertTrue(p['mappings'][0]['confirmed'])
-        with self.assertRaisesRegex(ValueError, '专用材料分类'):
+        with self.assertRaisesRegex(ValueError, '文字材料核对'):
             self.store.export(self.p['id'], {'mode': 'draft'})
 
     def test_industry_selection_expands_all_columns_and_preserves_common(self):
@@ -176,8 +176,9 @@ class ProjectSpecialTests(unittest.TestCase):
         self.assertEqual(['insurance', 'bank'], self.current()['special_industry_ids'])
 
     def test_industry_request_validation_and_explicit_none(self):
-        with self.assertRaisesRegex(ValueError, '通用材料'):
-            self.store.select_special_categories(self.p['id'], {'industry_ids': ['insurance']})
+        selected = self.store.select_special_categories(self.p['id'], {'industry_ids': ['insurance']})
+        self.assertTrue(selected['special_selection_confirmed'])
+        self.assertFalse(selected['mappings'][0]['confirmed'])
         self.common_confirm()
         for body in ({'industry_ids': 'insurance'}, {'industry_ids': ['insurance', 'insurance']},
                      {'industry_ids': ['unknown']}, {'industry_ids': []},
@@ -206,7 +207,11 @@ class ProjectSpecialTests(unittest.TestCase):
         common = next(r for r in p['mappings'] if r['layer'] == 'common')
         p = self.store.update_mappings(self.p['id'], {'mappings': [
             dict(common, note='重新核对', confirmed=False)]})
-        self.assertFalse(any(r['confirmed'] for r in p['mappings']))
+        self.assertFalse(next(r for r in p['mappings'] if r['layer'] == 'common')['confirmed'])
+        self.assertTrue(next(r for r in p['mappings'] if r['layer'] == 'special')['confirmed'])
+        with self.assertRaisesRegex(ValueError, '未经人工核对'):
+            self.store.export(self.p['id'], {'mode': 'reviewed'})
+        self.assertEqual(2, self.store.export(self.p['id'], {'mode': 'draft'})['filled_count'])
         self.common_confirm()
         self.fill(material)
         self.assertEqual(2, self.store.export(self.p['id'], {'mode': 'reviewed'})['filled_count'])

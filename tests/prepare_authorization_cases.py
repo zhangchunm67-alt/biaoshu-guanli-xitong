@@ -19,12 +19,14 @@ for mid in ids:
   shutil.copy2(ROOT/'标书管理系统/data'/f['storage'],dest);store.put('file',f)
 store.db.commit()
 cases=[]
-for label,needle in [
- ('东方基金','东方基金'),
- ('太平洋健康2026','直播供应商（增补）')]:
- source=next(p for p in (ROOT/'标书管理系统/考题').glob('*/考题.docx') if needle in str(p))
+# Images go only to a labelled agent ID slot; the letter body is for the text template.
+for label,needles,slot in [
+ ('东方基金',['东方基金'],False),
+ ('太平洋健康2026',['直播供应商（增补）'],False),
+ ('宁波银行',['宁波银行','第三次'],True)]:
+ source=next(p for p in (ROOT/'标书管理系统/考题').glob('*/考题.docx') if all(n in str(p) for n in needles))
  p=store.create_project({'name':'授权书验证_'+label,'filename':source.name,'data':base64.b64encode(source.read_bytes()).decode()})
- cases.append({'label':label,'id':p['id'],'source':str(source)})
+ cases.append({'label':label,'id':p['id'],'source':str(source),'slot':slot})
 # Simulate pre-removal saved settings; opening the project must discard them.
 legacy=store.require('project', cases[0]['id'])
 row=next(r for r in legacy['mappings'] if r['category_id']=='authorization')

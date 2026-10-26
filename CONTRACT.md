@@ -19,12 +19,13 @@
   - 接受 `.doc` / `.docx`，原文件及转换后的工作模板均不得超过 30 MB。实际为 OOXML 的 `.doc` 保持字节不变；OLE 旧版 Word 通过本机 LibreOffice 转换，拒绝宏、嵌入文件、加密和损坏文档，转换最多 60 秒。
   - project.template_import_kind 为 docx / docx_with_doc_suffix / converted_doc；template_hash 是工作模板指纹，template_source_hash 是原上传指纹。旧版/后缀不符文件额外保留 templates/<id>.original.doc，存储路径不公开。转换警示进入项目页面和导出报告；转换临时目录自动清理，失败不留下项目或模板副本。
 - POST /api/projects/:id/scan {} -> 完整 project（重扫会清除确认）
+- POST /api/projects/:id/text-materials {} -> 完整 project。图片材料核对后直接进入文字材料核对，由后端加载已启用的文书模板栏目及有未归档文字材料的栏目，不要求选择行业；重复进入保留已选材料、位置与备注。没有已启用文字栏目时返回空文字核对列表，仍可继续导出。界面流程为“上传标书 → 核对图片材料 → 核对文字材料 → 导出标书”；旧 `special-categories` 接口仅保留兼容，新界面不再调用。
 - POST /api/projects/:id/location-preview {mapping_id,locator_id,material_ids:[],action} -> {preview_id,page_count,initial_page,target_pages:[],markers:[{page,x,y,kind,label}],title,description,template_name}。使用当前未保存选择，仅允许本项目核对项、位置及材料范围；不写项目、不清除确认。locator_id 允许空字符串，此时从第 1 页展示原文，target_pages 和 markers 为空；非空位置仍须属于当前项目。x/y 为页面左上角归一化坐标，page 从 1 开始，kind 为 after/cell/table。
 - GET /api/projects/:id/location-preview/:preview_id/pages/:page -> image/png。只允许当前项目模板对应的缓存及有效页码；过期或无法可靠定位时返回明确错误，不用猜测页码。
   - 在临时 Word 副本的非空段落中添加不可见定位书签，映射至 PDF 页面后显示原页及独立标记层；源模板不变。空白单元格与表格后追加从实际 PDF 边框定位，避免书签撑高空白表格；无边框、边界不完整或无法可靠区分的复杂表格会明确报错。复用导出的正文锚点与空白表格选择规则。渲染在数据库锁外运行，最多 90 秒，最多 600 页 / 15000 段；缓存保留最近两份模板，页面图片按需生成，服务关闭清理。
 - PATCH /api/projects/:id/mappings {mappings:[{id,locator_id,material_ids:[],action:'fill'|'missing'|'skip',confirmed:true|false,note}]} -> 完整 project。未知id拒绝；后端重新校验匹配。
 - PATCH /api/projects/:id/special-categories {industry_ids:[],no_special_materials:false} -> 完整 project。通用核对完成后才能提交；后端将所选行业展开为其全部启用专用栏目。空行业必须显式 no_special_materials:true；未知、重复行业拒绝。保存后生成核对项，保留通用核对；栏目范围变化取消专用确认。兼容旧客户端的 category_ids，但两种参数不可同时提交。
-- POST /api/projects/:id/export {mode:'draft'|'reviewed'} -> export。所有行必须先确认；draft 允许已确认缺项/跳过并在报告/文档标明，reviewed 拒绝缺项和不满足要求的材料。
+- POST /api/projects/:id/export {mode:'draft'|'reviewed'} -> export。draft 不要求逐项确认，允许缺项/跳过并在报告/文档标明；所有模式拒绝材料或位置错误，reviewed 要求全部就绪且确认。
 - GET /api/exports/:id/download -> docx
 - GET /api/exports/:id/report -> 可下载 JSON 核对报告（含来源、结果、缺项；不要绝对路径）
 
@@ -52,7 +53,7 @@ industry: {id,name,created_at}
 
 - scan_document(template_path,categories,materials,special_category_ids=()) -> {headings:[],mappings:[],warnings:[]}; 默认只匹配启用 common 栏目，显式选择的 special 分类纳入扫描但不自动选择材料；为每栏目至少保留一行，同标题多处需保留独立定位，不自动使用目录。定位 id 由原文档结构生成并保持稳定，禁止使用可变页码。
 - validate_mappings(mappings,materials,headings,categories=None) -> 重新计算的 mapping 列表，category/year/file/expiry/subject 为强约束，缺失年度完整集合必须发现。material内部files包含path绝对路径，仅引擎使用，不给前端。
-- export_document(template_path,output_path,mappings,materials,mode='draft') -> {results:[],filled_count,missing_count,skipped_count,warnings:[]}; 每次从原模板开始，按精确 locator_id 操作，禁止越界填充；未确认拒绝；draft 确认缺项插红色待补，reviewed 拒绝缺项。保持原内容，新增图片/文本，按材料顺序和file_order，应用单图旋转，不修改源图。标题定位只在当前节内，避免混到子节。设置Word更新目录域，明确不自动更新人工写死页码。
+- export_document(template_path,output_path,mappings,materials,mode='draft') -> {results:[],filled_count,missing_count,skipped_count,warnings:[]}; 每次从原模板开始，按精确 locator_id 操作，禁止越界填充；draft 不要求确认，缺项插红色待补；reviewed 拒绝未确认、缺项和跳过。保持原内容，新增图片/文本，按材料顺序和file_order，应用单图旋转，不修改源图。标题定位只在当前节内，避免混到子节。设置Word更新目录域，明确不自动更新人工写死页码。
 
 默认七栏目 id: legal_identity, authorization, business_license, audit_report, tax_social, company_profile, iso_cert。审计栏目名称“2023-2024年财务审计报告”，别名含“财务审计报告”“审计报告”；required_years 从原文财务提交条款及目标标题提取，不从栏目配置名称推断。明确“2024或2025”记录为 year_options 的替代集合，不强制全部年度；未指定时不默认2023/2024。材料年度只信years元数据，不能信别名绕过。材料 subject 非空（种子用北京腾宝科技有限公司）；其他主体阻止自动匹配。缺失有效期标为待核对提示，不伪称有效。
 
@@ -99,3 +100,15 @@ POST /api/materials/validate 接收材料表单字段、可选 material_id 与 u
 - 正文和表格单元格可提供需求证据。优先应答格式中的明确附件标签、实际表单和显式占位符；无正式位置时，同义名称或去除副本、复印件、盖章等修饰后对应的独立材料条目可直接作为位置，包括编制说明中的提交清单。评分表、合同条款、否定要求、其他主体证件不作为自动位置。at: 为按栏目区分的原始附件或材料条目，不使用可变页码。
 - 附件/附表/格式编号、中文括号标题、6-5 等小节编号和并列材料清单限定写入范围。法人/代理人的独立证件表格分别定位；已有正文保持不变。清单条目直接在原段落后插入，表格内在同一单元格插入；重复清单按应答区域、匹配程度、原文顺序择一。location_match.method=entry 标记条目匹配，alternative_count 记录其他同类条目数量。多个独立专用应答栏目或跨行业共用位置仍要求核对；通用材料只在有需求且无对应条目或附件位置时生成文末区。
 - 位置版本升级更新有自动匹配记录的旧位置及未定位项，并清除受影响确认；已有人工位置、跳过、手动材料及备注保留。无法证明是自动选择的旧位置保留。未来所有类别的人工位置调整均记录 location_match.status=manual。旧自动位置不再可靠或候选冲突时清空位置并提示核对。
+- 商务提交的是待填充的投标文件框架。`document_toc.py` 在通用/专用栏目识别、预览和导出之前统一排除目录：Word 目录样式/链接/跨段落目录域（目录域结束标记所在段落如另有正文则保留），以及有目录标题或后续重复正文证据的手工目录。目录标题后的标题—页码表格同样排除；仅同名或短标题密集不作为删除正文的依据；只出现一次、且把同名栏目隔在两侧的“第X章/节/部分/篇”或“一、二、”标题之间的同名空白栏目均保留；章节标题在后文重复的无标题目录仍排除。投标文件格式章节内的评审索引（形式/资格/响应性评审标准，含编号或组合写法）按评分区处理；其后带中文序号的应答文书标题只有在下文不是评分语句、且为文书标题或有正文时（如“（一）投标函”）才恢复为应答格式区。章级标题或“评标办法”等评审方法标题结束格式章节。两份独立正文继续保留各自定位，授权委托书正文标题支持“格式”后缀。
+- 扫描返回 `excluded_locator_ids` 供旧项目升级：明确属于目录的位置不再进入选项；旧人工目录位置也取消定位并提示重新核对，材料、备注和处理方式保留。已知自动位置可迁至唯一且未被占用的正文；多个候选不猜选。导出重新识别原稿，拒绝沿用失效目录位置。未证实属于目录的普通材料清单保留原有填充能力。
+
+## 共享分类内的材料校验
+
+- `material_rules.py` 区分纳税和社保凭证；合并位置要求两类均覆盖。明确年月以材料名称/版本中的所属期核对，付款日期、打印日期及年份不能替代缴费月份；所属期支持“2025年1月至6月”“2025年1-6月”“2025年1至6月”“2025年12-2026年2月”等写法；逆序等无法完整识别的区间不按单月回退，不自动选择，核对项在选择材料前即提示。区间先完整解析（“自2025年1月至2025年6月截止”保留终点），单独的提交/递交日期不作为所属期。月份按位置归属凭证类型：紧接在凭证名称前的期间（“2025年1月的纳税证明”）属于该凭证，其余期间延续其前最近的凭证（“纳税证明所属期为2025年1月和2025年2月”）；每句只约束其中提到的凭证，句中提到但未写月份的凭证共用该句月份。文末新增材料区按原文需求证据核对凭证类型和所属期。月度或同年度重叠版本留给人工选择，互补年度视为一组；年度、凭证类型或月份只能部分覆盖时仍自动预选唯一组合，缺少部分保留为问题。
+- “近六个月”等相对期限缺少结构化投标截止日时一律不自动选材料，即使原文另有提交日期等绝对日期；人工选定后仍提示核对所属期。
+- `text_template` 在每个独立正文位置生成核对项，投标函、授权书、承诺函不可跨类型使用；带附件编号或序号的外层标题紧接同名文书标题时（“附件5：法定代表人授权书格式”与“法定代表人授权委托书”）合并为一个核对项，避免正文导出两次；不同名称的同类文书（保密承诺函、廉洁承诺函）分别核对。文字模板仍须人工选择，不改写原有正文。
+- 授权委托书标题/正文只作为文字模板位置。通用 `authorization` 图片栏目只定位到单独标注的被授权人/委托代理人/授权代理人身份证或护照复制件附件位或条目（复印件、扫描件、正反面等，或以身份证/护照结尾的条目，“附：”前缀可省略），包括授权书正文后的附件说明行；号码填写栏、真实性声明、原件（含正反面）查验不是附件位，括号内的号码栏（“号码：____”）和声明同样排除；括号内的质量说明（如“号码应清晰可辨”）不影响判定，整段括号的证件条目可识别；没有时记为缺项（标题“被授权人身份证附件”），不生成文末材料区。
+- 小数编号（如4.1、4.2）隔开各自材料位置；共享分类新增正文位置在旧项目升级时补出核对项，已有材料、备注和人工决定保留。
+- 原页预览每次请求读取模板字节并校验指纹，校验、识别和渲染使用同一份字节；按模板指纹和栏目配置缓存解析识别结果（最多两份），逐卡片预览不重复解析模板。
+- `scripts/audit_matching.py --data-dir data --corpus 考题` 只读核查本地库和模板，在临时目录验证导出图片数量、目录不变及原稿指纹，结束自动清理。它不代表招标业务验收或可直接投标。

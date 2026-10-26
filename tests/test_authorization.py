@@ -59,13 +59,14 @@ class AuthorizationImagesTests(unittest.TestCase):
         doc.add_paragraph('本授权书于   年  月  日签字生效，特此声明。')
         doc.add_paragraph('单位名称：（盖公章）')
         doc.add_paragraph('日期：')
+        doc.add_paragraph('附：被授权人身份证复印件')
         doc.add_paragraph('附件6：资格证明文件')
         doc.add_paragraph('下面原文不得改变')
         return doc
 
     def test_matching_entry_receives_only_selected_images_without_generating_body(self):
         doc = Document()
-        doc.add_paragraph('法人代表授权书（加盖公章）；')
+        doc.add_paragraph('被授权人身份证复印件（加盖公章）；')
         row, scan = self.prepare(doc)
         source_bytes = self.source.read_bytes()
         row = self.checked(row, scan)
@@ -89,7 +90,7 @@ class AuthorizationImagesTests(unittest.TestCase):
         row['material_ids'] = ['authorization']
         row = self.checked(row, scan)
         self.assertEqual('ready', row['status'], row['issues'])
-        self.assertTrue(row['locator_id'].startswith('p:'))
+        self.assertTrue(row['locator_id'].startswith('at:authorization:'))
         engine.export_document(self.source, self.output, [row], self.materials, categories=self.categories, mode='reviewed')
         result = Document(self.output)
         original = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -104,7 +105,7 @@ class AuthorizationImagesTests(unittest.TestCase):
 
     def test_images_do_not_require_both_roles_or_personal_fields(self):
         doc = Document()
-        doc.add_paragraph('请提供法定代表人授权委托书。')
+        doc.add_paragraph('被授权人身份证复印件；')
         row, scan = self.prepare(doc)
         for ids in [['authorization'], ['legal_identity'], ['legal_identity', 'authorization']]:
             checked = self.checked(dict(row, material_ids=ids), scan)
@@ -116,7 +117,9 @@ class AuthorizationImagesTests(unittest.TestCase):
         row['authorization'] = dict(enabled=True, signed_on='', project_name='不得写入')
         row['authorization_preview'] = {'body_lines': ['不得写入']}
         with self.assertRaisesRegex(ValueError, '重新核对'):
-            engine.export_document(self.source, self.output, [row], self.materials, categories=self.categories)
+            engine.export_document(self.source, self.output, [row], self.materials, 'reviewed', categories=self.categories)
+        engine.export_document(self.source, self.output, [row], self.materials, 'draft', categories=self.categories)
+        self.assertNotIn('不得写入', '\n'.join(p.text for p in Document(self.output).paragraphs))
         checked = self.checked(row, scan)
         self.assertEqual('ready', checked['status'], checked['issues'])
         self.assertFalse(checked['confirmed'])
@@ -125,6 +128,133 @@ class AuthorizationImagesTests(unittest.TestCase):
         checked['confirmed'] = True
         engine.export_document(self.source, self.output, [checked], self.materials, categories=self.categories)
         self.assertNotIn('不得写入', '\n'.join(p.text for p in Document(self.output).paragraphs))
+
+    def test_letter_body_takes_only_the_text_template(self):
+        categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],
+                                             layer='special', enabled=True)]
+        materials = self.materials + [dict(id='letter', name='法定代表人授权委托书模板',
+            category_id='text_template', subject=engine.EXPECTED_SUBJECT, mode='text',
+            content='授权委托书文字模板正文', files=[], years=[], valid_until='长期')]
+        for agent_slot in (True, False):
+            doc = Document()
+            doc.add_heading('法定代表人授权委托书', 1)
+            doc.add_paragraph('本授权书声明：本人甲某系北京腾宝科技有限公司的法定代表人，现委托乙某，为我方代理人。')
+            doc.add_paragraph('日期：')
+            if agent_slot:
+                doc.add_paragraph('附：被授权人身份证复印件')
+            doc.add_heading('附件6：资格证明文件', 1)
+            doc.save(self.source)
+            scan = engine.scan_document(self.source, categories, materials, ['text_template'])
+            image = next(r for r in scan['mappings'] if r['category_id'] == 'authorization')
+            letter = next(r for r in scan['mappings'] if r['category_id'] == 'text_template')
+            self.assertEqual('法定代表人授权委托书', letter['title'])
+            self.assertFalse(any(h['id'].startswith('ca:authorization') for h in scan['headings']))
+            rows = [dict(letter, action='fill', material_ids=['letter'])]
+            if agent_slot:
+                self.assertTrue(image['locator_id'].startswith('at:authorization:'))
+                rows.append(dict(image, action='fill', material_ids=['authorization']))
+            else:
+                self.assertEqual(('', 'missing'), (image['locator_id'], image['status']))
+                self.assertIn('文字模板', image['location_match']['reason'])
+                rows.append(image)
+            checked = engine.validate_mappings(rows, materials, scan['headings'], categories)
+            self.assertEqual(['ready', 'ready' if agent_slot else 'missing'],
+                             [r['status'] for r in checked], checked)
+            engine.export_document(self.source, self.output, checked, materials, categories=categories)
+            text = [p.text for p in Document(self.output).paragraphs]
+            self.assertEqual(1, text.count('授权委托书文字模板正文'))
+            self.assertEqual(2 if agent_slot else 0, len(Document(self.output).inline_shapes))
+            self.assertEqual(not agent_slot, any('待补：被授权人身份证附件' in t for t in text))
+
+    def test_agent_id_slots_need_a_copy_and_accept_passports(self):
+        categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],
+                                             layer='special', enabled=True)]
+        cases = {'附：被授权人护照复印件': True, '附：委托代理人护照复印件': True,
+                 '授权代理人身份证/护照复印件（正反面）': True, '附：被授权人身份证复印件（原件备查）': True,
+                 '附：被授权人身份证号码：________': False, '附：被授权人身份证的真实性声明': False,
+                 '附：被授权人身份证原件（开标现场查验）': False,
+                 '附：被授权人身份证原件（正反面，开标现场查验）': False,
+                 '附：被授权人身份证复印件（号码应清晰可辨）': True, '（被授权人身份证）': True,
+                 '被授权人身份证（正、反面）': True, '附：被授权人身份证（号码：____）': False,
+                 '附：被授权人身份证（真实性声明）': False}
+        for region in ([], ['第六章 投标文件格式']):
+            for label, expected in cases.items():
+                with self.subTest(region=bool(region), label=label):
+                    doc = Document()
+                    for line in region + ['附件3：法定代表人授权书', '本授权书声明：现委托乙某办理投标事项。',
+                                          '日期：', label, '附件4：资格证明文件']:
+                        doc.add_paragraph(line)
+                    doc.save(self.source)
+                    scan = engine.scan_document(self.source, categories, self.materials, ['text_template'])
+                    image = next(r for r in scan['mappings'] if r['category_id'] == 'authorization')
+                    letter = next(r for r in scan['mappings'] if r['category_id'] == 'text_template')
+                    self.assertEqual('附件3：法定代表人授权书', letter['title'])
+                    self.assertEqual(expected, image['locator_id'].startswith('at:authorization:'), image)
+                    if expected:
+                        checked = self.checked(dict(image, action='fill', material_ids=['authorization']), scan)
+                        self.assertEqual('ready', checked['status'], checked['issues'])
+                    else:
+                        self.assertEqual(('', 'missing'), (image['locator_id'], image['status']))
+
+    def test_review_index_in_format_chapter_ends_at_numbered_response_forms(self):
+        # Anonymized structure of a real framework: the format chapter opens
+        # with a review index before the numbered response forms.
+        lines = ['第三章 评标办法', '形式评审标准', '法定代表人（负责人）授权委托书',
+                 '第六章 投标文件格式', '一、商务文件', '形式评审标准', '法定代表人（负责人）身份证明',
+                 '法定代表人（负责人）授权委托书', '资格评审标准', '营业执照（或其他证明文件）', '同类业绩',
+                 '（一）投标函', '致：招标人。我方已仔细研究招标文件。',
+                 '（二）法定代表人（负责人）身份证明', '法定代表人（负责人）身份证明', '兹证明甲某为本单位法定代表人。',
+                 '（三）法定代表人（负责人）授权委托书', '法定代表人（负责人）授权委托书',
+                 '本授权书声明：现委托乙某办理投标事项。', '日期：',
+                 '附：委托代理人身份证或护照等身份证明文件扫描件（身份证需同时提供正反面）', '（四）结束',
+                 '七、评标办法', '（一）服务方案', '方案完整得10分。']
+        doc = Document()
+        paragraphs = [doc.add_paragraph(line) for line in lines]
+        doc.save(self.source)
+        categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],
+                                             layer='special', enabled=True)]
+        scan = engine.scan_document(self.source, categories, self.materials, ['text_template'])
+
+        def locator(index):
+            p = paragraphs[index]._p
+            return 'p:' + '.'.join(map(str, engine._xml_path(p, doc.element.body))) + ':' + engine._digest(p)
+        located = {}
+        for row in scan['mappings']:
+            located.setdefault(row['category_id'], []).append(row['locator_id'])
+        self.assertEqual([locator(11), locator(17)], located['text_template'])
+        self.assertEqual(['at:authorization:' + locator(20)], located['authorization'])
+        self.assertEqual([locator(14)], located['legal_identity'])
+        self.assertFalse({locator(i) for i in (2, 6, 7, 9)} & {l for ls in located.values() for l in ls})
+        image = next(r for r in scan['mappings'] if r['category_id'] == 'authorization')
+        checked = self.checked(dict(image, action='fill', material_ids=['authorization']), scan)
+        self.assertEqual('ready', checked['status'], checked['issues'])
+        # A scoring section after the format chapter is not a response form.
+        records, _ = engine._inspect(engine._read_template(self.source), categories)
+        regions = {r['_path'][0]: r['_region'] for r in records if len(r['_path']) == 1}
+        self.assertEqual(['scoring', 'scoring'], [regions[22], regions[23]])
+
+    def test_numbered_items_inside_a_review_index_stay_scoring(self):
+        categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],
+                                             layer='special', enabled=True)]
+
+        def scan(lines):
+            doc = Document()
+            for line in lines:
+                doc.add_paragraph(line)
+            doc.save(self.source)
+            records, _ = engine._inspect(engine._read_template(self.source), categories)
+            regions = [r['_region'] for r in records if len(r['_path']) == 1 and r['kind'] != 'placeholder']
+            return regions, engine.scan_document(self.source, categories, self.materials, ['text_template'])
+        regions, scanned = scan(['第六章 投标文件格式', '形式评审标准', '（一）服务方案', '根据服务方案评分，最高十分。',
+                                 '资格评审标准', '（二）营业执照', '依据资质评分。', '（一）投标函', '致：招标人。'])
+        self.assertEqual(['form'] + ['scoring'] * 6 + ['form', 'form'], regions)
+        self.assertFalse([r for r in scanned['mappings'] if r['category_id'] == 'business_license'
+                          and r['locator_id'].startswith(('p:5:', 'at:business_license:p:5:'))])
+        # Numbered or combined review-index titles still keep the format chapter.
+        for head in ['商务和技术评审标准', '评审内容及标准', '（一）形式评审标准', '1.形式评审标准']:
+            with self.subTest(head=head):
+                regions, _ = scan(['第六章 投标文件格式', head, '营业执照', '（一）投标函', '致：招标人。'])
+                self.assertEqual(['form', 'scoring', 'scoring', 'form', 'form'], regions)
 
     def test_expired_missing_or_text_materials_still_block(self):
         row, scan = self.prepare(self.form())
@@ -135,12 +265,13 @@ class AuthorizationImagesTests(unittest.TestCase):
 
     def test_existing_images_and_conflicting_agent_still_block(self):
         doc = self.form()
-        doc.paragraphs[6].add_run().add_picture(self.materials[0]['files'][0]['path'])
+        doc.paragraphs[10].insert_paragraph_before().add_run().add_picture(self.materials[0]['files'][0]['path'])
         row, scan = self.prepare(doc)
         self.assertTrue(any('已含证件图片' in e for e in self.checked(row, scan)['issues']))
         doc = Document()
         doc.add_heading('法定代表人授权委托书', 1)
         doc.add_paragraph('本人甲某系北京腾宝科技有限公司的法定代表人，现委托丙某，为我方代理人。')
+        doc.add_paragraph('附：被授权人身份证复印件')
         row, scan = self.prepare(doc)
         self.assertTrue(any('丙某' in e and '乙某' in e for e in self.checked(row, scan)['issues']))
 

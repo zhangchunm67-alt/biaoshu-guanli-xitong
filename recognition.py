@@ -14,6 +14,42 @@ _REQUEST = re.compile(r'提供|提交|出具|附[上后：:]?|后附|须附|应�
 _IMAGE = re.compile(r'复印件|扫描件|影印件|电子件|正反面|双面|照片|粘贴|证书|合同.{0,16}(?:证明|关键页)|证明材料')
 _COPY = re.compile(r'后附|附[：:]|附上|须附|应附|需附|粘贴|复印件|扫描件|影印件|电子件')
 _SIGNATURE = re.compile(r'^(?:投标人|供应商|法定代表人|委托代理人|日期|年月日|年\s*月\s*日)')
+# An evaluation-method title leaves the format chapter; review criteria inside it do not.
+_METHOD = re.compile(r'(?:评标|评审|评分)(?:办法|方法|细则|程序)')
+_SECTION = re.compile(r'^(?:[（(][一二三四五六七八九十\d]+[）)]|[一二三四五六七八九十]+[、.．]|\d+[、.．])')
+_SCORE = re.compile(r'评分|得分|分值|满分|加分|扣分|最高[\d一二三四五六七八九十]+分|\d+(?:\.\d+)?分')
+_LETTER = re.compile(r'(?:投标|响应|报价)函|授权(?:委托)?书|身份证明|承诺[函书]|声明[函书]?$')
+_RESPONSE_FORM = re.compile(r'^(?:[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.．])'
+                            r'.{1,40}?(?:函|书|证明|表|方案|声明|承诺|报价|简介|介绍|材料|资料|文件|执照|证书)$')
+_AGENT = r'(?:委托代理人|授权代理人|被授权人|授权代表|代理人|受托人)'
+_ID_DOC = r'(?:身份证(?!号)|护照)'
+_AGENT_ID = re.compile(_AGENT + r'.{0,18}?' + _ID_DOC + r'|' + _ID_DOC + r'.{0,12}' + _AGENT)
+_ID_COPY = re.compile(r'复印件|扫描件|影印件|复制件|电子件|粘贴|照片')
+_ID_SIDES = re.compile(r'正反面|正、反面|双面')
+
+
+def agent_identity_target(title, attachment):
+    """Authorization images are agent ID copies; the letter itself takes a text template.
+
+    A number field, an authenticity statement or an original for inspection is
+    not a copy slot, even when it names the agent's ID. Notes in parentheses,
+    such as （号码应清晰可辨）, do not change what the slot asks for.
+    """
+    value = re.sub(r'^(?:[（(]?(?:附件|附表)\s*' + _NUMBER + r'[）)]?[：:、.．-]*|附[：:]?)', '', compact(title))
+    whole = re.fullmatch(r'[（(]([^（）()]+)[）)][；;。，,]?', value)
+    if whole:
+        value = whole[1]
+    main = re.sub(r'[（(][^）)]*[）)]', '', value).rstrip('；;。，,：:')
+    # A quality note such as （号码应清晰可辨） is ignored; a field or a
+    # statement, even in parentheses (（号码：____）, （真实性声明）), is not a copy.
+    if (not _AGENT_ID.search(value) or re.search(r'号码|证号', main)
+            or re.search(r'(?:号码|证号)[：:]|[_＿]{2,}|声明|承诺', value)):
+        return False
+    copy = _ID_COPY.search(value)
+    if not copy and re.search(r'原件|查验|核验', value):
+        return False
+    return bool((copy or _ID_SIDES.search(value) or re.search(_ID_DOC + r'$', main))
+                and (attachment or not re.search(r'授权(?:委托)?书', value)))
 
 
 def family(category):
@@ -81,7 +117,7 @@ def _matches(text, key):
     if key == 'authorization':
         if re.search(r'(?:平台|媒体|厂商|制造商|品牌|渠道).{0,12}授权', v) and not re.search(r'法定代表|委托代理人|被授权人', v):
             return False
-        return bool(re.search(r'(?:法定代表人|法人代表|法人|负责人)授权(?:委托)?书|授权委托书|委托代理人.{0,18}身份证|(?:被)?授权人.{0,18}身份证', v)
+        return bool(re.search(r'(?:法定代表人|法人代表|法人|负责人)授权(?:委托)?书|授权委托书|(?:委托|授权)?代理人.{0,18}(?:身份证|护照)|(?:被)?授权人.{0,18}(?:身份证|护照)', v)
                     or re.fullmatch(r'(?:\d+[.、])?授权书[：:；;]?', v))
     if key == 'audit_report':
         return bool(re.search(r'审计报告|财务(?:会计)?(?:报告|报表)|资产负债表|现金流量表|利润表', v) and
@@ -145,7 +181,9 @@ def entry_score(title, category):
         return 0
     value = re.sub(r'^[•●◆◇★☆*·\-—]+', '', raw)
     value = engine._normal(value, remove_years=True)
-    value = re.sub(r'^(?:附件|附表|格式)' + _NUMBER + r'[）):：、.．-]*', '', value)
+    value = re.sub(r'^(?:附[：:]|(?:附件|附表|格式)' + _NUMBER + r'[）):：、.．-]*)', '', value)
+    # An entry written wholly in parentheses is still the entry itself.
+    value = re.sub(r'^[（(【\[]([^（）()【】\[\]]+)[）)】\]][；;。]?$', r'\1', value)
     value = re.sub(r'[（(【\[].*?[）)】\]]', '', value)
     value = value.rstrip('：:；;。')
     value = re.sub(r'^(?:(?:投标人|投标方|供应商)(?:应|须|需)?|请|须|需|应)?(?:提供|提交|附上|后附)', '', value)
@@ -164,7 +202,7 @@ def entry_score(title, category):
     variants = {
         'business_license': r'(?:(?:投标人|投标方|供应商|企业法人|企业|公司|单位)的?)?(?:营业执照|工商营业执照|企业执照)',
         'legal_identity': r'(?:法定代表人|法人代表|法人|单位负责人)(?:身份证(?:明书?)?|证明书|护照)',
-        'authorization': r'(?:(?:法定代表人|法人代表|法人|单位负责人)的?)?授权(?:委托)?书|(?:委托代理人|被授权人|授权代表)(?:身份证(?:明)?|护照)',
+        'authorization': r'(?:(?:法定代表人|法人代表|法人|单位负责人)的?)?授权(?:委托)?书|(?:委托代理人|授权代理人|被授权人|授权代表)的?(?:身份证(?:明)?|护照)(?:[/／或及和、](?:身份证|护照))?',
         'audit_report': r'(?:近?[一二三\d-]+年)?(?:公司|企业|年度)?(?:财务(?:会计)?审计报告|年度审计报告|审计报告|财务(?:会计)?(?:报告|报表))',
         'tax_social': r'(?:依法)?(?:(?:税收|纳税|税款)(?:和|及|与)?(?:社会保障资金|社会保险|社保)?|社会保障资金|社会保险|社保)(?:缴纳|缴费)?(?:证明(?:材料)?|凭证|记录)|完税(?:证明|凭证)',
         'company_profile': r'(?:公司|企业|单位|供应商|投标人)(?:基本)?(?:简介|介绍|概况|情况介绍|情况表|信息表|情况)',
@@ -287,19 +325,42 @@ def _slot_record(base, category, own, title=None):
     return r
 
 
-def resolve(document, records, categories):
+def resolve(document, records, categories, toc_elements=()):
     """Prefer precise form slots, then corresponding material entries, then appendices."""
     import engine
     top = [r for r in records if len(r['_path']) == 1 and r['kind'] != 'placeholder']
     explicit_forms = any(region_title(r['title']) == 'form' for r in top)
     mode = ''
+    form_chapter = False
     regions = {}
-    for r in top:
+    def form_evidence(index):
+        # Inside a review index, a numbered title is a response form only when
+        # what follows it is not scoring text: a letter title, or body text.
+        body = []
+        for other in top[index + 1:index + 9]:
+            text = compact(other['title'])
+            if region_title(other['title']) or _SECTION.match(text) or re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)', text):
+                break
+            body.append(text)
+        body = ''.join(body)
+        return not _SCORE.search(body) and bool(body or _LETTER.search(compact(top[index]['title'])))
+    for index, r in enumerate(top):
         region = region_title(r['title'])
+        chapter = re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)', compact(r['title']))
         if region:
             mode = region
-        elif re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)',compact(r['title'])):
+            # Review criteria (形式评审标准, （一）资格评审标准 …) stay inside the
+            # format chapter; a chapter or an evaluation-method title leaves it.
+            if region != 'scoring' or chapter or _METHOD.search(compact(r['title'])):
+                form_chapter = region == 'form'
+        elif chapter:
             mode = ''
+            form_chapter = False
+        elif (mode == 'scoring' and form_chapter and _RESPONSE_FORM.match(compact(r['title']))
+              and form_evidence(index)):
+            # A review index inside the format chapter ends at the first
+            # numbered response form, such as （一）投标函.
+            mode = 'form'
         elif not explicit_forms and _ATTACHMENT.match(compact(r['title'])) and mode != 'contract' and not re.search(r'评分|评审|须知', r['title']):
             mode = 'form'
         regions[r['_path'][0]] = mode
@@ -320,10 +381,15 @@ def resolve(document, records, categories):
     for r in top:
         own = []
         for i in range(r['_path'][0]+1, len(children)):
+            if children[i] in toc_elements or any(p in toc_elements for p in children[i].iter(qn('w:p'))):
+                break
             other = by_top.get(i)
-            current_number = re.match(r'^(?:附[：:]\s*)?(\d+)[.．、]', compact(r['title']))
-            next_number = re.match(r'^(?:附[：:]\s*)?(\d+)[.．、]', compact(other['title'])) if other else None
-            next_peer = bool(current_number and next_number and int(next_number[1]) > int(current_number[1]))
+            numbering = r'^(?:附[：:]\s*)?(\d+(?:[.．]\d+)*)(?:[.．、]|(?=[^\d.．]))'
+            current_number = re.match(numbering, compact(r['title']))
+            next_number = re.match(numbering, compact(other['title'])) if other else None
+            next_peer = bool(current_number and next_number and
+                tuple(map(int, re.split('[.．]', next_number[1]))) >
+                tuple(map(int, re.split('[.．]', current_number[1]))))
             next_requirement = bool(other and r['_region']=='form' and
                 re.match(r'^(?:附[：:]\s*)?\d+[.．、]', compact(other['title'])) and
                 (next_peer or (other['_topics'] and not other['_topics'].intersection(r['_title_topics'] or r['_topics']))))
@@ -340,6 +406,15 @@ def resolve(document, records, categories):
                  legal_body_present=bool(re.search(r'兹证明|(?:系|为).{0,35}法定代表人', compact(txt))),
                  authorization_body_present=bool(re.search(r'本授权(?:委托)?书|本人.{0,40}系|现委托|现授权委托|兹授权', compact(txt))))
     reqs = requirements(records, categories)
+    # An agent ID label after an authorization letter is that letter's attachment
+    # slot, also in bid frameworks without an explicit 投标文件格式 region.
+    letter = False
+    for r in top:
+        if r['authorization_body_present']:
+            letter = True
+        elif r['_structural'] or region_title(r['title']) or _ATTACHMENT.match(compact(r['title'])):
+            letter = False
+        r['_after_letter'] = letter and not r['authorization_body_present']
     extra = []
     for r in records:
         if r['kind'] != 'placeholder':
@@ -362,7 +437,8 @@ def resolve(document, records, categories):
                 continue
             aliases = cid in engine._category_ids(r['title'], [category])
             score, reason = engine._special_score(r['title'], category) if category.get('layer')=='special' else (130 if aliases else 0, '栏目名称或别名')
-            form = r['_region'] == 'form' or any(_form_table(e) for e in r['_own']) or r['legal_body_present'] or r['authorization_body_present']
+            form = (r['_region'] == 'form' or any(_form_table(e) for e in r['_own']) or r['legal_body_present']
+                    or r['authorization_body_present'] or (key == 'authorization' and r.get('_after_letter')))
             # Table clauses identify requirements. An empty adjacent answer/score
             # cell alone does not authorize inserting images into that cell.
             if r['_inside_table']:
@@ -429,6 +505,16 @@ def resolve(document, records, categories):
             precise = [(r,s,why) for r,s,why in candidates if r.get('_attachment')]
         filtered = []
         for r,s,why in candidates:
+            if key == 'authorization' and not agent_identity_target(r['title'], r.get('_attachment')):
+                continue
+            if key == 'tax_social':
+                from material_rules import tax_kinds
+                number = re.match(r'^(\d+(?:\.\d+)*)[.、]', compact(r['title']))
+                subtypes = set().union(*(tax_kinds(p['title']) for p,_,_ in candidates
+                    if p is not r and number and compact(p['title']).startswith(number[1] + '.')
+                    and re.match(r'^' + re.escape(number[1]) + r'\.\d', compact(p['title']))))
+                if number and len(tax_kinds(r['title'])) > 1 and tax_kinds(r['title']) <= subtypes:
+                    continue
             if key in {'legal_identity','authorization'} and not r.get('_attachment'):
                 nearby = [p for p,_,_ in precise if 0 < p['_path'][0]-r['_path'][0] < 60]
                 if any(not any(
@@ -443,8 +529,30 @@ def resolve(document, records, categories):
                    p['_element'] in r.get('_own', []) for p,_,_ in precise):
                 continue
             if r.get('_region') == 'form' and not r.get('_own') and not r.get('_attachment'):
-                siblings = [p for p,_,_ in candidates if p is not r and p.get('_own')]
+                # Collapse a section label followed by the same form title,
+                # not a distinct blank section elsewhere in the framework.
+                siblings = [p for p,_,_ in candidates if p is not r and p.get('_own')
+                            and p['_path'][0] == r['_path'][0] + 1
+                            and engine._normal(p['title']) == engine._normal(r['title'])]
                 if siblings:
+                    continue
+            if key == 'text_template' and not r['existing_content'] and not r.get('_attachment'):
+                # An outer label (附件3：法定代表人授权书) directly above the form's
+                # own title of the same document type is one text slot.
+                from material_rules import text_kind
+                label = r'^(?:[（(]?(?:附件|附表|格式)\s*' + _NUMBER + r'[）)]?[：:、.．-]*|[（(]' + _NUMBER + r'[）)]|' + _NUMBER + r'[、.．])'
+
+                def name(title):
+                    value = re.sub(r'[（(][^）)]*[）)]', '', re.sub(label, '', compact(title)))
+                    value = re.sub(r'(?:格式|范本|模板)$', '', value)
+                    return value.replace('授权委托书', '授权书').replace('承诺书', '承诺函')
+                following = next((t for t in top if t['_path'][0] > r['_path'][0]), None)
+                # Same document only: 保密承诺函 above 廉洁承诺函 is two letters.
+                if (following is not None and text_kind(r['title'])
+                        and re.match(label, compact(r['title'])) and not re.match(label, compact(following['title']))
+                        and any(p is following for p,_,_ in candidates)
+                        and text_kind(following['title']) == text_kind(r['title'])
+                        and (name(r['title']) in name(following['title']) or name(following['title']) in name(r['title']))):
                     continue
             if r.get('_attachment'):
                 extra.append(r)
@@ -461,6 +569,8 @@ def resolve(document, records, categories):
             for r in records:
                 score = entry_score(r['title'],category)
                 if not score or r['kind']=='placeholder' or r['_region'] in {'contract','scoring'}:
+                    continue
+                if key == 'authorization' and not agent_identity_target(r['title'], True):
                     continue
                 table = next((a for a in r['_element'].iterancestors() if a.tag==qn('w:tbl')),None)
                 if table is not None and re.search(r'评分|得分|分值|评审|满分',engine._text(table)):
@@ -480,7 +590,9 @@ def resolve(document, records, categories):
                 extra.append(slot)
                 filtered.append(slot)
         # The appendix is used only when no matching entry or form slot exists.
-        if not filtered and not has_token and reqs[cid]['status']!='not_detected' and category.get('layer','common')=='common':
+        # Agent ID copies without a labelled slot stay missing, not appended.
+        if (not filtered and not has_token and reqs[cid]['status']!='not_detected'
+                and category.get('layer','common')=='common' and key != 'authorization'):
             digest = hashlib.sha256(document.element.body.xml.encode()).hexdigest()[:16]
             name = '法定代表人身份证附件（证明正文另行核对）' if cid=='legal_identity' else category['name']
             extra.append({'id':f'ca:{cid}:{digest}','title':'文末新增材料区 · '+name,

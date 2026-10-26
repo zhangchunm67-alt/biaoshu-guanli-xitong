@@ -73,7 +73,7 @@ class EntryMatchingTests(unittest.TestCase):
         labels = {
             'business_license': '工商营业执照扫描件（盖章）；',
             'legal_identity': '单位负责人身份证正反面复印件；',
-            'authorization': '法人代表授权书（加盖公章）；',
+            'authorization': '被授权人身份证复印件（加盖公章）；',
             'audit_report': '2024年度财务会计报告（扫描件）；',
             'tax_social': '纳税及社保缴费证明；',
             'company_profile': '单位基本概况；',

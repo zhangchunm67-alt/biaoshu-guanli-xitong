@@ -2,12 +2,20 @@
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
-const {spawn}=require('node:child_process');
+const {spawn,spawnSync}=require('node:child_process');
 const {chromium}=require('playwright');
 const tmp=process.env.BID_AUTH_QA_DIR;
 if(!tmp)throw new Error('BID_AUTH_QA_DIR required');
 const fixture=JSON.parse(fs.readFileSync(path.join(tmp,'cases.json'),'utf8'));
 const app=path.resolve(__dirname,'..');
+const pictures=file=>{
+ const out=spawnSync(process.env.BID_TEST_PYTHON,['-c','import sys,zipfile;print(zipfile.ZipFile(sys.argv[1]).read("word/document.xml").count(b"<a:blip "))',file],{encoding:'utf8'});
+ assert.equal(out.status,0,out.stderr);return Number(out.stdout.trim());
+};
+const documentText=file=>{
+ const out=spawnSync(process.env.BID_TEST_PYTHON,['-c','import sys,docx;print("\\n".join(p.text for p in docx.Document(sys.argv[1]).paragraphs))',file],{encoding:'utf8',cwd:app});
+ assert.equal(out.status,0,out.stderr);return out.stdout;
+};
 (async()=>{
  let server,browser;
  try{
@@ -30,25 +38,38 @@ finally:s.server_close();s.store.close()`,path.join(tmp,'data')],{cwd:app,env:{.
    assert.equal(await card.locator('[data-auth-field]').count(),0);
    assert.doesNotMatch(await card.innerText(),/填写授权书正文|授权项目名称|授权书签署日期|正文与人员核对/);
    for(const id of fixture.ids)await card.locator('input[data-map-material][value="'+id+'"]').check();
-   await card.getByRole('checkbox',{name:'我已逐项核对此匹配',exact:true}).check();
-   await page.getByRole('button',{name:'保存核对',exact:true}).first().click();
-   await page.getByRole('button',{name:'下一步：选择行业分类',exact:true}).waitFor({state:'visible'});
-   await page.waitForFunction(()=>!document.querySelector('[data-action="save-project"]')?.disabled);
-   assert.equal(await card.getByRole('checkbox',{name:'我已逐项核对此匹配',exact:true}).isChecked(),true);
-   assert.equal(await card.locator('.issue-list').count(),0);
+   assert.equal(await card.getByRole('checkbox',{name:'我已逐项核对此匹配',exact:true}).count(),0);
+   const save=async()=>{
+    await page.getByRole('button',{name:'保存核对',exact:true}).first().click();
+    await page.getByRole('button',{name:'下一步：核对文字材料',exact:true}).waitFor({state:'visible'});
+    await page.waitForFunction(()=>!document.querySelector('[data-action="save-project"]')?.disabled);
+   };
+   await save();
    assert.equal(await card.locator('input[data-map-material]:checked').count(),2);
    assert.equal(await card.locator('.mapping-preview-image img').count()>0,true);
+   if(c.slot){
+    assert.equal(await card.locator('.issue-list').count(),0);
+   }else{
+    // No labelled agent ID slot: the letter takes the text template and the images stay out.
+    assert.match(await card.innerText(),/授权委托书正文由文字模板填写/);
+    assert.match(await card.locator('.issue-list').innerText(),/未找到有效填充位置/);
+    assert.equal(await page.getByRole('button',{name:'下一步：核对文字材料',exact:true}).isDisabled(),true);
+    await card.locator('select[data-map-field="action"]').selectOption('missing');
+    await save();
+    assert.doesNotMatch(await card.locator('.issue-list').innerText(),/未找到有效填充位置/);
+   }
    await page.screenshot({path:path.join(tmp,c.label+'-核对页.png'),fullPage:true});
-   await page.getByRole('button',{name:'下一步：选择行业分类',exact:true}).click();
-   await page.getByRole('checkbox',{name:'本项目无需专用材料',exact:true}).check();
-   await page.getByRole('button',{name:'保存行业并继续',exact:true}).click();
-   // With no special materials the application moves directly to export.
+   await page.getByRole('button',{name:'下一步：核对文字材料',exact:true}).click();
+   await page.getByRole('button',{name:'下一步：导出标书',exact:true}).click();
    await page.getByRole('button',{name:'导出',exact:true}).click();
    await page.getByRole('link',{name:'下载 Word 文件',exact:true}).waitFor({state:'visible',timeout:30000});
    const download=page.waitForEvent('download');
    await page.getByRole('link',{name:'下载 Word 文件',exact:true}).click();
-   const file=await download;await file.saveAs(path.join(tmp,c.label+'-图片填充结果.docx'));
-   result.push({case:c.label,browser_saved:true,downloaded:true});
+   const file=await download;const saved=path.join(tmp,c.label+'-图片填充结果.docx');await file.saveAs(saved);
+   const added=pictures(saved)-pictures(c.source);
+   if(c.slot)assert.equal(added>0,true);
+   else{assert.equal(added,0);assert.match(documentText(saved),/待补：被授权人身份证附件/);}
+   result.push({case:c.label,slot:c.slot,added_pictures:added,downloaded:true});
    await page.getByRole('button',{name:'关闭',exact:true}).click();
   }
   assert.deepEqual(errors,[]);
