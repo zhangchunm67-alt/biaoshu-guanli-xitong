@@ -111,6 +111,60 @@ class MaterialRuleTests(unittest.TestCase):
             [right, wrong], scanned['headings'], self.categories)[0]
         self.assertIn('2025年12月社保缴费凭证：缴费所属月份与目标要求不符。', bad['issues'])
 
+    def scan_lines(self, lines, materials):
+        doc = Document()
+        for line in lines:
+            doc.add_paragraph(line)
+        doc.save(self.path)
+        return engine.scan_document(self.path, self.categories, materials, ['text_template'])
+
+    def test_incomplete_ranges_are_not_read_as_single_months(self):
+        self.assertEqual(3, len(months('2025年12-2026年2月')))
+        self.assertFalse(months('2026年9月至8月'))
+        september = self.material('2026年9月社保缴费凭证')
+        row = self.tax_rows(self.scan(['2026年9月至8月社保缴费证明'], [september]))[0]
+        self.assertFalse(row['material_ids'])
+        checked = engine.validate_mappings([dict(row, action='fill', material_ids=[september['id']])],
+            [september], self.scan(['2026年9月至8月社保缴费证明'], [])['headings'], self.categories)[0]
+        self.assertTrue(any('无法完整识别' in w for w in checked['warnings']), checked)
+
+    def test_appendix_keeps_the_requirement_type_and_period(self):
+        wrong_tax, social = self.material('2026年9月完税证明'), self.material('2026年9月社保缴费凭证')
+        right = self.material('2025年1-6月完税证明')
+        lines = ['第一章 投标人须知', '供应商须提供2025年1月至6月的纳税证明。']
+        row = self.tax_rows(self.scan_lines(lines, [wrong_tax, social]))[0]
+        self.assertTrue(row['locator_id'].startswith('ca:tax_social:'))
+        self.assertFalse(row['material_ids'])
+        scanned = self.scan_lines(lines, [wrong_tax, social, right])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual(([right['id']], 'ready'), (row['material_ids'], row['status']))
+        for material, issue in [(wrong_tax, '缴费所属月份与目标要求不符'), (social, '纳税与社保凭证类型不符')]:
+            bad = engine.validate_mappings([dict(row, material_ids=[material['id']])],
+                [material], scanned['headings'], self.categories)[0]
+            self.assertTrue(any(issue in s for s in bad['issues']), bad['issues'])
+        relative = self.tax_rows(self.scan_lines(['第一章 投标人须知', '供应商须提供近六个月的纳税证明。'], [right]))[0]
+        self.assertFalse(relative['material_ids'])
+
+    def test_relative_period_ignores_submission_dates(self):
+        old, submitted = self.material('2025年1月社保缴费凭证'), self.material('2026年9月社保缴费凭证')
+        scanned = self.scan_lines(['第五章 投标文件格式', '近六个月社保缴费证明',
+                                   '社保缴费证明应于2026年9月提交。'], [old, submitted])
+        row = self.tax_rows(scanned)[0]
+        self.assertFalse(row['material_ids'])
+        checked = engine.validate_mappings([dict(row, action='fill', material_ids=[old['id']])],
+            [old, submitted], scanned['headings'], self.categories)[0]
+        self.assertFalse(any('所属月份' in s for s in checked['issues']), checked['issues'])
+        self.assertTrue(any('相对月份' in w for w in checked['warnings']))
+
+    def test_complementary_years_are_one_set_and_same_year_versions_overlap(self):
+        first, second = self.material('2025年纳税证明'), self.material('2026年纳税证明')
+        first['years'], second['years'] = [2025], [2026]
+        row = self.tax_rows(self.scan(['2025-2026年纳税证明'], [first, second]))[0]
+        self.assertEqual(([first['id'], second['id']], 'ready'), (row['material_ids'], row['status']))
+        again = self.material('2025年纳税证明（补开）')
+        again['years'] = [2025]
+        self.assertFalse(self.tax_rows(self.scan(['2025-2026年纳税证明'], [first, again, second]))[0]['material_ids'])
+
     def test_overlapping_social_versions_require_manual_selection(self):
         a = self.material('2026年8月社保缴费凭证')
         b = self.material('单位社保缴费证明（2025年9月至2026年8月）')
@@ -153,6 +207,9 @@ class MaterialRuleTests(unittest.TestCase):
             checked = engine.validate_mappings([dict(row, action='fill', material_ids=['letter'])],
                 [material], scanned['headings'], self.categories)[0]
             self.assertEqual('ready' if row['title'] == '投标函' else 'blocked', checked['status'])
+        titles = ['附件1：投标函', '附件3：法定代表人授权书', '附件5：承诺书']
+        numbered = self.scan(titles, [])
+        self.assertEqual(titles, [r['title'] for r in numbered['mappings'] if r['category_id'] == 'text_template'])
 
     def test_all_seven_categories_skip_directory_and_preserve_body_windows(self):
         doc = Document()

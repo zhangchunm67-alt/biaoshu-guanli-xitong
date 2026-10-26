@@ -142,23 +142,45 @@ class TocLocationTests(unittest.TestCase):
                                        {cid: 1 for _, _, cid in windows}, windows)
 
     def test_toc_field_end_merged_into_first_body_title_keeps_that_title(self):
+        # The merged heading may keep the plain style or inherit the TOC style.
+        for style in (None, 'TOC 1'):
+            with self.subTest(style=style):
+                document = Document()
+                if style:
+                    document.styles.add_style(style, WD_STYLE_TYPE.PARAGRAPH)
+                self.add_field_char(document.add_paragraph(style=style), 'begin', ' TOC \\o "1-3" ')
+                entries = [document.add_paragraph(title, style=style) for title in ['营业执照', '公司简介']]
+                # Deleting the blank line after a Word TOC leaves its field end here.
+                merged = document.add_paragraph(style=style)
+                self.add_field_char(merged, 'end')
+                merged.add_run('（一）营业执照')
+                document.add_paragraph('本节原有内容保持不变。')
+                document.add_paragraph('（二）公司简介')
+                document.add_paragraph('本节原有内容保持不变。')
+                document.add_paragraph('（三）结束附件')
+                scanned = self.scan(document)
+                self.assert_directory_unselectable(document, scanned, entries)
+                self.assertIn(self.locator(document, merged), {h['id'] for h in scanned['headings']})
+                self.export_and_assert_windows(document, scanned, {'business_license': 1, 'company_profile': 1},
+                                               [('（一）营业执照', '（二）公司简介', 'business_license'),
+                                                ('（二）公司简介', '（三）结束附件', 'company_profile')])
+
+    def test_unrepeated_chapters_keep_same_named_blank_sections(self):
         document = Document()
-        self.add_field_char(document.add_paragraph(), 'begin', ' TOC \\o "1-3" ')
-        entries = [document.add_paragraph(title) for title in ['营业执照', '公司简介']]
-        # Deleting the blank line after a Word TOC leaves its field end here.
-        merged = document.add_paragraph()
-        self.add_field_char(merged, 'end')
-        merged.add_run('（一）营业执照')
-        document.add_paragraph('本节原有内容保持不变。')
-        document.add_paragraph('（二）公司简介')
-        document.add_paragraph('本节原有内容保持不变。')
-        document.add_paragraph('（三）结束附件')
+        for line in ['第一章 资格证明文件', '营业执照', '公司简介', '第二章 其他证明文件', '营业执照',
+                     '本节原有内容保持不变。', '公司简介', '本节原有内容保持不变。', '三、结束附件']:
+            document.add_paragraph(line)
+        scanned = self.scan(document)
+        for cid in ('business_license', 'company_profile'):
+            self.assertEqual(2, len([r for r in scanned['mappings'] if r['category_id'] == cid and r['locator_id']]))
+        # Chapter titles that repeat later are still an unlabelled contents list.
+        document = Document()
+        entries = [document.add_paragraph(t) for t in ['第一章 营业执照', '第二章 公司简介']]
+        for line in ['第一章 营业执照', '本节原有内容保持不变。', '第二章 公司简介', '本节原有内容保持不变。',
+                     '第三章 结束附件']:
+            document.add_paragraph(line)
         scanned = self.scan(document)
         self.assert_directory_unselectable(document, scanned, entries)
-        self.assertIn(self.locator(document, merged), {h['id'] for h in scanned['headings']})
-        self.export_and_assert_windows(document, scanned, {'business_license': 1, 'company_profile': 1},
-                                       [('（一）营业执照', '（二）公司简介', 'business_license'),
-                                        ('（二）公司简介', '（三）结束附件', 'company_profile')])
 
     def test_manual_directory_without_page_numbers_covers_common_and_special(self):
         document = Document()

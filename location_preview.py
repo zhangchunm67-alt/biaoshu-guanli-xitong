@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -88,10 +89,9 @@ class LocationPreview:
         self._temporary = tempfile.TemporaryDirectory(prefix='bid-page-preview-')
         self.root = Path(self._temporary.name)
         self.cache = OrderedDict()
-        # Inline previews ask once per review card. Hash each template version
-        # and recognize its locations once, not on every card request.
+        # Inline previews ask once per review card: recognize each template
+        # version once. Every request still hashes the bytes it actually uses.
         self._recognized = OrderedDict()
-        self._digests = OrderedDict()
         self._recognized_lock = threading.Lock()
 
     def close(self):
@@ -100,28 +100,14 @@ class LocationPreview:
             self._temporary.cleanup()
         with self._recognized_lock:
             self._recognized.clear()
-            self._digests.clear()
 
-    def _verify(self, source, template_hash):
-        stat = Path(source).stat()
-        identity = (str(source), stat.st_size, stat.st_mtime_ns)
-        with self._recognized_lock:
-            digest = self._digests.get(identity)
-            if digest is None:
-                digest = hashlib.sha256(Path(source).read_bytes()).hexdigest()
-                self._digests[identity] = digest
-                while len(self._digests) > 16:
-                    self._digests.popitem(last=False)
-        if digest != template_hash:
-            raise ValueError('模板已变化，请重新上传或扫描后再预览。')
-
-    def _recognize(self, source, template_hash, categories):
+    def _recognize(self, raw, template_hash, categories):
         """Shared read-only document and public records for one template and category set."""
         rules = hashlib.sha256(json.dumps(categories, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
         key = (template_hash, rules)
         with self._recognized_lock:
             if key not in self._recognized:
-                document = engine._read_template(source)
+                document = engine._read_template(io.BytesIO(raw))
                 records, _ = engine._inspect(document, categories)
                 self._recognized[key] = (document, {r['id']: r for r in records if r['_public']})
                 while len(self._recognized) > 2:
@@ -133,7 +119,7 @@ class LocationPreview:
     def key(template_hash):
         return hashlib.sha256((VERSION + template_hash).encode()).hexdigest()
 
-    def _build(self, source, template_hash):
+    def _build(self, raw, template_hash):
         from pypdf import PdfReader
         key = self.key(template_hash)
         if key in self.cache:
@@ -142,10 +128,7 @@ class LocationPreview:
         directory = self.root / key
         directory.mkdir()
         try:
-            raw = Path(source).read_bytes()
-            if hashlib.sha256(raw).hexdigest() != template_hash:
-                raise ValueError('模板已变化，请重新上传或扫描后再预览。')
-            document = engine._read_template(source)
+            document = engine._read_template(io.BytesIO(raw))
             paragraphs = list(document.element.body.iter(qn('w:p')))
             if len(paragraphs) > 15000:
                 raise ValueError('模板段落过多，暂不支持原页预览。')
@@ -200,23 +183,25 @@ class LocationPreview:
             raise
 
     def describe(self, snapshot):
-        source = snapshot['template']
-        self._verify(source, snapshot['template_hash'])
+        # Verification, recognition and rendering all use these same bytes.
+        raw = Path(snapshot['template']).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != snapshot['template_hash']:
+            raise ValueError('模板已变化，请重新上传或扫描后再预览。')
         if not snapshot['locator_id']:
             with _RENDER_LOCK:
-                entry = self._build(source, snapshot['template_hash'])
+                entry = self._build(raw, snapshot['template_hash'])
                 return {'preview_id': entry['preview_id'], 'page_count': entry['page_count'],
                         'initial_page': 1, 'target_pages': [], 'markers': [],
                         'title': '标书原页',
                         'description': '尚未选择插入位置。可先翻页查看原文，再从上方选择位置查看标记。',
                         'template_name': snapshot['template_name']}
-        document, records = self._recognize(source, snapshot['template_hash'], snapshot['categories'])
+        document, records = self._recognize(raw, snapshot['template_hash'], snapshot['categories'])
         record = records.get(snapshot['locator_id'])
         if record is None:
             raise ValueError('所选插入位置已失效，请重新扫描后再选择。')
         if record['kind'] == 'common_appendix':
             with _RENDER_LOCK:
-                entry = self._build(source, snapshot['template_hash'])
+                entry = self._build(raw, snapshot['template_hash'])
                 return {'preview_id': entry['preview_id'], 'page_count': entry['page_count'],
                         'initial_page': entry['page_count'], 'target_pages': [], 'markers': [],
                         'title': record['title'],
@@ -261,7 +246,7 @@ class LocationPreview:
         if snapshot['action'] == 'fill' and any(m.get('mode') == 'page' for m in selected) and not record['_inside_table']:
             description += '整页图片材料会从此处之后另起一页。'
         with _RENDER_LOCK:
-            entry = self._build(source, snapshot['template_hash'])
+            entry = self._build(raw, snapshot['template_hash'])
             markers, anchors = [], []
             for paragraph, edge, kind, label in targets:
                 path = engine._xml_path(paragraph, document.element.body)

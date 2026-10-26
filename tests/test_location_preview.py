@@ -4,6 +4,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -193,7 +194,10 @@ class RenderedLocationTests(unittest.TestCase):
         copy_path = self.root / 'changed.docx'
         copy_path.write_bytes(self.raw)
         self.preview.describe(self.snapshot(rows[0]['locator_id'], template=copy_path))
-        Document().save(copy_path)
+        # Same size and restored mtime: only the bytes reveal the replacement.
+        stat = copy_path.stat()
+        copy_path.write_bytes(self.raw[:-1] + bytes([self.raw[-1] ^ 1]))
+        os.utime(copy_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         with self.assertRaisesRegex(ValueError, '已变化'):
             self.preview.describe(self.snapshot(rows[0]['locator_id'], template=copy_path))
 

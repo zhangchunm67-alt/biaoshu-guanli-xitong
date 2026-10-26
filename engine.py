@@ -41,8 +41,8 @@ for _category in DEFAULT_CATEGORIES:
 _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
-SPECIAL_LOCATOR_VERSION = 5
-COMMON_LOCATOR_VERSION = 7
+SPECIAL_LOCATOR_VERSION = 6
+COMMON_LOCATOR_VERSION = 8
 
 
 def _common_title(text):
@@ -70,7 +70,8 @@ def _special_score(title, category):
     """Match complete evidence-section titles, never a keyword in prose."""
     target = _normal(title, remove_years=True)
     if category['id'] == 'text_template' and re.fullmatch(
-            r'(?:法定代表人)?授权(?:委托)?书(?:格式)?|投标函|承诺[函书]', target):
+            r'(?:[（(]?(?:附件|附表|格式)[一二三四五六七八九十百零〇\d]+[）)]?[：:、.．\-]*)?'
+            r'(?:(?:法定代表人)?授权(?:委托)?书(?:格式)?|投标函|承诺[函书])', target):
         return 130, '文书类型与正文标题'
     if target in {_normal(n, True) for n in [category['name'], *category.get('aliases', [])]}:
         return 130, '栏目名称或已配置别名'
@@ -336,7 +337,7 @@ def _public(record):
 
 def _read_template(path):
     try:
-        return Document(str(path))
+        return Document(path if hasattr(path, 'read') else str(path))
     except Exception as exc:
         raise ValueError("无法读取 Word 模板，请使用有效的 .docx 文件。") from exc
 
@@ -499,10 +500,10 @@ def _check_material(material, category_id, required, heading, special=False):
     errors, warnings = [], []
     name = str(material.get("name") or material.get("id") or "材料")
     if category_id == 'tax_social':
-        from material_rules import tax_errors, relative_period
+        from material_rules import tax_errors, period_issue
         errors.extend(tax_errors(material, heading))
-        if relative_period(heading):
-            warnings.append('原文要求相对月份，请按本项目投标截止日核对缴费所属期；系统未自动判定期限。')
+        if period_issue(heading):
+            warnings.append(period_issue(heading))
     if category_id == 'text_template':
         from material_rules import text_kind
         wanted, actual = text_kind(heading.get('title', '')), text_kind(name)

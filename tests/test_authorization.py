@@ -166,6 +166,32 @@ class AuthorizationImagesTests(unittest.TestCase):
             self.assertEqual(2 if agent_slot else 0, len(Document(self.output).inline_shapes))
             self.assertEqual(not agent_slot, any('待补：被授权人身份证附件' in t for t in text))
 
+    def test_agent_id_slots_need_a_copy_and_accept_passports(self):
+        categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],
+                                             layer='special', enabled=True)]
+        cases = {'附：被授权人护照复印件': True, '附：委托代理人护照复印件': True,
+                 '授权代理人身份证/护照复印件（正反面）': True, '附：被授权人身份证复印件（原件备查）': True,
+                 '附：被授权人身份证号码：________': False, '附：被授权人身份证的真实性声明': False,
+                 '附：被授权人身份证原件（开标现场查验）': False}
+        for region in ([], ['第六章 投标文件格式']):
+            for label, expected in cases.items():
+                with self.subTest(region=bool(region), label=label):
+                    doc = Document()
+                    for line in region + ['附件3：法定代表人授权书', '本授权书声明：现委托乙某办理投标事项。',
+                                          '日期：', label, '附件4：资格证明文件']:
+                        doc.add_paragraph(line)
+                    doc.save(self.source)
+                    scan = engine.scan_document(self.source, categories, self.materials, ['text_template'])
+                    image = next(r for r in scan['mappings'] if r['category_id'] == 'authorization')
+                    letter = next(r for r in scan['mappings'] if r['category_id'] == 'text_template')
+                    self.assertEqual('附件3：法定代表人授权书', letter['title'])
+                    self.assertEqual(expected, image['locator_id'].startswith('at:authorization:'), image)
+                    if expected:
+                        checked = self.checked(dict(image, action='fill', material_ids=['authorization']), scan)
+                        self.assertEqual('ready', checked['status'], checked['issues'])
+                    else:
+                        self.assertEqual(('', 'missing'), (image['locator_id'], image['status']))
+
     def test_expired_missing_or_text_materials_still_block(self):
         row, scan = self.prepare(self.form())
         for change in [{'valid_until': '2000-01-01'}, {'files': []}, {'mode': 'text', 'content': '正文'}]:

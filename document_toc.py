@@ -28,6 +28,9 @@ def excluded_paragraphs(document):
     # A TOC field can span several paragraphs without TOC styles or page numbers.
     stack = []
     current = None
+    # Deleting the blank line after a TOC merges the field end into the first
+    # body heading, which may also inherit a TOC style; that heading stays.
+    body_after_field = set()
     for node in body.iter():
         if node.tag == qn('w:p'):
             current = node
@@ -44,12 +47,9 @@ def excluded_paragraphs(document):
             elif kind == 'end' and stack:
                 frame = stack.pop()
                 if re.search(r'\bTOC\b', frame['instruction'], re.I):
-                    paragraphs = frame['paragraphs']
+                    excluded.update(frame['paragraphs'])
                     if current is not None and _text_after(current, node):
-                        # Deleting the blank line after a TOC merges the field
-                        # end into the first body heading; keep that heading.
-                        paragraphs = paragraphs - {current}
-                    excluded.update(paragraphs)
+                        body_after_field.add(current)
         elif node.tag == qn('w:instrText') and stack:
             stack[-1]['instruction'] += node.text or ''
     for frame in stack:
@@ -107,7 +107,8 @@ def excluded_paragraphs(document):
         directory_heading = marker
         row = dict(index=index, element=element, key=key(text),
                    label=label(text, paragraph), marker=marker,
-                   numbered=bool(engine._number_level(text)), region=recognition.region_title(text))
+                   numbered=bool(engine._number_level(text)), region=recognition.region_title(text),
+                   chapter=bool(re.match(r'^第' + recognition._NUMBER + r'[章节部分篇]', recognition.compact(text))))
         positions[row['key']].append(len(rows))
         rows.append(row)
 
@@ -161,6 +162,10 @@ def excluded_paragraphs(document):
                     # Blank material sections in one part remain real targets
                     # even when another part repeats them with existing text.
                     continue
+                if any(r.get('chapter') and positions[r['key']][-1] < boundary for r in run[1:cut]):
+                    # A chapter heading that is not repeated later separates
+                    # same-named blank sections; it is body structure, not a list.
+                    continue
             for row in run[:cut]:
                 if row['marker'] or (not row.get('region') and
                         (explicit or not re.search(r'(?:部分|篇)$', row['key']))):
@@ -189,7 +194,7 @@ def excluded_paragraphs(document):
                         if not row.get('region') and not re.search(r'(?:部分|篇)$', row['key']):
                             excluded.add(row['element'])
         start = end
-    return excluded
+    return excluded - body_after_field
 
 
 def excluded_locator_ids(document, paragraphs, categories):

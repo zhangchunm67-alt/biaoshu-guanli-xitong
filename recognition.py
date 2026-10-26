@@ -14,14 +14,24 @@ _REQUEST = re.compile(r'提供|提交|出具|附[上后：:]?|后附|须附|应�
 _IMAGE = re.compile(r'复印件|扫描件|影印件|电子件|正反面|双面|照片|粘贴|证书|合同.{0,16}(?:证明|关键页)|证明材料')
 _COPY = re.compile(r'后附|附[：:]|附上|须附|应附|需附|粘贴|复印件|扫描件|影印件|电子件')
 _SIGNATURE = re.compile(r'^(?:投标人|供应商|法定代表人|委托代理人|日期|年月日|年\s*月\s*日)')
-_AGENT = r'(?:委托代理人|被授权人|授权代表|代理人|受托人)'
-_AGENT_ID = re.compile(_AGENT + r'.{0,18}(?:身份证|护照)|(?:身份证|护照).{0,12}' + _AGENT)
+_AGENT = r'(?:委托代理人|授权代理人|被授权人|授权代表|代理人|受托人)'
+_ID_DOC = r'(?:身份证(?!号)|护照)'
+_AGENT_ID = re.compile(_AGENT + r'.{0,18}?' + _ID_DOC + r'|' + _ID_DOC + r'.{0,12}' + _AGENT)
+_ID_COPY = re.compile(r'复印件|扫描件|影印件|复制件|电子件|正反面|双面|粘贴|照片')
 
 
 def agent_identity_target(title, attachment):
-    """Authorization images are agent ID copies; the letter itself takes a text template."""
-    value = compact(title)
-    return bool(_AGENT_ID.search(value) and (attachment or not re.search(r'授权(?:委托)?书', value)))
+    """Authorization images are agent ID copies; the letter itself takes a text template.
+
+    A number field, an authenticity statement or an original for inspection is
+    not a copy slot, even when it names the agent's ID.
+    """
+    value = re.sub(r'^(?:[（(]?(?:附件|附表)\s*' + _NUMBER + r'[）)]?[：:、.．-]*|附[：:]?)', '', compact(title))
+    if not _AGENT_ID.search(value) or re.search(r'号码|证号|声明|承诺', value):
+        return False
+    core = re.sub(r'[（(][^）)]*[）)]', '', value).rstrip('；;。，,：:')
+    copy = _ID_COPY.search(value) or re.search(_ID_DOC + r'$', core)
+    return bool(copy and (attachment or not re.search(r'授权(?:委托)?书', value)))
 
 
 def family(category):
@@ -89,7 +99,7 @@ def _matches(text, key):
     if key == 'authorization':
         if re.search(r'(?:平台|媒体|厂商|制造商|品牌|渠道).{0,12}授权', v) and not re.search(r'法定代表|委托代理人|被授权人', v):
             return False
-        return bool(re.search(r'(?:法定代表人|法人代表|法人|负责人)授权(?:委托)?书|授权委托书|委托代理人.{0,18}身份证|(?:被)?授权人.{0,18}身份证', v)
+        return bool(re.search(r'(?:法定代表人|法人代表|法人|负责人)授权(?:委托)?书|授权委托书|(?:委托|授权)?代理人.{0,18}(?:身份证|护照)|(?:被)?授权人.{0,18}(?:身份证|护照)', v)
                     or re.fullmatch(r'(?:\d+[.、])?授权书[：:；;]?', v))
     if key == 'audit_report':
         return bool(re.search(r'审计报告|财务(?:会计)?(?:报告|报表)|资产负债表|现金流量表|利润表', v) and
@@ -153,7 +163,7 @@ def entry_score(title, category):
         return 0
     value = re.sub(r'^[•●◆◇★☆*·\-—]+', '', raw)
     value = engine._normal(value, remove_years=True)
-    value = re.sub(r'^(?:附件|附表|格式)' + _NUMBER + r'[）):：、.．-]*', '', value)
+    value = re.sub(r'^(?:附[：:]|(?:附件|附表|格式)' + _NUMBER + r'[）):：、.．-]*)', '', value)
     value = re.sub(r'[（(【\[].*?[）)】\]]', '', value)
     value = value.rstrip('：:；;。')
     value = re.sub(r'^(?:(?:投标人|投标方|供应商)(?:应|须|需)?|请|须|需|应)?(?:提供|提交|附上|后附)', '', value)
@@ -172,7 +182,7 @@ def entry_score(title, category):
     variants = {
         'business_license': r'(?:(?:投标人|投标方|供应商|企业法人|企业|公司|单位)的?)?(?:营业执照|工商营业执照|企业执照)',
         'legal_identity': r'(?:法定代表人|法人代表|法人|单位负责人)(?:身份证(?:明书?)?|证明书|护照)',
-        'authorization': r'(?:(?:法定代表人|法人代表|法人|单位负责人)的?)?授权(?:委托)?书|(?:委托代理人|被授权人|授权代表)(?:身份证(?:明)?|护照)',
+        'authorization': r'(?:(?:法定代表人|法人代表|法人|单位负责人)的?)?授权(?:委托)?书|(?:委托代理人|授权代理人|被授权人|授权代表)的?(?:身份证(?:明)?|护照)(?:[/／或及和、](?:身份证|护照))?',
         'audit_report': r'(?:近?[一二三\d-]+年)?(?:公司|企业|年度)?(?:财务(?:会计)?审计报告|年度审计报告|审计报告|财务(?:会计)?(?:报告|报表))',
         'tax_social': r'(?:依法)?(?:(?:税收|纳税|税款)(?:和|及|与)?(?:社会保障资金|社会保险|社保)?|社会保障资金|社会保险|社保)(?:缴纳|缴费)?(?:证明(?:材料)?|凭证|记录)|完税(?:证明|凭证)',
         'company_profile': r'(?:公司|企业|单位|供应商|投标人)(?:基本)?(?:简介|介绍|概况|情况介绍|情况表|信息表|情况)',
