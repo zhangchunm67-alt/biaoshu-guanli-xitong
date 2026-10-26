@@ -18,13 +18,15 @@ def tax_kinds(text):
 
 _RANGE = r'(?:至|到|[-—–~～])'
 _SPAN = re.compile(r'(20\d{2})年(\d{1,2})月?' + _RANGE + r'(?:(20\d{2})年)?(\d{1,2})月')
-# A submission, deadline or transaction date is not the contribution period.
-_DEADLINE = re.compile(r'(?:应于|须于|需于|于|截至|截止(?:到|至)?)?20\d{2}年\d{1,2}月(?:\d{1,2}日)?'
-                       r'(?:前|之前|以前)?(?:提交|递交|报送|送达|截止)')
+# A single submission date is not the contribution period. Ranges are parsed
+# first, so "自2025年1月至2025年6月截止" keeps its end month.
+_DEADLINE = re.compile(r'(?:应于|须于|需于|于)?20\d{2}年\d{1,2}月(?:\d{1,2}日)?'
+                       r'(?:前|之前|以前)?(?:提交|递交|报送|送达)')
 _RELATIVE = re.compile(r'(?:近|前|最近)[一二三四五六七八九十\d]+个?月|近半年')
+_JOIN = re.compile(r'以及|及|和|与|；|;')
 
 
-def _period(text):
+def _period(text, deadlines=False):
     """Months named by text, and whether a range in it is not a valid period."""
     text = re.sub(r'\s+', '', text or '')
     found, invalid = set(), False
@@ -40,6 +42,8 @@ def _period(text):
         # Consume the whole range so its end is never read as a single month.
         return '|'
     rest = _SPAN.sub(span, text)
+    if deadlines:
+        rest = _DEADLINE.sub('|', rest)
     for m in re.finditer(r'(20\d{2})年((?:\d{1,2}[、，,])*\d{1,2})月', rest):
         found.update(int(m[1]) * 12 + int(n) - 1 for n in re.split('[、，,]', m[2]) if 1 <= int(n) <= 12)
     return found, invalid
@@ -61,7 +65,7 @@ def _period_clauses(heading):
     title, context = _sources(heading)
     if title and _period(title) != (set(), False):
         return [title]
-    return [_DEADLINE.sub('', c) for c in re.split('[。；;\n]', context) if tax_kinds(c)]
+    return [c for c in re.split('[。；;\n]', context) if tax_kinds(c)]
 
 
 def relative_period(heading):
@@ -77,22 +81,40 @@ def period_issue(heading):
     return ''
 
 
+def _clause_periods(clause):
+    """Months named beside each kind; a kind named without months shares them all."""
+    own, every = {}, set()
+    for chunk in _JOIN.split(clause):
+        found = _period(chunk, deadlines=True)[0]
+        every |= found
+        for kind in tax_kinds(chunk) if found else ():
+            own.setdefault(kind, set()).update(found)
+    return own, every
+
+
 def tax_target(heading):
+    """Wanted evidence kinds and the months each kind must cover (empty: none named)."""
     # The exact slot takes precedence over other tax/social sections in the file.
     title, context = _sources(heading)
-    period = set()
+    periods = {'tax': set(), 'social': set()}
     if not relative_period(heading):
         for clause in _period_clauses(heading):
-            period.update(months(clause))
-    return tax_kinds(title) or tax_kinds(title + '\n' + context), period
+            own, every = _clause_periods(clause)
+            for kind in periods:
+                periods[kind] |= own.get(kind) or every
+    return tax_kinds(title) or tax_kinds(title + '\n' + context), periods
 
 
 def material_tax_kinds(material):
     return tax_kinds(material.get('name', ''))
 
 
+def _declared(material):
+    return months(material.get('name', '') + '\n' + material.get('version', ''))
+
+
 def tax_errors(material, heading):
-    wanted, period = tax_target(heading)
+    wanted, periods = tax_target(heading)
     kinds = material_tax_kinds(material)
     name = material.get('name', '材料')
     errors = []
@@ -100,7 +122,9 @@ def tax_errors(material, heading):
         errors.append(f'{name}：无法核对是纳税还是社保凭证，请完善材料名称。')
     elif wanted and not wanted.intersection(kinds):
         errors.append(f'{name}：纳税与社保凭证类型不符。')
-    declared = months(material.get('name', '') + '\n' + material.get('version', ''))
+    relevant = (kinds & wanted) or wanted or kinds or set(periods)
+    period = set().union(*(periods[kind] for kind in relevant))
+    declared = _declared(material)
     if period and not declared:
         errors.append(f'{name}：缺少缴费所属月份，不能仅凭年度匹配。')
     elif period and not period.intersection(declared):
@@ -109,16 +133,16 @@ def tax_errors(material, heading):
 
 
 def tax_coverage_errors(materials, heading):
-    wanted, period = tax_target(heading)
+    wanted, periods = tax_target(heading)
     errors = []
     labels = {'tax': '纳税', 'social': '社保'}
     for kind in sorted(wanted):
         matching = [m for m in materials if kind in material_tax_kinds(m)]
         if not matching:
             errors.append('缺少要求凭证：' + labels[kind] + '。')
-        elif period:
-            covered = set().union(*(months(m.get('name', '') + '\n' + m.get('version', '')) for m in matching))
-            missing = period - covered
+        elif periods[kind]:
+            covered = set().union(*(_declared(m) for m in matching))
+            missing = periods[kind] - covered
             if missing:
                 values = '、'.join(f'{v // 12}年{v % 12 + 1}月' for v in sorted(missing))
                 errors.append('缺少要求月份：' + labels[kind] + ' ' + values + '。')
@@ -150,7 +174,7 @@ def automatic_ids(row, candidates, headings, categories):
         return []
     if row['category_id'] == 'tax_social':
         heading = next((h for h in headings if h['id'] == row.get('locator_id')), {})
-        wanted, period = tax_target(heading)
+        wanted, periods = tax_target(heading)
         if period_issue(heading):
             # The bid cutoff date is not a reliable structured input yet, and a
             # submission date elsewhere in the text cannot stand in for it.
@@ -159,15 +183,15 @@ def automatic_ids(row, candidates, headings, categories):
             years = set(row.get('required_years', []))
             covered = set()
             for material in candidates:
-                kinds = material_tax_kinds(material) & wanted
-                if period:
-                    declared = months(material.get('name', '') + '\n' + material.get('version', ''))
-                    keys = {(kind, month) for kind in kinds for month in period & declared}
-                elif years:
-                    # Complementary years are one set; two versions of a year overlap.
-                    keys = {(kind, year) for kind in kinds for year in years & engine._material_years(material)}
-                else:
-                    keys = kinds
+                keys = set()
+                for kind in material_tax_kinds(material) & wanted:
+                    if periods[kind]:
+                        keys |= {(kind, month) for month in periods[kind] & _declared(material)}
+                    elif years:
+                        # Complementary years are one set; two versions of a year overlap.
+                        keys |= {(kind, year) for year in years & engine._material_years(material)}
+                    else:
+                        keys.add(kind)
                 if covered.intersection(keys):
                     return []
                 covered.update(keys)

@@ -166,13 +166,16 @@ class TocLocationTests(unittest.TestCase):
                                                 ('（二）公司简介', '（三）结束附件', 'company_profile')])
 
     def test_unrepeated_chapters_keep_same_named_blank_sections(self):
-        document = Document()
-        for line in ['第一章 资格证明文件', '营业执照', '公司简介', '第二章 其他证明文件', '营业执照',
-                     '本节原有内容保持不变。', '公司简介', '本节原有内容保持不变。', '三、结束附件']:
-            document.add_paragraph(line)
-        scanned = self.scan(document)
-        for cid in ('business_license', 'company_profile'):
-            self.assertEqual(2, len([r for r in scanned['mappings'] if r['category_id'] == cid and r['locator_id']]))
+        for first, second in (('第一章 资格证明文件', '第二章 其他证明文件'), ('一、资格证明文件', '二、其他证明文件')):
+            with self.subTest(first=first):
+                document = Document()
+                for line in [first, '营业执照', '公司简介', second, '营业执照',
+                             '本节原有内容保持不变。', '公司简介', '本节原有内容保持不变。', '三、结束附件']:
+                    document.add_paragraph(line)
+                scanned = self.scan(document)
+                for cid in ('business_license', 'company_profile'):
+                    self.assertEqual(2, len([r for r in scanned['mappings']
+                                             if r['category_id'] == cid and r['locator_id']]))
         # Chapter titles that repeat later are still an unlabelled contents list.
         document = Document()
         entries = [document.add_paragraph(t) for t in ['第一章 营业执照', '第二章 公司简介']]
@@ -181,6 +184,17 @@ class TocLocationTests(unittest.TestCase):
             document.add_paragraph(line)
         scanned = self.scan(document)
         self.assert_directory_unselectable(document, scanned, entries)
+        # Also when the listed chapters contain same-named entries.
+        document = Document()
+        entries = [document.add_paragraph(t) for t in ['第一章 资格证明文件', '营业执照', '公司简介',
+                                                       '第二章 其他证明文件', '营业执照', '公司简介']]
+        for line in ['第一章 资格证明文件', '营业执照', '本节原有内容。', '公司简介', '本节原有内容。',
+                     '第二章 其他证明文件', '营业执照', '本节原有内容。', '公司简介', '本节原有内容。', '三、结束']:
+            document.add_paragraph(line)
+        scanned = self.scan(document)
+        self.assert_directory_unselectable(document, scanned, entries)
+        for cid in ('business_license', 'company_profile'):
+            self.assertEqual(2, len([r for r in scanned['mappings'] if r['category_id'] == cid and r['locator_id']]))
 
     def test_manual_directory_without_page_numbers_covers_common_and_special(self):
         document = Document()

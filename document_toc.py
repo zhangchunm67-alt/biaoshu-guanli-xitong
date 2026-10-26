@@ -108,7 +108,8 @@ def excluded_paragraphs(document):
         row = dict(index=index, element=element, key=key(text),
                    label=label(text, paragraph), marker=marker,
                    numbered=bool(engine._number_level(text)), region=recognition.region_title(text),
-                   chapter=bool(re.match(r'^第' + recognition._NUMBER + r'[章节部分篇]', recognition.compact(text))))
+                   chapter=bool(re.match(r'^(?:第' + recognition._NUMBER + r'[章节部分篇]|[一二三四五六七八九十]+[、.．])',
+                                         recognition.compact(text))))
         positions[row['key']].append(len(rows))
         rows.append(row)
 
@@ -162,9 +163,11 @@ def excluded_paragraphs(document):
                     # Blank material sections in one part remain real targets
                     # even when another part repeats them with existing text.
                     continue
-                if any(r.get('chapter') and positions[r['key']][-1] < boundary for r in run[1:cut]):
-                    # A chapter heading that is not repeated later separates
-                    # same-named blank sections; it is body structure, not a list.
+                if any(row.get('chapter') and len(positions[row['key']]) == 1 and
+                       {r['key'] for r in run[:j]} & {r['key'] for r in run[j + 1:cut + 1]}
+                       for j, row in enumerate(run[:cut]) if j):
+                    # A chapter heading that occurs only once and separates
+                    # same-named blank sections is body structure, not a contents entry.
                     continue
             for row in run[:cut]:
                 if row['marker'] or (not row.get('region') and

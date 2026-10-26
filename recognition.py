@@ -14,26 +14,35 @@ _REQUEST = re.compile(r'提供|提交|出具|附[上后：:]?|后附|须附|应�
 _IMAGE = re.compile(r'复印件|扫描件|影印件|电子件|正反面|双面|照片|粘贴|证书|合同.{0,16}(?:证明|关键页)|证明材料')
 _COPY = re.compile(r'后附|附[：:]|附上|须附|应附|需附|粘贴|复印件|扫描件|影印件|电子件')
 _SIGNATURE = re.compile(r'^(?:投标人|供应商|法定代表人|委托代理人|日期|年月日|年\s*月\s*日)')
+_REVIEW_INDEX = re.compile(r'(?:形式|资格|响应性|符合性|初步|详细|商务|技术)?评审(?:标准|因素|索引)表?[：:]?')
 _RESPONSE_FORM = re.compile(r'^(?:[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.．])'
                             r'.{1,40}?(?:函|书|证明|表|方案|声明|承诺|报价|简介|介绍|材料|资料|文件|执照|证书)$')
 _AGENT = r'(?:委托代理人|授权代理人|被授权人|授权代表|代理人|受托人)'
 _ID_DOC = r'(?:身份证(?!号)|护照)'
 _AGENT_ID = re.compile(_AGENT + r'.{0,18}?' + _ID_DOC + r'|' + _ID_DOC + r'.{0,12}' + _AGENT)
-_ID_COPY = re.compile(r'复印件|扫描件|影印件|复制件|电子件|正反面|双面|粘贴|照片')
+_ID_COPY = re.compile(r'复印件|扫描件|影印件|复制件|电子件|粘贴|照片')
+_ID_SIDES = re.compile(r'正反面|正、反面|双面')
 
 
 def agent_identity_target(title, attachment):
     """Authorization images are agent ID copies; the letter itself takes a text template.
 
     A number field, an authenticity statement or an original for inspection is
-    not a copy slot, even when it names the agent's ID.
+    not a copy slot, even when it names the agent's ID. Notes in parentheses,
+    such as （号码应清晰可辨）, do not change what the slot asks for.
     """
     value = re.sub(r'^(?:[（(]?(?:附件|附表)\s*' + _NUMBER + r'[）)]?[：:、.．-]*|附[：:]?)', '', compact(title))
-    if not _AGENT_ID.search(value) or re.search(r'号码|证号|声明|承诺', value):
+    whole = re.fullmatch(r'[（(]([^（）()]+)[）)][；;。，,]?', value)
+    if whole:
+        value = whole[1]
+    main = re.sub(r'[（(][^）)]*[）)]', '', value).rstrip('；;。，,：:')
+    if not _AGENT_ID.search(value) or re.search(r'号码|证号|声明|承诺', main):
         return False
-    core = re.sub(r'[（(][^）)]*[）)]', '', value).rstrip('；;。，,：:')
-    copy = _ID_COPY.search(value) or re.search(_ID_DOC + r'$', core)
-    return bool(copy and (attachment or not re.search(r'授权(?:委托)?书', value)))
+    copy = _ID_COPY.search(value)
+    if not copy and re.search(r'原件|查验|核验', value):
+        return False
+    return bool((copy or _ID_SIDES.search(value) or re.search(_ID_DOC + r'$', main))
+                and (attachment or not re.search(r'授权(?:委托)?书', value)))
 
 
 def family(category):
@@ -166,6 +175,8 @@ def entry_score(title, category):
     value = re.sub(r'^[•●◆◇★☆*·\-—]+', '', raw)
     value = engine._normal(value, remove_years=True)
     value = re.sub(r'^(?:附[：:]|(?:附件|附表|格式)' + _NUMBER + r'[）):：、.．-]*)', '', value)
+    # An entry written wholly in parentheses is still the entry itself.
+    value = re.sub(r'^[（(【\[]([^（）()【】\[\]]+)[）)】\]][；;。]?$', r'\1', value)
     value = re.sub(r'[（(【\[].*?[）)】\]]', '', value)
     value = value.rstrip('：:；;。')
     value = re.sub(r'^(?:(?:投标人|投标方|供应商)(?:应|须|需)?|请|须|需|应)?(?:提供|提交|附上|后附)', '', value)
@@ -320,8 +331,9 @@ def resolve(document, records, categories, toc_elements=()):
         chapter = re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)', compact(r['title']))
         if region:
             mode = region
-            # A review index inside the format chapter does not leave it.
-            if region != 'scoring' or chapter:
+            # Only an unnumbered review index (形式评审标准 etc.) stays inside
+            # the format chapter; 评标办法 or a numbered scoring section leaves it.
+            if region != 'scoring' or not _REVIEW_INDEX.fullmatch(compact(r['title'])):
                 form_chapter = region == 'form'
         elif chapter:
             mode = ''
@@ -504,6 +516,17 @@ def resolve(document, records, categories, toc_elements=()):
                             and p['_path'][0] == r['_path'][0] + 1
                             and engine._normal(p['title']) == engine._normal(r['title'])]
                 if siblings:
+                    continue
+            if key == 'text_template' and not r['existing_content'] and not r.get('_attachment'):
+                # An outer label (附件3：法定代表人授权书) directly above the form's
+                # own title of the same document type is one text slot.
+                from material_rules import text_kind
+                label = r'^(?:[（(]?(?:附件|附表|格式)\s*' + _NUMBER + r'|[（(]' + _NUMBER + r'[）)]|' + _NUMBER + r'[、.．])'
+                following = next((t for t in top if t['_path'][0] > r['_path'][0]), None)
+                if (following is not None and text_kind(r['title'])
+                        and re.match(label, compact(r['title'])) and not re.match(label, compact(following['title']))
+                        and any(p is following for p,_,_ in candidates)
+                        and text_kind(following['title']) == text_kind(r['title'])):
                     continue
             if r.get('_attachment'):
                 extra.append(r)

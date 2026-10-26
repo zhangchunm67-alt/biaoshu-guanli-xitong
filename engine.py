@@ -41,8 +41,8 @@ for _category in DEFAULT_CATEGORIES:
 _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
-SPECIAL_LOCATOR_VERSION = 7
-COMMON_LOCATOR_VERSION = 9
+SPECIAL_LOCATOR_VERSION = 8
+COMMON_LOCATOR_VERSION = 10
 
 
 def _common_title(text):
@@ -500,10 +500,8 @@ def _check_material(material, category_id, required, heading, special=False):
     errors, warnings = [], []
     name = str(material.get("name") or material.get("id") or "材料")
     if category_id == 'tax_social':
-        from material_rules import tax_errors, period_issue
+        from material_rules import tax_errors
         errors.extend(tax_errors(material, heading))
-        if period_issue(heading):
-            warnings.append(period_issue(heading))
     if category_id == 'text_template':
         from material_rules import text_kind
         wanted, actual = text_kind(heading.get('title', '')), text_kind(name)
@@ -633,6 +631,11 @@ def validate_mappings(mappings, materials, headings, categories=None):
         year_options = requirement.get('year_options', []) if category_id == 'audit_report' else []
         if year_options:
             row['required_years'] = []
+        if category_id == 'tax_social' and heading:
+            from material_rules import period_issue
+            # Shown before any material is chosen, not only on a selected one.
+            if period_issue(heading):
+                warnings.append(period_issue(heading))
         action = row.get("action")
         if action not in {"fill", "missing", "skip"}:
             errors.append("处理方式无效。")

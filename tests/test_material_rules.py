@@ -124,6 +124,8 @@ class MaterialRuleTests(unittest.TestCase):
         september = self.material('2026年9月社保缴费凭证')
         row = self.tax_rows(self.scan(['2026年9月至8月社保缴费证明'], [september]))[0]
         self.assertFalse(row['material_ids'])
+        # The review card warns before any material is chosen.
+        self.assertTrue(any('无法完整识别' in w for w in row['warnings']), row)
         checked = engine.validate_mappings([dict(row, action='fill', material_ids=[september['id']])],
             [september], self.scan(['2026年9月至8月社保缴费证明'], [])['headings'], self.categories)[0]
         self.assertTrue(any('无法完整识别' in w for w in checked['warnings']), checked)
@@ -155,6 +157,22 @@ class MaterialRuleTests(unittest.TestCase):
             [old, submitted], scanned['headings'], self.categories)[0]
         self.assertFalse(any('所属月份' in s for s in checked['issues']), checked['issues'])
         self.assertTrue(any('相对月份' in w for w in checked['warnings']))
+
+    def test_range_end_survives_deadline_wording(self):
+        january, half = self.material('2025年1月社保缴费凭证'), self.material('2025年1-6月社保缴费凭证')
+        lines = ['第五章 投标文件格式', '社保缴费证明', '社保缴费证明所属期自2025年1月至2025年6月截止。']
+        row = self.tax_rows(self.scan_lines(lines, [january]))[0]
+        self.assertEqual('blocked', row['status'])
+        self.assertTrue(any(s.startswith('缺少要求月份：社保 2025年2月') for s in row['issues']), row['issues'])
+        row = self.tax_rows(self.scan_lines(lines, [half]))[0]
+        self.assertEqual(([half['id']], 'ready'), (row['material_ids'], row['status']))
+
+    def test_each_kind_keeps_its_own_months(self):
+        tax, social = self.material('2025年1月至3月完税证明'), self.material('2025年4月至6月社保缴费凭证')
+        row = self.tax_rows(self.scan(['2025年1月至3月纳税证明及2025年4月至6月社保缴费证明'], [tax, social]))[0]
+        self.assertEqual(({tax['id'], social['id']}, 'ready'), (set(row['material_ids']), row['status']))
+        shared = self.tax_rows(self.scan(['2025年1月至6月的纳税和社保缴费证明'], [tax, social]))[0]
+        self.assertIn('缺少要求月份：纳税 2025年4月、2025年5月、2025年6月。', shared['issues'])
 
     def test_complementary_years_are_one_set_and_same_year_versions_overlap(self):
         first, second = self.material('2025年纳税证明'), self.material('2026年纳税证明')
@@ -210,6 +228,21 @@ class MaterialRuleTests(unittest.TestCase):
         titles = ['附件1：投标函', '附件3：法定代表人授权书', '附件5：承诺书']
         numbered = self.scan(titles, [])
         self.assertEqual(titles, [r['title'] for r in numbered['mappings'] if r['category_id'] == 'text_template'])
+
+    def test_outer_label_and_form_title_are_one_text_slot(self):
+        letter = dict(id='auth', category_id='text_template', name='法定代表人授权委托书模板',
+            subject=engine.EXPECTED_SUBJECT, mode='text', content='授权书模板正文', files=[], years=[], valid_until='长期')
+        scanned = self.scan_lines(['第六章 投标文件格式', '附件3：法定代表人授权书', '法定代表人授权委托书',
+                                   '本授权书声明：现委托乙某办理投标事项。', '附件4：其他'], [letter])
+        rows = [r for r in scanned['mappings'] if r['category_id'] == 'text_template']
+        self.assertEqual(['法定代表人授权委托书'], [r['title'] for r in rows])
+        filled = [dict(r, action='fill', material_ids=['auth']) for r in rows]
+        output = self.root / 'letter.docx'
+        engine.export_document(self.path, output, filled, [letter], categories=self.categories)
+        self.assertEqual(1, [p.text for p in Document(output).paragraphs].count('授权书模板正文'))
+        separate = self.scan_lines(['第六章 投标文件格式', '附件1：投标函', '附件2：投标函', '附件3：其他'], [])
+        self.assertEqual(['附件1：投标函', '附件2：投标函'],
+                         [r['title'] for r in separate['mappings'] if r['category_id'] == 'text_template'])
 
     def test_all_seven_categories_skip_directory_and_preserve_body_windows(self):
         doc = Document()

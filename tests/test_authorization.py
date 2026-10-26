@@ -172,7 +172,10 @@ class AuthorizationImagesTests(unittest.TestCase):
         cases = {'附：被授权人护照复印件': True, '附：委托代理人护照复印件': True,
                  '授权代理人身份证/护照复印件（正反面）': True, '附：被授权人身份证复印件（原件备查）': True,
                  '附：被授权人身份证号码：________': False, '附：被授权人身份证的真实性声明': False,
-                 '附：被授权人身份证原件（开标现场查验）': False}
+                 '附：被授权人身份证原件（开标现场查验）': False,
+                 '附：被授权人身份证原件（正反面，开标现场查验）': False,
+                 '附：被授权人身份证复印件（号码应清晰可辨）': True, '（被授权人身份证）': True,
+                 '被授权人身份证（正、反面）': True}
         for region in ([], ['第六章 投标文件格式']):
             for label, expected in cases.items():
                 with self.subTest(region=bool(region), label=label):
@@ -202,7 +205,8 @@ class AuthorizationImagesTests(unittest.TestCase):
                  '（二）法定代表人（负责人）身份证明', '法定代表人（负责人）身份证明', '兹证明甲某为本单位法定代表人。',
                  '（三）法定代表人（负责人）授权委托书', '法定代表人（负责人）授权委托书',
                  '本授权书声明：现委托乙某办理投标事项。', '日期：',
-                 '附：委托代理人身份证或护照等身份证明文件扫描件（身份证需同时提供正反面）', '（四）结束']
+                 '附：委托代理人身份证或护照等身份证明文件扫描件（身份证需同时提供正反面）', '（四）结束',
+                 '七、评标办法', '（一）服务方案', '方案完整得10分。']
         doc = Document()
         paragraphs = [doc.add_paragraph(line) for line in lines]
         doc.save(self.source)
@@ -223,6 +227,10 @@ class AuthorizationImagesTests(unittest.TestCase):
         image = next(r for r in scan['mappings'] if r['category_id'] == 'authorization')
         checked = self.checked(dict(image, action='fill', material_ids=['authorization']), scan)
         self.assertEqual('ready', checked['status'], checked['issues'])
+        # A scoring section after the format chapter is not a response form.
+        records, _ = engine._inspect(engine._read_template(self.source), categories)
+        regions = {r['_path'][0]: r['_region'] for r in records if len(r['_path']) == 1}
+        self.assertEqual(['scoring', 'scoring'], [regions[22], regions[23]])
 
     def test_expired_missing_or_text_materials_still_block(self):
         row, scan = self.prepare(self.form())
