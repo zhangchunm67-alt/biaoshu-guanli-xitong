@@ -17,3 +17,5 @@ node_modules/
 *.log
 考题/
 测试结果/
+outputs/
+tmp/

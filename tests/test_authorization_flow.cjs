@@ -30,19 +30,16 @@ finally:s.server_close();s.store.close()`,path.join(tmp,'data')],{cwd:app,env:{.
    assert.equal(await card.locator('[data-auth-field]').count(),0);
    assert.doesNotMatch(await card.innerText(),/填写授权书正文|授权项目名称|授权书签署日期|正文与人员核对/);
    for(const id of fixture.ids)await card.locator('input[data-map-material][value="'+id+'"]').check();
-   await card.getByRole('checkbox',{name:'我已逐项核对此匹配',exact:true}).check();
+   assert.equal(await card.getByRole('checkbox',{name:'我已逐项核对此匹配',exact:true}).count(),0);
    await page.getByRole('button',{name:'保存核对',exact:true}).first().click();
-   await page.getByRole('button',{name:'下一步：选择行业分类',exact:true}).waitFor({state:'visible'});
+   await page.getByRole('button',{name:'下一步：核对文字材料',exact:true}).waitFor({state:'visible'});
    await page.waitForFunction(()=>!document.querySelector('[data-action="save-project"]')?.disabled);
-   assert.equal(await card.getByRole('checkbox',{name:'我已逐项核对此匹配',exact:true}).isChecked(),true);
    assert.equal(await card.locator('.issue-list').count(),0);
    assert.equal(await card.locator('input[data-map-material]:checked').count(),2);
    assert.equal(await card.locator('.mapping-preview-image img').count()>0,true);
    await page.screenshot({path:path.join(tmp,c.label+'-核对页.png'),fullPage:true});
-   await page.getByRole('button',{name:'下一步：选择行业分类',exact:true}).click();
-   await page.getByRole('checkbox',{name:'本项目无需专用材料',exact:true}).check();
-   await page.getByRole('button',{name:'保存行业并继续',exact:true}).click();
-   // With no special materials the application moves directly to export.
+   await page.getByRole('button',{name:'下一步：核对文字材料',exact:true}).click();
+   await page.getByRole('button',{name:'下一步：导出标书',exact:true}).click();
    await page.getByRole('button',{name:'导出',exact:true}).click();
    await page.getByRole('link',{name:'下载 Word 文件',exact:true}).waitFor({state:'visible',timeout:30000});
    const download=page.waitForEvent('download');

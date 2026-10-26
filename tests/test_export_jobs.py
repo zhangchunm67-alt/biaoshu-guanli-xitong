@@ -32,6 +32,18 @@ class ExportJobTests(unittest.TestCase):
             if job['status'] in {'completed','failed'}:return job
             time.sleep(.01)
         self.fail('Job did not finish')
+    def test_draft_export_without_manual_confirmation(self):
+        p=self.store.require('project',self.key)
+        for row in p['mappings']: row['confirmed']=False
+        self.store.put('project',p);self.store.db.commit()
+        self.assertTrue(self.store.common_reviewed(p))
+        self.store.prepare_export(self.key,{'mode':'draft'})
+        self.start()
+        self.assertEqual('completed',self.wait()['status'])
+        self.assertTrue(all(not r['confirmed'] for r in self.store.require('project',self.key)['mappings']))
+        with self.assertRaises(ValueError):
+            self.store.prepare_export(self.key,{'mode':'reviewed'})
+
     def test_background_dedup_snapshot_download_and_persistence(self):
         entered=threading.Event();release=threading.Event();original=engine.export_document
         def delayed(*args,**kwargs):

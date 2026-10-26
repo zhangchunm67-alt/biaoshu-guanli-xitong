@@ -116,7 +116,9 @@ class AuthorizationImagesTests(unittest.TestCase):
         row['authorization'] = dict(enabled=True, signed_on='', project_name='不得写入')
         row['authorization_preview'] = {'body_lines': ['不得写入']}
         with self.assertRaisesRegex(ValueError, '重新核对'):
-            engine.export_document(self.source, self.output, [row], self.materials, categories=self.categories)
+            engine.export_document(self.source, self.output, [row], self.materials, 'reviewed', categories=self.categories)
+        engine.export_document(self.source, self.output, [row], self.materials, 'draft', categories=self.categories)
+        self.assertNotIn('不得写入', '\n'.join(p.text for p in Document(self.output).paragraphs))
         checked = self.checked(row, scan)
         self.assertEqual('ready', checked['status'], checked['issues'])
         self.assertFalse(checked['confirmed'])

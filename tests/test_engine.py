@@ -139,17 +139,19 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(scanned["mappings"][0]["status"], "ready")
         self.assertTrue(any("附件" in warning for warning in scanned["mappings"][0]["warnings"]))
 
-    def test_confirmation_and_blocked_fill_gate_even_for_draft(self):
+    def test_draft_needs_valid_materials_and_reviewed_needs_confirmation(self):
         self.doc("公司介绍")
         material = self.material()
         scanned = self.scan(self.categories("company_profile"), [material])
         with self.assertRaisesRegex(ValueError, "确认"):
-            engine.export_document(self.template, self.output, scanned["mappings"], [material])
+            engine.export_document(self.template, self.output, scanned["mappings"], [material], 'reviewed')
         self.assertFalse(self.output.exists())
+        engine.export_document(self.template, self.output, scanned["mappings"], [material], 'draft')
+        before = self.output.read_bytes()
         row = dict(scanned["mappings"][0], material_ids=["material", "missing"], confirmed=True)
         with self.assertRaisesRegex(ValueError, "不能导出"):
             engine.export_document(self.template, self.output, [row], [material], "draft")
-        self.assertFalse(self.output.exists())
+        self.assertEqual(before, self.output.read_bytes())
 
     def test_draft_missing_markers_and_reviewed_refusal(self):
         self.doc("公司介绍")

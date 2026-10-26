@@ -287,7 +287,7 @@ def _slot_record(base, category, own, title=None):
     return r
 
 
-def resolve(document, records, categories):
+def resolve(document, records, categories, toc_elements=()):
     """Prefer precise form slots, then corresponding material entries, then appendices."""
     import engine
     top = [r for r in records if len(r['_path']) == 1 and r['kind'] != 'placeholder']
@@ -320,10 +320,15 @@ def resolve(document, records, categories):
     for r in top:
         own = []
         for i in range(r['_path'][0]+1, len(children)):
+            if children[i] in toc_elements or any(p in toc_elements for p in children[i].iter(qn('w:p'))):
+                break
             other = by_top.get(i)
-            current_number = re.match(r'^(?:附[：:]\s*)?(\d+)[.．、]', compact(r['title']))
-            next_number = re.match(r'^(?:附[：:]\s*)?(\d+)[.．、]', compact(other['title'])) if other else None
-            next_peer = bool(current_number and next_number and int(next_number[1]) > int(current_number[1]))
+            numbering = r'^(?:附[：:]\s*)?(\d+(?:[.．]\d+)*)(?:[.．、]|(?=[^\d.．]))'
+            current_number = re.match(numbering, compact(r['title']))
+            next_number = re.match(numbering, compact(other['title'])) if other else None
+            next_peer = bool(current_number and next_number and
+                tuple(map(int, re.split('[.．]', next_number[1]))) >
+                tuple(map(int, re.split('[.．]', current_number[1]))))
             next_requirement = bool(other and r['_region']=='form' and
                 re.match(r'^(?:附[：:]\s*)?\d+[.．、]', compact(other['title'])) and
                 (next_peer or (other['_topics'] and not other['_topics'].intersection(r['_title_topics'] or r['_topics']))))
@@ -429,6 +434,14 @@ def resolve(document, records, categories):
             precise = [(r,s,why) for r,s,why in candidates if r.get('_attachment')]
         filtered = []
         for r,s,why in candidates:
+            if key == 'tax_social':
+                from material_rules import tax_kinds
+                number = re.match(r'^(\d+(?:\.\d+)*)[.、]', compact(r['title']))
+                subtypes = set().union(*(tax_kinds(p['title']) for p,_,_ in candidates
+                    if p is not r and number and compact(p['title']).startswith(number[1] + '.')
+                    and re.match(r'^' + re.escape(number[1]) + r'\.\d', compact(p['title']))))
+                if number and len(tax_kinds(r['title'])) > 1 and tax_kinds(r['title']) <= subtypes:
+                    continue
             if key in {'legal_identity','authorization'} and not r.get('_attachment'):
                 nearby = [p for p,_,_ in precise if 0 < p['_path'][0]-r['_path'][0] < 60]
                 if any(not any(
@@ -443,7 +456,11 @@ def resolve(document, records, categories):
                    p['_element'] in r.get('_own', []) for p,_,_ in precise):
                 continue
             if r.get('_region') == 'form' and not r.get('_own') and not r.get('_attachment'):
-                siblings = [p for p,_,_ in candidates if p is not r and p.get('_own')]
+                # Collapse a section label followed by the same form title,
+                # not a distinct blank section elsewhere in the framework.
+                siblings = [p for p,_,_ in candidates if p is not r and p.get('_own')
+                            and p['_path'][0] == r['_path'][0] + 1
+                            and engine._normal(p['title']) == engine._normal(r['title'])]
                 if siblings:
                     continue
             if r.get('_attachment'):
