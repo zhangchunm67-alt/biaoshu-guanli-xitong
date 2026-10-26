@@ -25,8 +25,10 @@ _DEADLINE = re.compile(r'(?:应于|须于|需于|于)?20\d{2}年\d{1,2}月(?:\d{
 _RELATIVE = re.compile(r'(?:近|前|最近)[一二三四五六七八九十\d]+个?月|近半年')
 _TAX_WORD, _SOCIAL_WORD = r'税收|税款|纳税|完税', r'社保|社会保险|社会保障|职工缴费'
 _KIND_WORD = re.compile('(' + _TAX_WORD + ')|(' + _SOCIAL_WORD + ')')
-# A period written just before its evidence (2025年1月的纳税证明) names that evidence.
-_BEFORE_KIND = re.compile(r'[）)]?(?:的|之)?(?:单位|企业|公司|依法)?(?:缴纳)?(?=' + _TAX_WORD + '|' + _SOCIAL_WORD + ')')
+# A period written just before its evidence (2025年1月的纳税证明, 2025年2月份的
+# 社保缴费证明) names that evidence.
+_BEFORE_KIND = re.compile(r'(?:份|期间|所属期)?[）)]?(?:的|之)?(?:单位|企业|公司|依法)?(?:缴纳)?'
+                          r'(?=' + _TAX_WORD + '|' + _SOCIAL_WORD + ')')
 
 
 def _spans(text, deadlines=False):

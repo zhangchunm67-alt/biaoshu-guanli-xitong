@@ -190,6 +190,24 @@ class MaterialRuleTests(unittest.TestCase):
         mixed = self.tax_rows(self.scan(['2025年1月和2025年2月的纳税证明及2025年3月的社保缴费证明'], [feb, social]))[0]
         self.assertIn('缺少要求月份：纳税 2025年1月。', mixed['issues'])
 
+    def test_month_modifiers_keep_the_period_with_its_evidence(self):
+        lines = ['第五章 投标文件格式', '纳税和社保缴费证明',
+                 '2025年1月纳税证明及2025年2月份的社保缴费证明和2025年3月社保缴费证明。']
+        tax, social = self.material('2025年1月完税证明'), self.material('2025年2月至3月社保缴费凭证')
+        row = self.tax_rows(self.scan_lines(lines, [tax, social]))[0]
+        self.assertEqual(({tax['id'], social['id']}, 'ready', []),
+                         (set(row['material_ids']), row['status'], row['issues']))
+        early_tax, late_social = self.material('2025年1月至2月完税证明'), self.material('2025年3月社保缴费凭证')
+        row = self.tax_rows(self.scan_lines(lines, [early_tax, late_social]))[0]
+        self.assertEqual('blocked', row['status'])
+        self.assertIn('缺少要求月份：社保 2025年2月。', row['issues'])
+        for modifier in ['份的', '期间的', '所属期的']:
+            with self.subTest(modifier=modifier):
+                text = '2025年1月纳税证明及2025年2月' + modifier + '社保缴费证明'
+                row = self.tax_rows(self.scan_lines(['第五章 投标文件格式', '纳税和社保缴费证明', text],
+                                                    [tax, self.material('2025年2月社保缴费凭证')]))[0]
+                self.assertEqual(('ready', []), (row['status'], row['issues']))
+
     def test_each_sentence_constrains_only_the_evidence_it_names(self):
         tax, social = self.material('2025年1月完税证明'), self.material('2025年2月社保缴费凭证')
         for text in ['供应商须提供2025年1月的纳税证明。供应商须提供2025年2月的社保缴费证明。',
