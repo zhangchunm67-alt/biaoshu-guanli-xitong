@@ -175,7 +175,8 @@ class AuthorizationImagesTests(unittest.TestCase):
                  '附：被授权人身份证原件（开标现场查验）': False,
                  '附：被授权人身份证原件（正反面，开标现场查验）': False,
                  '附：被授权人身份证复印件（号码应清晰可辨）': True, '（被授权人身份证）': True,
-                 '被授权人身份证（正、反面）': True}
+                 '被授权人身份证（正、反面）': True, '附：被授权人身份证（号码：____）': False,
+                 '附：被授权人身份证（真实性声明）': False}
         for region in ([], ['第六章 投标文件格式']):
             for label, expected in cases.items():
                 with self.subTest(region=bool(region), label=label):
@@ -231,6 +232,29 @@ class AuthorizationImagesTests(unittest.TestCase):
         records, _ = engine._inspect(engine._read_template(self.source), categories)
         regions = {r['_path'][0]: r['_region'] for r in records if len(r['_path']) == 1}
         self.assertEqual(['scoring', 'scoring'], [regions[22], regions[23]])
+
+    def test_numbered_items_inside_a_review_index_stay_scoring(self):
+        categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],
+                                             layer='special', enabled=True)]
+
+        def scan(lines):
+            doc = Document()
+            for line in lines:
+                doc.add_paragraph(line)
+            doc.save(self.source)
+            records, _ = engine._inspect(engine._read_template(self.source), categories)
+            regions = [r['_region'] for r in records if len(r['_path']) == 1 and r['kind'] != 'placeholder']
+            return regions, engine.scan_document(self.source, categories, self.materials, ['text_template'])
+        regions, scanned = scan(['第六章 投标文件格式', '形式评审标准', '（一）服务方案', '根据服务方案评分，最高十分。',
+                                 '资格评审标准', '（二）营业执照', '依据资质评分。', '（一）投标函', '致：招标人。'])
+        self.assertEqual(['form'] + ['scoring'] * 6 + ['form', 'form'], regions)
+        self.assertFalse([r for r in scanned['mappings'] if r['category_id'] == 'business_license'
+                          and r['locator_id'].startswith(('p:5:', 'at:business_license:p:5:'))])
+        # Numbered or combined review-index titles still keep the format chapter.
+        for head in ['商务和技术评审标准', '评审内容及标准', '（一）形式评审标准', '1.形式评审标准']:
+            with self.subTest(head=head):
+                regions, _ = scan(['第六章 投标文件格式', head, '营业执照', '（一）投标函', '致：招标人。'])
+                self.assertEqual(['form', 'scoring', 'scoring', 'form', 'form'], regions)
 
     def test_expired_missing_or_text_materials_still_block(self):
         row, scan = self.prepare(self.form())

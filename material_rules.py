@@ -23,30 +23,37 @@ _SPAN = re.compile(r'(20\d{2})年(\d{1,2})月?' + _RANGE + r'(?:(20\d{2})年)?(\
 _DEADLINE = re.compile(r'(?:应于|须于|需于|于)?20\d{2}年\d{1,2}月(?:\d{1,2}日)?'
                        r'(?:前|之前|以前)?(?:提交|递交|报送|送达)')
 _RELATIVE = re.compile(r'(?:近|前|最近)[一二三四五六七八九十\d]+个?月|近半年')
-_JOIN = re.compile(r'以及|及|和|与|；|;')
+_TAX_WORD, _SOCIAL_WORD = r'税收|税款|纳税|完税', r'社保|社会保险|社会保障|职工缴费'
+_KIND_WORD = re.compile('(' + _TAX_WORD + ')|(' + _SOCIAL_WORD + ')')
+# A period written just before its evidence (2025年1月的纳税证明) names that evidence.
+_BEFORE_KIND = re.compile(r'[）)]?(?:的|之)?(?:单位|企业|公司|依法)?(?:缴纳)?(?=' + _TAX_WORD + '|' + _SOCIAL_WORD + ')')
+
+
+def _spans(text, deadlines=False):
+    """(start, end, months, valid) for each period in compact text, in order."""
+    spans = []
+
+    def mask(m):
+        return '|' * (m.end() - m.start())
+    for m in _SPAN.finditer(text):
+        y, a, end_year, b = m.groups()
+        first, last = int(y) * 12 + int(a) - 1, int(end_year or y) * 12 + int(b) - 1
+        valid = 1 <= int(a) <= 12 and 1 <= int(b) <= 12 and 0 <= last - first <= 120
+        spans.append((m.start(), m.end(), set(range(first, last + 1)) if valid else set(), valid))
+    # Consume each range so its end is never read again as a single month.
+    rest = _SPAN.sub(mask, text)
+    if deadlines:
+        rest = _DEADLINE.sub(mask, rest)
+    for m in re.finditer(r'(20\d{2})年((?:\d{1,2}[、，,])*\d{1,2})月', rest):
+        found = {int(m[1]) * 12 + int(n) - 1 for n in re.split('[、，,]', m[2]) if 1 <= int(n) <= 12}
+        spans.append((m.start(), m.end(), found, True))
+    return sorted(spans, key=lambda span: span[0])
 
 
 def _period(text, deadlines=False):
     """Months named by text, and whether a range in it is not a valid period."""
-    text = re.sub(r'\s+', '', text or '')
-    found, invalid = set(), False
-
-    def span(m):
-        nonlocal invalid
-        y, a, end_year, b = m.groups()
-        start, end = int(y) * 12 + int(a) - 1, int(end_year or y) * 12 + int(b) - 1
-        if 1 <= int(a) <= 12 and 1 <= int(b) <= 12 and 0 <= end - start <= 120:
-            found.update(range(start, end + 1))
-        else:
-            invalid = True
-        # Consume the whole range so its end is never read as a single month.
-        return '|'
-    rest = _SPAN.sub(span, text)
-    if deadlines:
-        rest = _DEADLINE.sub('|', rest)
-    for m in re.finditer(r'(20\d{2})年((?:\d{1,2}[、，,])*\d{1,2})月', rest):
-        found.update(int(m[1]) * 12 + int(n) - 1 for n in re.split('[、，,]', m[2]) if 1 <= int(n) <= 12)
-    return found, invalid
+    spans = _spans(re.sub(r'\s+', '', text or ''), deadlines)
+    return set().union(*(span[2] for span in spans)), not all(span[3] for span in spans)
 
 
 def months(text):
@@ -82,12 +89,18 @@ def period_issue(heading):
 
 
 def _clause_periods(clause):
-    """Months named beside each kind; a kind named without months shares them all."""
+    """Months per kind by position: a period just before a kind names it; any
+    other period continues the nearest kind before it, or else the next one."""
+    text = re.sub(r'\s+', '', clause)
+    kinds = [(m.start(), m.end(), 'tax' if m.group(1) else 'social') for m in _KIND_WORD.finditer(text)]
     own, every = {}, set()
-    for chunk in _JOIN.split(clause):
-        found = _period(chunk, deadlines=True)[0]
+    for start, end, found, _ in _spans(text, deadlines=True):
         every |= found
-        for kind in tax_kinds(chunk) if found else ():
+        ahead = _BEFORE_KIND.match(text, end)
+        before = [k for s, e, k in kinds if e <= start]
+        after = [k for s, e, k in kinds if s >= (ahead.end() if ahead else end)]
+        kind = after[0] if ahead and after else before[-1] if before else after[0] if after else None
+        if kind:
             own.setdefault(kind, set()).update(found)
     return own, every
 
@@ -100,7 +113,9 @@ def tax_target(heading):
     if not relative_period(heading):
         for clause in _period_clauses(heading):
             own, every = _clause_periods(clause)
-            for kind in periods:
+            # Only the kinds a clause names take its months; one it names
+            # without months of its own shares them (2025年1月的纳税和社保证明).
+            for kind in tax_kinds(clause) or set(periods):
                 periods[kind] |= own.get(kind) or every
     return tax_kinds(title) or tax_kinds(title + '\n' + context), periods
 

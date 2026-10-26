@@ -174,6 +174,33 @@ class MaterialRuleTests(unittest.TestCase):
         shared = self.tax_rows(self.scan(['2025年1月至6月的纳税和社保缴费证明'], [tax, social]))[0]
         self.assertIn('缺少要求月份：纳税 2025年4月、2025年5月、2025年6月。', shared['issues'])
 
+    def test_listed_months_stay_with_their_evidence(self):
+        jan, feb = self.material('2025年1月完税证明'), self.material('2025年2月完税证明')
+        lines = ['第五章 投标文件格式', '纳税证明', '纳税证明缴费所属期为2025年1月和2025年2月。']
+        scanned = self.scan_lines(lines, [jan, feb])
+        row = self.tax_rows(scanned)[0]
+        self.assertEqual(([jan['id'], feb['id']], 'ready'), (row['material_ids'], row['status']))
+        manual = engine.validate_mappings([dict(row, material_ids=[jan['id'], feb['id']])],
+            [jan, feb], scanned['headings'], self.categories)[0]
+        self.assertEqual('ready', manual['status'], manual['issues'])
+        partial = self.tax_rows(self.scan_lines(lines, [jan]))[0]
+        self.assertEqual(([jan['id']], 'blocked'), (partial['material_ids'], partial['status']))
+        self.assertIn('缺少要求月份：纳税 2025年2月。', partial['issues'])
+        social = self.material('2025年3月社保缴费凭证')
+        mixed = self.tax_rows(self.scan(['2025年1月和2025年2月的纳税证明及2025年3月的社保缴费证明'], [feb, social]))[0]
+        self.assertIn('缺少要求月份：纳税 2025年1月。', mixed['issues'])
+
+    def test_each_sentence_constrains_only_the_evidence_it_names(self):
+        tax, social = self.material('2025年1月完税证明'), self.material('2025年2月社保缴费凭证')
+        for text in ['供应商须提供2025年1月的纳税证明。供应商须提供2025年2月的社保缴费证明。',
+                     '供应商须提供2025年1月的纳税证明，2025年2月的社保缴费证明。',
+                     '供应商须提供2025年1月的纳税证明；2025年2月的社保缴费证明。']:
+            with self.subTest(text=text):
+                row = self.tax_rows(self.scan_lines(['第一章 投标人须知'] + text.rstrip('。').split('。'),
+                                                    [tax, social]))[0]
+                self.assertEqual(({tax['id'], social['id']}, 'ready', []),
+                                 (set(row['material_ids']), row['status'], row['issues']))
+
     def test_complementary_years_are_one_set_and_same_year_versions_overlap(self):
         first, second = self.material('2025年纳税证明'), self.material('2026年纳税证明')
         first['years'], second['years'] = [2025], [2026]
@@ -243,6 +270,11 @@ class MaterialRuleTests(unittest.TestCase):
         separate = self.scan_lines(['第六章 投标文件格式', '附件1：投标函', '附件2：投标函', '附件3：其他'], [])
         self.assertEqual(['附件1：投标函', '附件2：投标函'],
                          [r['title'] for r in separate['mappings'] if r['category_id'] == 'text_template'])
+        # Two different commitments of the same kind stay two slots.
+        self.categories[-1]['aliases'] += ['保密承诺函', '廉洁承诺函']
+        letters = self.scan_lines(['第六章 投标文件格式', '（一）保密承诺函', '廉洁承诺函', '签署本函。', '附件2：其他'], [])
+        self.assertEqual(['（一）保密承诺函', '廉洁承诺函'],
+                         [r['title'] for r in letters['mappings'] if r['category_id'] == 'text_template'])
 
     def test_all_seven_categories_skip_directory_and_preserve_body_windows(self):
         doc = Document()

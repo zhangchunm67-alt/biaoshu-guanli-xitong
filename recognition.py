@@ -14,7 +14,11 @@ _REQUEST = re.compile(r'提供|提交|出具|附[上后：:]?|后附|须附|应�
 _IMAGE = re.compile(r'复印件|扫描件|影印件|电子件|正反面|双面|照片|粘贴|证书|合同.{0,16}(?:证明|关键页)|证明材料')
 _COPY = re.compile(r'后附|附[：:]|附上|须附|应附|需附|粘贴|复印件|扫描件|影印件|电子件')
 _SIGNATURE = re.compile(r'^(?:投标人|供应商|法定代表人|委托代理人|日期|年月日|年\s*月\s*日)')
-_REVIEW_INDEX = re.compile(r'(?:形式|资格|响应性|符合性|初步|详细|商务|技术)?评审(?:标准|因素|索引)表?[：:]?')
+# An evaluation-method title leaves the format chapter; review criteria inside it do not.
+_METHOD = re.compile(r'(?:评标|评审|评分)(?:办法|方法|细则|程序)')
+_SECTION = re.compile(r'^(?:[（(][一二三四五六七八九十\d]+[）)]|[一二三四五六七八九十]+[、.．]|\d+[、.．])')
+_SCORE = re.compile(r'评分|得分|分值|满分|加分|扣分|最高[\d一二三四五六七八九十]+分|\d+(?:\.\d+)?分')
+_LETTER = re.compile(r'(?:投标|响应|报价)函|授权(?:委托)?书|身份证明|承诺[函书]|声明[函书]?$')
 _RESPONSE_FORM = re.compile(r'^(?:[（(][一二三四五六七八九十]+[）)]|[一二三四五六七八九十]+[、.．])'
                             r'.{1,40}?(?:函|书|证明|表|方案|声明|承诺|报价|简介|介绍|材料|资料|文件|执照|证书)$')
 _AGENT = r'(?:委托代理人|授权代理人|被授权人|授权代表|代理人|受托人)'
@@ -36,7 +40,10 @@ def agent_identity_target(title, attachment):
     if whole:
         value = whole[1]
     main = re.sub(r'[（(][^）)]*[）)]', '', value).rstrip('；;。，,：:')
-    if not _AGENT_ID.search(value) or re.search(r'号码|证号|声明|承诺', main):
+    # A quality note such as （号码应清晰可辨） is ignored; a field or a
+    # statement, even in parentheses (（号码：____）, （真实性声明）), is not a copy.
+    if (not _AGENT_ID.search(value) or re.search(r'号码|证号', main)
+            or re.search(r'(?:号码|证号)[：:]|[_＿]{2,}|声明|承诺', value)):
         return False
     copy = _ID_COPY.search(value)
     if not copy and re.search(r'原件|查验|核验', value):
@@ -326,19 +333,31 @@ def resolve(document, records, categories, toc_elements=()):
     mode = ''
     form_chapter = False
     regions = {}
-    for r in top:
+    def form_evidence(index):
+        # Inside a review index, a numbered title is a response form only when
+        # what follows it is not scoring text: a letter title, or body text.
+        body = []
+        for other in top[index + 1:index + 9]:
+            text = compact(other['title'])
+            if region_title(other['title']) or _SECTION.match(text) or re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)', text):
+                break
+            body.append(text)
+        body = ''.join(body)
+        return not _SCORE.search(body) and bool(body or _LETTER.search(compact(top[index]['title'])))
+    for index, r in enumerate(top):
         region = region_title(r['title'])
         chapter = re.match(r'^第' + _NUMBER + r'(?:章|部分|篇)', compact(r['title']))
         if region:
             mode = region
-            # Only an unnumbered review index (形式评审标准 etc.) stays inside
-            # the format chapter; 评标办法 or a numbered scoring section leaves it.
-            if region != 'scoring' or not _REVIEW_INDEX.fullmatch(compact(r['title'])):
+            # Review criteria (形式评审标准, （一）资格评审标准 …) stay inside the
+            # format chapter; a chapter or an evaluation-method title leaves it.
+            if region != 'scoring' or chapter or _METHOD.search(compact(r['title'])):
                 form_chapter = region == 'form'
         elif chapter:
             mode = ''
             form_chapter = False
-        elif mode == 'scoring' and form_chapter and _RESPONSE_FORM.match(compact(r['title'])):
+        elif (mode == 'scoring' and form_chapter and _RESPONSE_FORM.match(compact(r['title']))
+              and form_evidence(index)):
             # A review index inside the format chapter ends at the first
             # numbered response form, such as （一）投标函.
             mode = 'form'
@@ -521,12 +540,19 @@ def resolve(document, records, categories, toc_elements=()):
                 # An outer label (附件3：法定代表人授权书) directly above the form's
                 # own title of the same document type is one text slot.
                 from material_rules import text_kind
-                label = r'^(?:[（(]?(?:附件|附表|格式)\s*' + _NUMBER + r'|[（(]' + _NUMBER + r'[）)]|' + _NUMBER + r'[、.．])'
+                label = r'^(?:[（(]?(?:附件|附表|格式)\s*' + _NUMBER + r'[）)]?[：:、.．-]*|[（(]' + _NUMBER + r'[）)]|' + _NUMBER + r'[、.．])'
+
+                def name(title):
+                    value = re.sub(r'[（(][^）)]*[）)]', '', re.sub(label, '', compact(title)))
+                    value = re.sub(r'(?:格式|范本|模板)$', '', value)
+                    return value.replace('授权委托书', '授权书').replace('承诺书', '承诺函')
                 following = next((t for t in top if t['_path'][0] > r['_path'][0]), None)
+                # Same document only: 保密承诺函 above 廉洁承诺函 is two letters.
                 if (following is not None and text_kind(r['title'])
                         and re.match(label, compact(r['title'])) and not re.match(label, compact(following['title']))
                         and any(p is following for p,_,_ in candidates)
-                        and text_kind(following['title']) == text_kind(r['title'])):
+                        and text_kind(following['title']) == text_kind(r['title'])
+                        and (name(r['title']) in name(following['title']) or name(following['title']) in name(r['title']))):
                     continue
             if r.get('_attachment'):
                 extra.append(r)
