@@ -42,6 +42,15 @@ const navs = [{id:'dashboard',label:'工作台',icon:'grid'},{id:'materials',lab
 const specialState={industry:'',category:'',query:'',page:1,result:{items:[],total:0,counts:{}},cache:new Map()};
 const projectUi={id:null,step:'common',pickers:{},navigation:null};
 const locationUi={mappingId:null,projectId:null,result:null,page:1,zoom:1,showMarkers:true,requestId:0};
+// Colleagues submit materials and cases; only the local entry reviews them into the library.
+const contributionUi={status:'pending',result:null,cases:null,caseArchived:false};
+const MATERIAL_VIEWS=['materials','industries','cases','submissions'];
+function isRemote(){return !!state.data?.remote_access?.public;}
+function fileSize(bytes){const n=Number(bytes)||0;return n>=1024*1024?`${(n/1024/1024).toFixed(n>=10*1024*1024?0:1)} MB`:`${Math.max(1,Math.round(n/1024))} KB`;}
+function contributorName(){try{return localStorage.getItem('bid-contributor')||'';}catch{return '';}}
+function rememberContributor(name){try{localStorage.setItem('bid-contributor',name);}catch{}}
+async function loadSubmissions(){contributionUi.result=await api('/api/submissions?status='+encodeURIComponent(contributionUi.status));}
+async function loadCaseLibrary(){contributionUi.cases=await api('/api/case-library'+(contributionUi.caseArchived?'?archived=true':''));}
 function isSpecial(id){return state.data?.categories.find(c=>c.id===id)?.layer==='special';}
 function projectRows(layer){return (state.project?.mappings||[]).filter(m=>(isSpecial(m.category_id)?'special':'common')===layer);}
 function rowsReviewed(rows){return rows.every(m=>m.status!=='blocked');}
@@ -152,6 +161,8 @@ async function refreshData({refreshProject=true}={}) {
   if(auditCategory?.name==='2023-2024年财务审计报告')auditCategory.name='近三年财务审计报告';
   if(!state.data.industries.some(i=>i.id===specialState.industry))specialState.industry=state.data.industries[0]?.id||'';
   if(state.view==='industries')await loadSpecial();
+  if(state.view==='submissions')await loadSubmissions();
+  if(state.view==='cases')await loadCaseLibrary();
   if(state.drawerId&&specialState.cache.has(state.drawerId))specialState.cache.set(state.drawerId,await api('/api/materials/'+encodeURIComponent(state.drawerId)));
   const currentProject=state.project;
   if(refreshProject&&currentProject&&!state.dirty){
@@ -263,15 +274,16 @@ function button(label, action, opts = {}) {
 }
 function render() {
   if (!state.data) return;
-  const nav = navs.find(n => n.id === (state.view==='industries'?'materials':state.view)) || navs[0];
-  $('#app').innerHTML = `<div class="app-shell"><button type="button" class="mobile-shade" data-action="toggle-nav" aria-label="关闭导航"></button><aside class="sidebar" aria-label="主导航"><a class="brand" href="#" data-action="navigate" data-view="dashboard"><span class="brand-mark">${icon('layers')}</span><span><span class="brand-title">腾宝 · 标书管理</span></span></a><nav class="nav-items">${navs.map(n=>{const active=n.id===state.view||(n.id==='materials'&&state.view==='industries');return `<button type="button" class="nav-button ${active?'active':''}" data-action="navigate" data-view="${n.id}" ${active?'aria-current="page"':''}>${icon(n.icon)}${n.label}${n.id==='projects'?`<span class="nav-count" style="margin-left:auto">${state.data.projects.length}</span>`:''}</button>${n.id==='materials'&&active?`<div class="material-subnav" aria-label="材料库分类">${[['materials','图片材料'],['industries','文字材料']].map(([id,label])=>`<button type="button" class="nav-button ${state.view===id?'active':''}" data-action="navigate" data-view="${id}" ${state.view===id?'aria-current="page"':''}>${label}</button>`).join('')}</div>`:''}`;}).join('')}</nav><div class="sidebar-bottom"><div class="sidebar-footnote">文件保存在本机；使用 AI 时，相关文本会发送至所配置的模型服务。</div></div></aside><div class="main-shell"><header class="topbar"><button type="button" class="icon-button mobile-menu" data-action="toggle-nav" aria-label="打开导航">${icon('menu')}</button><div class="breadcrumb"><strong>${nav.label}</strong>${state.project&&state.view==='projects'?`${icon('chevron')}<span>项目核对</span>`:''}</div><div class="topbar-right">${button('新建项目','new-framework',{primary:true,icon:'plus'})}<span class="avatar" aria-label="腾宝">腾</span></div></header><main id="main-content" class="main-content" tabindex="-1">${renderView()}</main></div></div>`;
+  const nav = navs.find(n => n.id === (MATERIAL_VIEWS.includes(state.view)?'materials':state.view)) || navs[0];
+  const pendingSubmissions=Number(state.data.stats?.pending_submission_count||0);
+  $('#app').innerHTML = `<div class="app-shell"><button type="button" class="mobile-shade" data-action="toggle-nav" aria-label="关闭导航"></button><aside class="sidebar" aria-label="主导航"><a class="brand" href="#" data-action="navigate" data-view="dashboard"><span class="brand-mark">${icon('layers')}</span><span><span class="brand-title">腾宝 · 标书管理</span></span></a><nav class="nav-items">${navs.map(n=>{const active=n.id===state.view||(n.id==='materials'&&MATERIAL_VIEWS.includes(state.view));return `<button type="button" class="nav-button ${active?'active':''}" data-action="navigate" data-view="${n.id}" ${active?'aria-current="page"':''}>${icon(n.icon)}${n.label}${n.id==='projects'?`<span class="nav-count" style="margin-left:auto">${state.data.projects.length}</span>`:''}</button>${n.id==='materials'&&active?`<div class="material-subnav" aria-label="材料库分类">${[['materials','图片材料'],['industries','文字材料'],['cases','案例库'],['submissions','投稿入库']].map(([id,label])=>`<button type="button" class="nav-button ${state.view===id?'active':''}" data-action="navigate" data-view="${id}" ${state.view===id?'aria-current="page"':''}>${label}${id==='submissions'&&pendingSubmissions?`<span class="nav-count" style="margin-left:auto">${pendingSubmissions}<span class="sr-only"> 份待审核</span></span>`:''}</button>`).join('')}</div>`:''}`;}).join('')}</nav><div class="sidebar-bottom"><div class="sidebar-footnote">文件保存在本机；使用 AI 时，相关文本会发送至所配置的模型服务。</div></div></aside><div class="main-shell"><header class="topbar"><button type="button" class="icon-button mobile-menu" data-action="toggle-nav" aria-label="打开导航">${icon('menu')}</button><div class="breadcrumb"><strong>${nav.label}</strong>${state.project&&state.view==='projects'?`${icon('chevron')}<span>项目核对</span>`:''}</div><div class="topbar-right">${button('新建项目','new-framework',{primary:true,icon:'plus'})}<span class="avatar" aria-label="腾宝">腾</span></div></header><main id="main-content" class="main-content" tabindex="-1">${renderView()}</main></div></div>`;
   $('#app').inert=state.busy;
   updateCreditCard();syncCreditPolling();observeInlineLocations();
 }
 function renderView() {
   if(state.view==='dashboard')return renderDashboard();
   if (state.project) return renderProject();
-  return ({materials:renderMaterials,industries:renderIndustries,projects:renderProjects}[state.view] || renderDashboard)();
+  return ({materials:renderMaterials,industries:renderIndustries,projects:renderProjects,cases:renderCaseLibrary,submissions:renderSubmissions}[state.view] || renderDashboard)();
 }
 function renderDashboard() {
   const d = state.data;
@@ -284,8 +296,12 @@ function renderDashboard() {
 function projectTable(projects, compact = false) {
   return `<div class="table-wrap"><table class="data-table"><thead><tr><th>项目名称</th>${compact?'':'<th>模板文件</th>'}<th>状态</th><th>最近更新</th><th>操作</th></tr></thead><tbody>${projects.map(p=>`<tr><td><div class="name-cell"><span class="file-icon">${icon('file')}</span><div><button type="button" class="text-button table-title" data-action="open-project" data-id="${esc(p.id)}">${esc(p.name)}</button>${compact?`<div class="table-subtitle">${esc(p.template_name || 'Word 模板')}</div>`:''}</div></div></td>${compact?'':`<td class="muted">${esc(p.template_name)}</td>`}<td>${statusBadge(p.status)}</td><td class="muted mono">${date(p.updated_at || p.created_at)}</td><td><button type="button" class="text-button" data-action="open-project" data-id="${esc(p.id)}">${p.framework_artifact_id?.startsWith('part-')?'查看历史工作稿':'进入核对'}</button></td></tr>`).join('')}</tbody></table></div>`;
 }
+function addMaterialButton(label,category,options={}) {
+  // The mapped port cannot upload originals; colleagues there submit for local review instead.
+  return isRemote()?button('提交材料','submit-material',{...options,icon:'upload',category,disabled:false}):button(label,'new-material',{...options,icon:'plus',category});
+}
 function renderMaterials() {
-  return `${heading('图片材料','',button('新增材料','new-material',{primary:true,icon:'plus',category:state.category!=='all'?state.category:undefined,disabled:isCreditCategory(state.category)}))}${renderCreditCard()}<div id="material-library-region">${renderMaterialsLibrary()}</div>`;
+  return `${heading('图片材料','',addMaterialButton('新增材料',state.category!=='all'&&!isCreditCategory(state.category)?state.category:undefined,{primary:true,disabled:isCreditCategory(state.category)}))}${renderCreditCard()}<div id="material-library-region">${renderMaterialsLibrary()}</div>`;
 }
 function renderMaterialsLibrary() {
   if(isCreditCategory(state.category))state.category='all';
@@ -293,17 +309,44 @@ function renderMaterialsLibrary() {
   const rows = state.data.materials.filter(m=>(state.category==='all'||m.category_id===state.category)&&(!query||[m.name,m.subject,m.version,categoryName(m.category_id),(m.years||[]).join(' ')].join(' ').toLocaleLowerCase().includes(query)));
   return `<div class="filter-tabs" aria-label="按栏目筛选"><button type="button" class="filter-tab ${state.category==='all'?'active':''}" data-action="filter-category" data-id="all">全部材料 <span>${state.data.materials.length}</span></button>${cats.map(c=>`<button type="button" class="filter-tab ${state.category===c.id?'active':''}" data-action="filter-category" data-id="${esc(c.id)}">${esc(c.name)}${!c.enabled?'（停用）':''}<span>${state.data.materials.filter(m=>m.category_id===c.id).length}</span></button>`).join('')}</div>
   <div class="toolbar"><div class="search-box">${icon('search')}<input id="material-search" class="input" type="search" placeholder="搜索材料名称、主体或年度" aria-label="搜索图片材料" value="${esc(state.query)}"></div><span class="muted small">共 ${rows.length} 份材料</span></div>
-  <section class="panel">${rows.length?`<div class="table-wrap material-table-wrap"><table class="data-table material-table"><thead><tr><th>材料名称 / 所属栏目</th><th>所属主体</th><th>年度 / 版本</th><th>有效期</th><th>操作</th></tr></thead><tbody>${rows.map(m=>`<tr><td><div class="name-cell"><span class="file-icon">${icon(m.mode==='text'?'file':'image')}</span><div><button type="button" class="text-button table-title" data-action="open-material" data-id="${esc(m.id)}">${esc(m.name)}</button><div class="table-subtitle">${esc(categoryName(m.category_id))}</div></div></div></td><td>${esc(m.subject || '待补充')}</td><td>${(m.years||[]).length?esc(m.years.join('、')):'—'}<div class="table-subtitle">${esc(m.version || '—')}</div></td><td>${validityBadge(m.valid_until)}</td><td><button type="button" class="text-button" data-action="open-material" data-id="${esc(m.id)}">查看材料</button></td></tr>`).join('')}</tbody></table></div>`:emptyState(query?'没有找到符合条件的材料':isCreditCategory(state.category)?'此栏目等待全自动验证归档':'此栏目尚未添加材料',query?'试试其他名称、主体或年度。':isCreditCategory(state.category)?'仅在三项官方查询全部验证完成后自动生成材料；当前不提供手工接力。':'',query||isCreditCategory(state.category)?'':button('添加材料','new-material',{icon:'plus',category:state.category!=='all'?state.category:undefined}))}</section>
+  <section class="panel">${rows.length?`<div class="table-wrap material-table-wrap"><table class="data-table material-table"><thead><tr><th>材料名称 / 所属栏目</th><th>所属主体</th><th>年度 / 版本</th><th>有效期</th><th>操作</th></tr></thead><tbody>${rows.map(m=>`<tr><td><div class="name-cell"><span class="file-icon">${icon(m.mode==='text'?'file':'image')}</span><div><button type="button" class="text-button table-title" data-action="open-material" data-id="${esc(m.id)}">${esc(m.name)}</button><div class="table-subtitle">${esc(categoryName(m.category_id))}</div></div></div></td><td>${esc(m.subject || '待补充')}</td><td>${(m.years||[]).length?esc(m.years.join('、')):'—'}<div class="table-subtitle">${esc(m.version || '—')}</div></td><td>${validityBadge(m.valid_until)}</td><td><button type="button" class="text-button" data-action="open-material" data-id="${esc(m.id)}">查看材料</button></td></tr>`).join('')}</tbody></table></div>`:emptyState(query?'没有找到符合条件的材料':isCreditCategory(state.category)?'此栏目等待全自动验证归档':'此栏目尚未添加材料',query?'试试其他名称、主体或年度。':isCreditCategory(state.category)?'仅在三项官方查询全部验证完成后自动生成材料；当前不提供手工接力。':'',query||isCreditCategory(state.category)?'':addMaterialButton('添加材料',state.category!=='all'?state.category:undefined))}</section>
   `;
 }
 function renderIndustries() {
   const ss=specialState,r=ss.result,cats=state.data.categories.filter(c=>c.layer==='special'),rows=r.items;
-  return `${heading('文字材料','',button('新增文字材料','new-material',{primary:true,icon:'plus',category:cats[0]?.id,disabled:!cats.length}))}
+  return `${heading('文字材料','',addMaterialButton('新增文字材料',isRemote()?undefined:cats[0]?.id,{primary:true,disabled:!cats.length}))}
   <div class="toolbar special-toolbar"><div class="search-box">${icon('search')}<input class="input" id="special-search" type="search" aria-label="搜索文字材料" placeholder="搜索模板名称或内容说明" value="${esc(ss.query)}"></div></div>
   <section class="panel">${rows.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>模板名称</th><th>所属主体</th><th>版本</th><th>操作</th></tr></thead><tbody>${rows.map(m=>`<tr><td><button class="text-button table-title" data-action="open-material" data-id="${esc(m.id)}">${esc(m.name)}</button></td><td>${esc(m.subject)}</td><td>${esc(m.version||'—')}</td><td>${button('查看','open-material',{small:true,id:m.id})}</td></tr>`).join('')}</tbody></table></div>`:emptyState('暂无文字材料','添加投标函、授权书等模板')}
   <div class="panel-body actions">${button('上一页','special-prev',{small:true,disabled:ss.page<=1})}<span>第 ${ss.page} / ${Math.max(1,Math.ceil(r.total/(r.page_size||25)))} 页 · 共 ${r.total} 份</span>${button('下一页','special-next',{small:true,disabled:ss.page*(r.page_size||25)>=r.total})}</div></section>`;
 }
-function specialFormFields(m){return `<div class="form-field"><label>客户名称<input class="input" name="client_name" value="${esc(m?.client_name)}" maxlength="300"></label></div><div class="form-field"><label>项目名称<input class="input" name="case_name" value="${esc(m?.case_name)}" maxlength="300"></label></div><div class="form-field"><label>证明主体类型<select name="subject_kind">${[['company','公司'],['person','人员'],['partner','合作方'],['unknown','待核对']].map(([k,v])=>`<option value="${k}" ${m?.subject_kind===k?'selected':''}>${v}</option>`).join('')}</select></label></div><div class="form-field full"><label>关联使用栏目（保留原始归属）</label><div class="special-links">${state.data.categories.filter(c=>c.layer==='special').map(c=>`<label><input type="checkbox" name="linked_category_ids" value="${esc(c.id)}" ${m?.linked_category_ids?.includes(c.id)?'checked':''}>${esc(c.name)}</label>`).join('')}</div></div>`;}
+function specialFormFields(m,attributes=''){const a=attributes?' '+attributes:'';return `<div class="form-field"${a}><label>客户名称<input class="input" name="client_name" value="${esc(m?.client_name)}" maxlength="300"></label></div><div class="form-field"${a}><label>项目名称<input class="input" name="case_name" value="${esc(m?.case_name)}" maxlength="300"></label></div><div class="form-field"${a}><label>证明主体类型<select name="subject_kind">${[['company','公司'],['person','人员'],['partner','合作方'],['unknown','待核对']].map(([k,v])=>`<option value="${k}" ${m?.subject_kind===k?'selected':''}>${v}</option>`).join('')}</select></label></div><div class="form-field full"${a}><label>关联使用栏目（保留原始归属）</label><div class="special-links">${state.data.categories.filter(c=>c.layer==='special').map(c=>`<label><input type="checkbox" name="linked_category_ids" value="${esc(c.id)}" ${m?.linked_category_ids?.includes(c.id)?'checked':''}>${esc(c.name)}</label>`).join('')}</div></div>`;}
+function submissionTitle(s){return (s.kind==='material'?s.material?.name:s.case?.name)||'未命名投稿';}
+function submissionRow(s,remote){
+  const material=s.kind==='material',text=material&&s.material?.mode==='text';
+  const detail=material?(s.material?.category_id?categoryName(s.material.category_id):'未指定栏目，由审核人归类'):(s.case?.client_name||'项目案例');
+  let result;
+  if(s.status==='pending')result=remote?'<span class="muted small">等待本机核对</span>':`<div class="actions">${button(material?'审核入库':'审核加入案例库','review-submission',{small:true,primary:true,id:s.id})}${button('退回','reject-submission',{small:true,id:s.id})}</div>`;
+  else if(s.status==='accepted')result=`${statusBadge('ready',material?'已入库':'已加入案例库')}${s.decision?.material_id?` <button type="button" class="text-button" data-action="open-material" data-id="${esc(s.decision.material_id)}">查看材料</button>`:s.decision?.case_id?` <button type="button" class="text-button" data-action="navigate" data-view="cases">查看案例库</button>`:''}`;
+  else result=`${statusBadge('blocked','已退回')}<div class="table-subtitle submission-reason">原因：${esc(s.decision?.reason||'未填写')}</div>`;
+  return `<tr><td><div class="name-cell"><span class="file-icon">${icon(material&&!text?'image':'file')}</span><div><span class="table-title">${esc(submissionTitle(s))}</span><div class="table-subtitle">${material?'材料':'案例'} · ${esc(detail)}</div>${s.note?`<div class="table-subtitle">说明：${esc(s.note)}</div>`:''}</div></div></td><td>${esc(s.contributor)}<div class="table-subtitle">${s.origin==='remote'?'外网提交':'本机提交'}</div></td><td class="muted mono">${date(s.created_at,true)}</td><td class="muted">${text?'文字内容':`${s.file_count} 个文件 · ${fileSize(s.size)}`}</td><td>${result}</td></tr>`;
+}
+function renderSubmissions(){
+  const r=contributionUi.result||{items:[],counts:{}},remote=isRemote(),status=contributionUi.status;
+  const tabs=[['pending','待审核'],['accepted','已入库'],['rejected','已退回']];
+  const empty={pending:['没有待审核的投稿','同事可通过“提交材料”“提交案例”上传，入库前不会进入材料库。'],accepted:['尚无已入库的投稿',''],rejected:['尚无退回的投稿','']}[status];
+  return `${heading('投稿入库','',`${button('提交材料','submit-material',{primary:true,icon:'upload'})}${button('提交案例','submit-case',{icon:'upload'})}`)}
+  <div class="note-bar submission-policy">${icon('info')}<span>${remote?'外网可以提交材料和案例并查看处理结果；已提交的图片和文件不会再从外网显示，由本机管理员核对后入库。':'同事提交的材料和案例先在此核对：入库前不会进入材料库、自动匹配或正文写作；退回或入库后，暂存文件即删除。'}</span></div>
+  <div class="filter-tabs submission-tabs" aria-label="按处理状态筛选">${tabs.map(([id,label])=>`<button type="button" class="filter-tab ${status===id?'active':''}" data-action="submission-status" data-id="${id}" ${status===id?'aria-current="true"':''}>${label} <span>${Number(r.counts?.[id]||0)}</span></button>`).join('')}</div>
+  <section class="panel">${r.items.length?`<div class="table-wrap"><table class="data-table submission-table"><thead><tr><th>投稿内容</th><th>提交人</th><th>提交时间</th><th>文件</th><th>${status==='pending'?'处理':'处理结果'}</th></tr></thead><tbody>${r.items.map(s=>submissionRow(s,remote)).join('')}</tbody></table></div>${r.total>r.items.length?`<p class="muted small panel-body">仅显示最近 ${r.items.length} 份，共 ${r.total} 份。</p>`:''}`:emptyState(empty[0],empty[1],'',false,'upload')}</section>`;
+}
+function renderCaseLibrary(){
+  const r=contributionUi.cases||{items:[],counts:{}},remote=isRemote(),archived=contributionUi.caseArchived;
+  const rows=r.items.map(c=>`<tr><td><div class="name-cell"><span class="file-icon">${icon('file')}</span><div><span class="table-title">${esc(c.name)}</span>${c.client_name?`<div class="table-subtitle">客户：${esc(c.client_name)}</div>`:''}${c.description?`<div class="table-subtitle">${esc(c.description)}</div>`:''}</div></div></td><td><ul class="case-file-list">${c.files.map(f=>`<li>${f.url?`<a href="${esc(f.url)}" download>${esc(f.name)}</a>`:esc(f.name)} <span class="muted small">${fileSize(f.size)}</span></li>`).join('')}</ul></td><td>${esc(c.contributor||'—')}</td><td class="muted mono">${date(c.created_at)}</td><td>${remote?'<span class="muted small">本机管理</span>':`<div class="actions">${archived?button('恢复到案例库','restore-case',{small:true,id:c.id}):`${button('编辑','edit-case',{small:true,id:c.id})}${button('移出案例库','archive-case',{small:true,id:c.id})}`}</div>`}</td></tr>`).join('');
+  return `${heading('案例库','',button('提交案例','submit-case',{primary:true,icon:'upload'}))}
+  <div class="note-bar submission-policy">${icon('info')}<span>案例供“编写投标文件”时选作正文参考；新案例经“投稿入库”核对后加入。${remote?'案例原件仅限本机下载。':''}</span></div>
+  <div class="filter-tabs" aria-label="案例库筛选">${[['active','在用案例'],['archived','已移出']].map(([id,label])=>`<button type="button" class="filter-tab ${(id==='archived')===archived?'active':''}" data-action="case-library-filter" data-id="${id}">${label} <span>${Number(r.counts?.[id]||0)}</span></button>`).join('')}</div>
+  <section class="panel">${r.items.length?`<div class="table-wrap"><table class="data-table case-table"><thead><tr><th>案例</th><th>文件</th><th>提交人</th><th>入库时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`:emptyState(archived?'没有已移出的案例':'案例库暂无案例',archived?'':'可点击“提交案例”上传项目案例，核对后即可在编写投标文件时选用。','',false,'file')}</section>`;
+}
 function sourceDescription(source){if(!source)return '<p>手动上传，尚未登记来源。</p>';if(typeof source==='string')return `<p>${esc(source)}</p>`;const position=source.page?'PDF 第 '+source.page+' 页':source.slide?'幻灯片第 '+source.slide+' 页':source.paragraph?'文档段落 P'+source.paragraph:source.paragraph_start?'文档段落 P'+source.paragraph_start+'–P'+source.paragraph_end:source.chapter||source.section!==undefined?'章节／段落：'+(source.chapter||source.section):'';return `<p><strong>${esc(source.path||'来源待补充')}</strong><br>${esc([position,source.method].filter(Boolean).join(' · '))}</p>`;}
 
 function renderProjects() {
@@ -474,7 +517,8 @@ function openModal(title, subtitle, content, formName, submitLabel, options = {}
   if(options.id&&['material','append-files','remove-file','remove-files'].includes(formName))form.dataset.revision=String(material(options.id)?.revision||1);
   if(formName==='rescan')form.dataset.mappingRevision=state.project.mapping_revision;
   document.body.append(modal); modal.showModal();
-  modal.addEventListener('cancel',e=>{e.preventDefault();closeModal();});
+  // A file input fires its own bubbling cancel when its picker is dismissed; only Esc on the dialog closes it.
+  modal.addEventListener('cancel',e=>{if(e.target!==modal)return;e.preventDefault();closeModal();});
   modal.addEventListener('click',e=>{if(e.target===modal && !modal.querySelector('button[type=submit]:disabled'))closeModal();});
 }
 function closeModal(restore=true) {
@@ -494,10 +538,71 @@ function showMaterialForm(id, category) {
   form.dataset.initialMaterialBody=JSON.stringify(materialFormBody(form));
   queueMaterialValidation(form);
 }
+function categoryOptions(selected){
+  const usable=state.data.categories.filter(c=>c.enabled&&!isCreditCategory(c.id));
+  const group=(layer,label)=>{const rows=usable.filter(c=>c.layer===layer);return rows.length?`<optgroup label="${label}">${rows.map(c=>`<option value="${esc(c.id)}" ${c.id===selected?'selected':''}>${esc(c.name)}</option>`).join('')}</optgroup>`:'';};
+  return group('common','图片材料栏目')+group('special','文字材料栏目');
+}
+function contributorField(id){
+  return `<div class="form-field"><label for="${id}">提交人 *</label><input id="${id}" class="input" name="contributor" required maxlength="60" value="${esc(contributorName())}" placeholder="填写你的姓名" autocomplete="name"></div>`;
+}
+function showSubmitMaterial(category){
+  const chosen=state.data.categories.some(c=>c.id===category&&c.enabled&&!isCreditCategory(c.id))?category:'';
+  openModal('提交材料','提交后由本机管理员核对入库；入库前不会进入材料库或自动匹配。',`<div class="form-grid">${contributorField('submission-contributor')}<div class="form-field"><label for="submission-category">建议栏目</label><select id="submission-category" name="category_id"><option value="">不确定，由审核人归类</option>${categoryOptions(chosen)}</select></div><div class="form-field full"><label for="submission-name">材料名称 *</label><input id="submission-name" class="input" name="name" required maxlength="200" placeholder="例如：2025 年财务审计报告"></div><div class="form-field"><label for="submission-subject">材料主体</label><input id="submission-subject" class="input" name="subject" maxlength="200" value="${esc(CREDIT_SUBJECT)}" placeholder="证明对应的公司或人员"></div><div class="form-field"><label for="submission-years">适用年度</label><input id="submission-years" class="input" name="years" placeholder="例如：2024、2025"></div><div class="form-field"><label for="submission-version">版本说明</label><input id="submission-version" class="input" name="version" maxlength="200" placeholder="例如：2026 年换发"></div><div class="form-field"><label for="submission-valid">有效期截止</label><input id="submission-valid" class="input" name="valid_until" maxlength="200" placeholder="YYYY-MM-DD 或 长期"></div><div class="form-field full"><label for="submission-mode">内容方式</label><select id="submission-mode" name="mode"><option value="page">图片 · 每张独立一页</option><option value="side_by_side">图片 · 双图并排</option><option value="text">文字内容</option></select></div><div class="form-field full hidden" id="material-text-area"><label for="submission-content">材料正文 *</label><textarea id="submission-content" name="content" rows="6" maxlength="30000" placeholder="填写可复用的说明正文"></textarea></div><div class="form-field full" id="material-upload-area"><div class="upload-zone">${icon('upload')}<label for="submission-files">选择材料图片，可一次选择多张</label><input id="submission-files" name="files" type="file" multiple accept="image/png,image/jpeg,image/webp,image/bmp,image/tiff"><small>PNG / JPEG / WebP / BMP / TIFF，单张不超过 15 MB</small></div></div><div class="form-field"><label for="submission-client">客户名称（业绩类选填）</label><input id="submission-client" class="input" name="client_name" maxlength="300"></div><div class="form-field"><label for="submission-case-name">项目名称（业绩类选填）</label><input id="submission-case-name" class="input" name="case_name" maxlength="300"></div><div class="form-field full"><label for="submission-description">使用说明</label><textarea id="submission-description" name="description" rows="2" maxlength="2000" placeholder="例如：证件附件，需核对授权正文"></textarea></div><div class="form-field full"><label for="submission-note">给审核人的说明</label><textarea id="submission-note" name="note" rows="2" maxlength="2000" placeholder="例如：原件在行政部，3 月已换发"></textarea></div></div>`,'submit-material','提交审核');
+}
+function showSubmitCase(){
+  openModal('提交案例','案例经本机核对后加入案例库，供编写投标文件时选用。',`<div class="form-grid">${contributorField('case-contributor')}<div class="form-field"><label for="case-client">客户名称</label><input id="case-client" class="input" name="client_name" maxlength="300" placeholder="例如：某银行"></div><div class="form-field full"><label for="case-name">案例名称 *</label><input id="case-name" class="input" name="name" required maxlength="200" placeholder="例如：某银行 2025 年运维服务项目"></div><div class="form-field full"><label for="case-description">案例说明</label><textarea id="case-description" name="description" rows="3" maxlength="2000" placeholder="适用的项目类型、服务内容、年份等"></textarea></div><div class="form-field full"><div class="upload-zone">${icon('upload')}<label for="case-files">选择案例文件，可多选或上传 ZIP</label><input id="case-files" name="files" type="file" multiple accept=".doc,.docx,.pdf,.pptx,.txt,.md,.zip"><small>DOC、DOCX、PDF、PPTX、TXT、MD、ZIP，合计不超过 50 MB；须含可读取的文字，扫描件不做识别</small></div></div><div class="form-field full"><label for="case-note">给审核人的说明</label><textarea id="case-note" name="note" rows="2" maxlength="2000"></textarea></div></div>`,'submit-case','提交审核');
+}
+function submissionSummary(s){
+  return `<div class="note-bar submission-meta">${icon('info')}<span>提交人：${esc(s.contributor)}（${s.origin==='remote'?'外网提交':'本机提交'}）· ${date(s.created_at,true)}${s.note?`<br>提交说明：${esc(s.note)}`:''}</span></div>`;
+}
+function syncReviewLayer(form){
+  const value=form.elements.namedItem('category_id')?.value||'',special=isSpecial(value)&&value!=='text_template';
+  $$('[data-special-field]',form).forEach(el=>el.classList.toggle('hidden',!special));
+}
+function showReviewMaterial(s){
+  const m=s.material||{},files=s.files||[],text=m.mode==='text';
+  const chosen=state.data.categories.some(c=>c.id===m.category_id&&c.enabled&&!isCreditCategory(c.id))?m.category_id:'';
+  const previews=files.length?`<div class="form-field full"><span class="field-label">投稿图片（${files.length} 张，点击查看原图）</span><div class="submission-preview">${files.map((f,i)=>`<a class="submission-thumb" href="${esc(f.url)}" target="_blank" rel="noopener"><img src="${esc(f.url)}?thumb=1" alt="第 ${i+1} 张：${esc(f.name)}" loading="lazy"><span>${i+1}. ${esc(f.name)}</span></a>`).join('')}</div></div>`:'';
+  const modes=files.length?`<option value="page" ${m.mode!=='side_by_side'?'selected':''}>图片 · 每张独立一页</option><option value="side_by_side" ${m.mode==='side_by_side'?'selected':''}>图片 · 双图并排</option>`:'<option value="text" selected>文字内容</option>';
+  openModal('审核入库：材料','核对后按材料库规则入库：主体、年度和有效期会在保存前校验。',`${submissionSummary(s)}<div class="form-grid">${previews}<div class="form-field full"><label for="material-name">材料名称 *</label><input id="material-name" class="input" name="name" required maxlength="200" value="${esc(m.name)}"></div><div class="form-field"><label for="material-category">所属栏目 *</label><select id="material-category" name="category_id" required>${chosen?'':'<option value="" selected disabled>请选择栏目</option>'}${categoryOptions(chosen)}</select></div><div class="form-field"><label for="material-subject">材料主体 *</label><input id="material-subject" class="input" name="subject" required maxlength="160" value="${esc(m.subject||CREDIT_SUBJECT)}"></div><div class="form-field"><label for="material-years">适用年度</label><input id="material-years" class="input" name="years" value="${esc((m.years||[]).join('、'))}" placeholder="例如：2023、2024"><span class="form-hint" id="material-years-hint" hidden>填写报告对应年度</span></div><div class="form-field"><label for="material-version">版本说明</label><input id="material-version" class="input" name="version" maxlength="120" value="${esc(m.version)}"></div><div class="form-field"><label for="material-valid">有效期截止</label><input id="material-valid" class="input" name="valid_until" value="${esc(m.valid_until)}" placeholder="YYYY-MM-DD、长期或下一年度更新"></div><div class="form-field"><label for="material-mode">内容与排版方式 *</label><select id="material-mode" name="mode">${modes}</select></div><div class="form-field full ${text?'':'hidden'}" id="material-text-area"><label for="material-content">材料正文</label><textarea id="material-content" name="content" rows="6">${esc(m.content)}</textarea></div>${specialFormFields(m,'data-special-field')}<div class="form-field full"><label for="material-description">使用说明 / 注意事项</label><textarea id="material-description" name="description" rows="3">${esc(m.description)}</textarea></div></div>`,'material','核对无误，入库');
+  const form=$('form[data-form="material"]');
+  form.dataset.submission=s.id;form.dataset.revision=String(s.revision);form.dataset.uploadCount=String(files.length);
+  $('#material-years-hint',form).hidden=form.elements.namedItem('category_id').value!=='audit_report';
+  syncReviewLayer(form);
+  form.dataset.initialMaterialBody=JSON.stringify(materialFormBody(form));
+  queueMaterialValidation(form);
+}
+function showReviewCase(s){
+  const c=s.case||{},files=s.files||[],warnings=s.summary?.warnings||[];
+  openModal('审核加入案例库','下载核对案例文件后加入案例库，供编写投标文件时选用。',`${submissionSummary(s)}<div class="form-grid"><div class="form-field full"><label for="review-case-name">案例名称 *</label><input id="review-case-name" class="input" name="name" required maxlength="200" value="${esc(c.name)}"></div><div class="form-field full"><label for="review-case-client">客户名称</label><input id="review-case-client" class="input" name="client_name" maxlength="300" value="${esc(c.client_name)}"></div><div class="form-field full"><label for="review-case-description">案例说明</label><textarea id="review-case-description" name="description" rows="3" maxlength="2000">${esc(c.description)}</textarea></div><div class="form-field full"><span class="field-label">案例文件（下载核对）</span><ul class="case-file-list">${files.map(f=>`<li><a href="${esc(f.url)}" download>${esc(f.name)}</a> <span class="muted small">${fileSize(f.size)}</span></li>`).join('')}</ul><span class="form-hint">已读取 ${Number(s.summary?.source_count||0)} 段文字${warnings.length?`，另有 ${warnings.length} 条读取提示`:''}。</span>${warnings.length?`<details class="warning-box case-warnings"><summary>查看读取提示</summary><ul>${warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul></details>`:''}</div></div>`,'accept-case','核对无误，加入案例库');
+  const form=$('form[data-form="accept-case"]');form.dataset.submission=s.id;form.dataset.revision=String(s.revision);
+}
+function showRejectSubmission(s){
+  if(!s)return;
+  openModal('退回投稿',`${s.kind==='material'?'材料':'案例'}：${submissionTitle(s)} · 提交人 ${s.contributor}`,`<div class="form-field"><label for="reject-reason">退回原因 *</label><textarea id="reject-reason" name="reason" rows="3" required maxlength="500" placeholder="例如：图片模糊，请重新扫描后提交"></textarea><span class="form-hint">提交人可在“投稿入库”看到原因；退回后已上传的文件会删除。</span></div>`,'reject-submission','确认退回');
+  const form=$('form[data-form="reject-submission"]');form.dataset.submission=s.id;form.dataset.revision=String(s.revision);
+}
+function showEditCase(c){
+  if(!c)return;
+  openModal('编辑案例信息','',`<div class="form-grid"><div class="form-field full"><label for="edit-case-name">案例名称 *</label><input id="edit-case-name" class="input" name="name" required maxlength="200" value="${esc(c.name)}"></div><div class="form-field full"><label for="edit-case-client">客户名称</label><input id="edit-case-client" class="input" name="client_name" maxlength="300" value="${esc(c.client_name)}"></div><div class="form-field full"><label for="edit-case-description">案例说明</label><textarea id="edit-case-description" name="description" rows="3" maxlength="2000">${esc(c.description)}</textarea></div></div>`,'edit-case','保存修改',{id:c.id});
+  $('form[data-form="edit-case"]').dataset.revision=String(c.revision);
+}
+async function reviewSubmission(id){
+  const s=await api('/api/submissions/'+encodeURIComponent(id));
+  if(s.status!=='pending'){await refreshData();render();toast('该投稿已处理，列表已刷新。',true);return;}
+  if(s.kind==='material')showReviewMaterial(s);else showReviewCase(s);
+}
+async function setCaseArchived(id,archived){
+  const c=contributionUi.cases?.items.find(x=>x.id===id);if(!c)return;
+  if(archived&&!window.confirm(`将“${c.name}”移出案例库？移出后编写投标文件时不再可选，已使用该案例的项目不受影响。`))return;
+  await api('/api/case-library/'+encodeURIComponent(id),{method:'PATCH',body:{revision:c.revision,archived}});
+  await refreshData();render();toast(archived?'已移出案例库':'已恢复到案例库');
+}
 let materialFeedbackTimer, materialFeedbackSequence=0;
 function materialFormBody(form) {
   const fd=new FormData(form), raw=String(fd.get('years')||'').trim();
-  return {material_id:form.dataset.id||null,name:String(fd.get('name')||'').trim(),subject:String(fd.get('subject')||'').trim(),category_id:fd.get('category_id'),years:raw?raw.split(/[\s,，、;；]+/).filter(Boolean).map(y=>/^\d{4}$/.test(y)?Number(y):null):[],valid_until:String(fd.get('valid_until')||'').trim(),mode:fd.get('mode'),content:String(fd.get('content')||''),description:String(fd.get('description')||''),upload_count:form.dataset.id?(material(form.dataset.id)?.files?.length||0):($('input[name=files]',form)?.files?.length||0)};
+  return {material_id:form.dataset.id||null,name:String(fd.get('name')||'').trim(),subject:String(fd.get('subject')||'').trim(),category_id:fd.get('category_id'),years:raw?raw.split(/[\s,，、;；]+/).filter(Boolean).map(y=>/^\d{4}$/.test(y)?Number(y):null):[],valid_until:String(fd.get('valid_until')||'').trim(),mode:fd.get('mode'),content:String(fd.get('content')||''),description:String(fd.get('description')||''),upload_count:form.dataset.uploadCount!==undefined?Number(form.dataset.uploadCount):form.dataset.id?(material(form.dataset.id)?.files?.length||0):($('input[name=files]',form)?.files?.length||0)};
 }
 async function validateMaterialForm(form) {
   const sequence=++materialFeedbackSequence;
@@ -581,7 +686,7 @@ function renderDrawer() {
   const files=m.files||[];state.pageIndex=Math.max(0,Math.min(state.pageIndex,files.length-1));const f=files[state.pageIndex];
   const rotation=f?Number(f.rotation||0):0,creditManaged=isCreditCategory(m.category_id)||!!m.credit_evidence;
   document.body.style.overflow='hidden';
-  $('#overlay-root').innerHTML=`<div class="overlay-backdrop" data-action="close-drawer"></div><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><div class="drawer-header"><div class="drawer-title"><h2 id="drawer-title">${esc(m.name)}</h2><p>${esc(categoryName(m.category_id))} · ${m.mode==='text'?'文字材料':`${files.length} 张图片`}</p></div><button type="button" class="icon-button" data-action="close-drawer" aria-label="关闭材料详情">${icon('close')}</button></div><div class="drawer-body"><div class="actions">${validityBadge(m.valid_until)}${m.version?`<span class="muted small">版本 ${esc(m.version)}</span>`:''}</div><dl class="detail-meta"><div><dt>所属主体</dt><dd>${esc(m.subject||'未填写')}</dd></div><div><dt>适用年度</dt><dd>${esc(m.years?.join('、')||'未指定')}</dd></div><div><dt>排版方式</dt><dd>${{page:'每张独立一页',side_by_side:'双图并排',text:'文字内容'}[m.mode]||esc(m.mode)}</dd></div><div><dt>最近更新</dt><dd>${date(m.updated_at)}</dd></div></dl>${m.description&&!isSpecial(m.category_id)?`<p class="detail-description">${esc(m.description)}</p>`:''}${renderCreditEvidence(m.credit_evidence)}${['legal_identity','authorization'].includes(m.category_id)?`<div class="note-bar" style="margin:0 0 18px">${icon('info')}<span>证件图片是附件，需另外核对模板中的身份证明或授权委托正文、签字盖章与日期。</span></div>`:''}<div class="preview-stage">${m.mode==='text'?`<div class="text-preview">${esc(m.content||'尚未填写文字正文')}</div>`:f?`<img src="${esc(f.url||`/api/files/${encodeURIComponent(f.id)}`)}" alt="${esc(m.name)}，第 ${state.pageIndex+1} 张：${esc(f.name)}" style="transform:rotate(${rotation}deg);${rotation%180?'max-height:360px;max-width:78%;':''}">`:'<span class="muted small">尚未上传图片</span>'}</div>${m.mode!=='text'&&files.length?`<div class="preview-toolbar"><div class="preview-pagination"><button type="button" class="icon-button" data-action="preview-prev" aria-label="上一张" ${state.pageIndex===0?'disabled':''}>${icon('back')}</button><span>${state.pageIndex+1} / ${files.length}</span><button type="button" class="icon-button" data-action="preview-next" aria-label="下一张" ${state.pageIndex===files.length-1?'disabled':''}>${icon('chevron')}</button></div>${creditManaged?'':`<div class="actions"><button type="button" class="btn small" data-action="rotate-file">${icon('rotate')}旋转 90°</button><button type="button" class="icon-button" data-action="move-file-up" aria-label="将当前图片前移一位" title="前移一位" ${state.pageIndex===0?'disabled':''}>${icon('up')}</button><button type="button" class="icon-button" data-action="move-file-down" aria-label="将当前图片后移一位" title="后移一位" ${state.pageIndex===files.length-1?'disabled':''}>${icon('down')}</button></div>`}</div><div class="preview-filename">${esc(f.name)}${rotation?` · 顺时针 ${rotation}°`:''} ${f.width&&f.height?`<details><summary>图片详情</summary>${f.width} × ${f.height}</details>`:''} ${creditManaged?'':'<button type="button" class="text-button" data-action="remove-file" style="font-size:10px;margin-left:8px;color:#b17569">移出本组</button>'}</div><div class="preview-files" aria-label="材料图片列表">${files.map((x,i)=>`<button type="button" class="preview-thumb ${state.pageIndex===i?'active':''}" data-action="preview-page" data-index="${i}" aria-label="预览第 ${i+1} 张 ${esc(x.name)}" ${state.pageIndex===i?'aria-current="true"':''}><img src="${esc(x.url||`/api/files/${encodeURIComponent(x.id)}`)}?thumb=1" alt="" loading="lazy"><span>${i+1}</span></button>`).join('')}</div>`:''}</div><div class="drawer-footer">${creditManaged?'<span class="muted small">自动归档证据，不可编辑</span>':`${m.mode==='text'?'<span></span>':`<div class="actions">${button('追加图片','append-files',{icon:'plus',id:m.id})}${files.length?button('批量移除','batch-remove-files',{small:true}):''}</div>`}${button('编辑信息','edit-material',{primary:true,icon:'edit',id:m.id})}`}</div></aside>`;
+  $('#overlay-root').innerHTML=`<div class="overlay-backdrop" data-action="close-drawer"></div><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><div class="drawer-header"><div class="drawer-title"><h2 id="drawer-title">${esc(m.name)}</h2><p>${esc(categoryName(m.category_id))} · ${m.mode==='text'?'文字材料':`${files.length} 张图片`}</p></div><button type="button" class="icon-button" data-action="close-drawer" aria-label="关闭材料详情">${icon('close')}</button></div><div class="drawer-body"><div class="actions">${validityBadge(m.valid_until)}${m.version?`<span class="muted small">版本 ${esc(m.version)}</span>`:''}</div><dl class="detail-meta"><div><dt>所属主体</dt><dd>${esc(m.subject||'未填写')}</dd></div><div><dt>适用年度</dt><dd>${esc(m.years?.join('、')||'未指定')}</dd></div><div><dt>排版方式</dt><dd>${{page:'每张独立一页',side_by_side:'双图并排',text:'文字内容'}[m.mode]||esc(m.mode)}</dd></div><div><dt>最近更新</dt><dd>${date(m.updated_at)}</dd></div>${m.contribution?`<div><dt>来源</dt><dd>投稿 · ${esc(m.contribution.contributor)} · ${date(m.contribution.accepted_at)} 入库</dd></div>`:''}</dl>${m.description&&!isSpecial(m.category_id)?`<p class="detail-description">${esc(m.description)}</p>`:''}${renderCreditEvidence(m.credit_evidence)}${['legal_identity','authorization'].includes(m.category_id)?`<div class="note-bar" style="margin:0 0 18px">${icon('info')}<span>证件图片是附件，需另外核对模板中的身份证明或授权委托正文、签字盖章与日期。</span></div>`:''}<div class="preview-stage">${m.mode==='text'?`<div class="text-preview">${esc(m.content||'尚未填写文字正文')}</div>`:f?`<img src="${esc(f.url||`/api/files/${encodeURIComponent(f.id)}`)}" alt="${esc(m.name)}，第 ${state.pageIndex+1} 张：${esc(f.name)}" style="transform:rotate(${rotation}deg);${rotation%180?'max-height:360px;max-width:78%;':''}">`:m.files_intranet_only?`<span class="muted small">图片原件仅限本机入口查看（共 ${Number(m.file_count||0)} 张）</span>`:'<span class="muted small">尚未上传图片</span>'}</div>${m.mode!=='text'&&files.length?`<div class="preview-toolbar"><div class="preview-pagination"><button type="button" class="icon-button" data-action="preview-prev" aria-label="上一张" ${state.pageIndex===0?'disabled':''}>${icon('back')}</button><span>${state.pageIndex+1} / ${files.length}</span><button type="button" class="icon-button" data-action="preview-next" aria-label="下一张" ${state.pageIndex===files.length-1?'disabled':''}>${icon('chevron')}</button></div>${creditManaged?'':`<div class="actions"><button type="button" class="btn small" data-action="rotate-file">${icon('rotate')}旋转 90°</button><button type="button" class="icon-button" data-action="move-file-up" aria-label="将当前图片前移一位" title="前移一位" ${state.pageIndex===0?'disabled':''}>${icon('up')}</button><button type="button" class="icon-button" data-action="move-file-down" aria-label="将当前图片后移一位" title="后移一位" ${state.pageIndex===files.length-1?'disabled':''}>${icon('down')}</button></div>`}</div><div class="preview-filename">${esc(f.name)}${rotation?` · 顺时针 ${rotation}°`:''} ${f.width&&f.height?`<details><summary>图片详情</summary>${f.width} × ${f.height}</details>`:''} ${creditManaged?'':'<button type="button" class="text-button" data-action="remove-file" style="font-size:10px;margin-left:8px;color:#b17569">移出本组</button>'}</div><div class="preview-files" aria-label="材料图片列表">${files.map((x,i)=>`<button type="button" class="preview-thumb ${state.pageIndex===i?'active':''}" data-action="preview-page" data-index="${i}" aria-label="预览第 ${i+1} 张 ${esc(x.name)}" ${state.pageIndex===i?'aria-current="true"':''}><img src="${esc(x.url||`/api/files/${encodeURIComponent(x.id)}`)}?thumb=1" alt="" loading="lazy"><span>${i+1}</span></button>`).join('')}</div>`:''}</div><div class="drawer-footer">${creditManaged?'<span class="muted small">自动归档证据，不可编辑</span>':`${m.mode==='text'||m.files_intranet_only?'<span></span>':`<div class="actions">${button('追加图片','append-files',{icon:'plus',id:m.id})}${files.length?button('批量移除','batch-remove-files',{small:true}):''}</div>`}${button('编辑信息','edit-material',{primary:true,icon:'edit',id:m.id})}`}</div></aside>`;
 }
 
 async function toFiles(fileList) {
@@ -609,10 +714,51 @@ async function submitForm(form) {
       const body={name:String(fd.get('name')).trim(),category_id:fd.get('category_id'),subject:String(fd.get('subject')).trim(),version:String(fd.get('version')||'').trim(),years:[...new Set(years.map(Number))],valid_until:fd.get('valid_until')||'',mode:fd.get('mode'),content:String(fd.get('content')||''),description:String(fd.get('description')||'')};
       if(isSpecial(body.category_id))Object.assign(body,{client_name:String(fd.get('client_name')||''),case_name:String(fd.get('case_name')||''),subject_kind:fd.get('subject_kind'),linked_category_ids:fd.getAll('linked_category_ids')});
       if(!body.name||!body.subject)throw new Error('请填写材料名称与所属主体。');
-      if(!id){body.files=await toFiles($('input[name=files]',form)?.files||[]);if(body.mode!=='text'&&!body.files.length)throw new Error('请至少添加一张图片，或选择文字内容。');}
+      if(!id&&!form.dataset.submission){body.files=await toFiles($('input[name=files]',form)?.files||[]);if(body.mode!=='text'&&!body.files.length)throw new Error('请至少添加一张图片，或选择文字内容。');}
       if(body.mode==='text'&&!body.content.trim())throw new Error('请填写文字材料正文。');
       if(id)body.revision=Number(form.dataset.revision);
-      result=await api(id?`/api/materials/${encodeURIComponent(id)}`:'/api/materials',{method:id?'PATCH':'POST',body});
+      // A reviewed contribution is created from its own quarantined files by the accept endpoint.
+      result=form.dataset.submission
+        ?await api(`/api/submissions/${encodeURIComponent(form.dataset.submission)}/accept`,{method:'POST',body:{revision:Number(form.dataset.revision),material:body}})
+        :await api(id?`/api/materials/${encodeURIComponent(id)}`:'/api/materials',{method:id?'PATCH':'POST',body});
+    } else if(kind==='submit-material') {
+      const contributor=String(fd.get('contributor')||'').trim(),name=String(fd.get('name')||'').trim(),mode=String(fd.get('mode')||'page'),content=String(fd.get('content')||'');
+      if(!contributor)throw new Error('请填写提交人。');
+      if(!name)throw new Error('请填写材料名称。');
+      const yearInput=String(fd.get('years')||'').trim(),years=yearInput?yearInput.split(/[\s,，、;；]+/).filter(Boolean):[];
+      if(years.some(y=>!/^\d{4}$/.test(y)))throw new Error('年度请填写四位年份，多个年度用逗号或顿号分隔。');
+      let files=[];
+      if(mode==='text'){if(!content.trim())throw new Error('请填写文字材料正文。');}
+      else{
+        const picked=[...($('input[name=files]',form)?.files||[])];
+        if(!picked.length)throw new Error('请至少选择一张材料图片，或改为文字内容。');
+        if(picked.some(f=>!/\.(png|jpe?g|webp|bmp|tiff?)$/i.test(f.name)))throw new Error('图片格式不支持，请选择 PNG、JPEG、WebP、BMP 或 TIFF。');
+        if(picked.some(f=>f.size>15*1024*1024))throw new Error('单张图片不能超过 15 MB。');
+        if(picked.reduce((sum,f)=>sum+Math.ceil(f.size/3)*4,0)>79*1024*1024)throw new Error('本次图片超出一次上传容量，请分批提交。');
+        files=await toFiles(picked);
+      }
+      submit.innerHTML='<span class="spinner" style="width:14px;height:14px"></span> 正在上传…';
+      result=await api('/api/submissions',{method:'POST',body:{kind:'material',contributor,note:String(fd.get('note')||''),files,material:{name,category_id:String(fd.get('category_id')||''),subject:String(fd.get('subject')||'').trim(),version:String(fd.get('version')||'').trim(),years:[...new Set(years.map(Number))],valid_until:String(fd.get('valid_until')||'').trim(),mode,content:mode==='text'?content:'',description:String(fd.get('description')||''),client_name:String(fd.get('client_name')||'').trim(),case_name:String(fd.get('case_name')||'').trim()}}});
+      rememberContributor(contributor);
+    } else if(kind==='submit-case') {
+      const contributor=String(fd.get('contributor')||'').trim(),name=String(fd.get('name')||'').trim(),picked=[...($('input[name=files]',form)?.files||[])];
+      if(!contributor)throw new Error('请填写提交人。');
+      if(!name)throw new Error('请填写案例名称。');
+      if(!picked.length)throw new Error('请选择案例文件或 ZIP 案例包。');
+      if(picked.some(f=>!/\.(docx?|pdf|pptx|txt|md|zip)$/i.test(f.name)))throw new Error('案例支持 DOC、DOCX、PDF、PPTX、TXT、MD、ZIP。');
+      if(picked.some(f=>!f.size)||picked.reduce((sum,f)=>sum+f.size,0)>50*1024*1024)throw new Error('案例文件须大于 0 字节，合计不超过 50 MB。');
+      submit.innerHTML='<span class="spinner" style="width:14px;height:14px"></span> 正在上传并读取案例…';
+      result=await api('/api/submissions',{method:'POST',body:{kind:'case',contributor,note:String(fd.get('note')||''),case:{name,client_name:String(fd.get('client_name')||'').trim(),description:String(fd.get('description')||'')},files:await toFiles(picked)}});
+      rememberContributor(contributor);
+    } else if(kind==='accept-case') {
+      const name=String(fd.get('name')||'').trim();if(!name)throw new Error('请填写案例名称。');
+      result=await api(`/api/submissions/${encodeURIComponent(form.dataset.submission)}/accept`,{method:'POST',body:{revision:Number(form.dataset.revision),case:{name,client_name:String(fd.get('client_name')||'').trim(),description:String(fd.get('description')||'')}}});
+    } else if(kind==='reject-submission') {
+      const reason=String(fd.get('reason')||'').trim();if(!reason)throw new Error('请填写退回原因。');
+      result=await api(`/api/submissions/${encodeURIComponent(form.dataset.submission)}/reject`,{method:'POST',body:{revision:Number(form.dataset.revision),reason}});
+    } else if(kind==='edit-case') {
+      const name=String(fd.get('name')||'').trim();if(!name)throw new Error('请填写案例名称。');
+      result=await api(`/api/case-library/${encodeURIComponent(id)}`,{method:'PATCH',body:{revision:Number(form.dataset.revision),name,client_name:String(fd.get('client_name')||'').trim(),description:String(fd.get('description')||'')}});
     } else if(kind==='append-files') {
       const files=await toFiles($('input[name=files]',form).files);if(!files.length)throw new Error('请至少选择一张图片。');
       result=await api(`/api/materials/${encodeURIComponent(id)}/files`,{method:'POST',body:{files,revision:Number(form.dataset.revision)}});
@@ -631,10 +777,15 @@ async function submitForm(form) {
     } else if(kind==='rescan') {
       result=await api(`/api/projects/${encodeURIComponent(state.project.id)}/scan`,{method:'POST',body:{mapping_revision:form.dataset.mappingRevision}});state.project=result;state.dirty=false;
     }
+    if(['submit-material','submit-case'].includes(kind)){
+      // Show the contributor where the submission now waits for review.
+      closeDrawer();contributionUi.status='pending';state.view='submissions';state.project=null;state.query='';state.category='all';tenderFlow.url();
+    }
     await refreshData();if(state.project)await loadProjectPickers();if(kind==='rescan')projectUi.step='special';submit.disabled=false;closeModal();render();
     if(state.drawerId)renderDrawer();
     if(kind==='material'&&!id&&result?.id)openDrawer(result.id);
-    toast(kind==='project'?'项目已创建':kind==='rescan'?'已重新扫描，请重新核对匹配结果。':kind==='category'?'栏目已保存，已有项目重新扫描后生效。':['remove-file','remove-files'].includes(kind)?'已移出本组':'已保存');
+    const contributionMessages={'submit-material':'已提交，等待本机管理员核对入库。','submit-case':'已提交，等待本机管理员核对后加入案例库。','accept-case':'已加入案例库。','reject-submission':'已退回投稿。','edit-case':'案例信息已保存。'};
+    toast(contributionMessages[kind]||(kind==='material'&&form.dataset.submission?'已核对入库。':kind==='project'?'项目已创建':kind==='rescan'?'已重新扫描，请重新核对匹配结果。':kind==='category'?'栏目已保存，已有项目重新扫描后生效。':['remove-file','remove-files'].includes(kind)?'已移出本组':'已保存'));
   } catch(e) {error.textContent=e.message;submit.disabled=false;submit.textContent=label;}
   finally {form.inert=false;}
 }
@@ -658,7 +809,7 @@ async function navigate(view, category) {
   }
   await tenderFlow.beforeLeave();
   if(state.dirty)await saveProject(false);
-  closeDrawer();state.view=view;state.project=null;state.query='';state.category=category||'all';tenderFlow.url();if(view==='industries')await loadSpecial();render();window.scrollTo({top:0});
+  closeDrawer();state.view=view;state.project=null;state.query='';state.category=category||'all';tenderFlow.url();if(view==='industries')await loadSpecial();if(view==='submissions')await loadSubmissions();if(view==='cases')await loadCaseLibrary();render();window.scrollTo({top:0});
 }
 async function openProject(id) {
   if(state.dirty)await saveProject(false);
@@ -768,6 +919,14 @@ document.addEventListener('click',async e=>{
     else if(action==='credit-archive'){if(state.data.credit_automation?.enabled===true&&state.data.credit_automation?.status==='verified')await runCreditCheck();}
     else if(action==='credit-retry-status'){creditUi.error='';await pollCreditStatus();}
     else if(action==='new-material')showMaterialForm(null,target.dataset.category);
+    else if(action==='submit-material')showSubmitMaterial(target.dataset.category);
+    else if(action==='submit-case')showSubmitCase();
+    else if(action==='submission-status'){contributionUi.status=id;await loadSubmissions();render();}
+    else if(action==='review-submission')await reviewSubmission(id);
+    else if(action==='reject-submission')showRejectSubmission(contributionUi.result?.items.find(s=>s.id===id));
+    else if(action==='case-library-filter'){contributionUi.caseArchived=id==='archived';await loadCaseLibrary();render();}
+    else if(action==='edit-case')showEditCase(contributionUi.cases?.items.find(c=>c.id===id));
+    else if(action==='archive-case'||action==='restore-case')await setCaseArchived(id,action==='archive-case');
     else if(action==='edit-material')showMaterialForm(id);
     else if(action==='focus-material-field'){
       const field=target.closest('form')?.elements.namedItem(id);
@@ -832,7 +991,7 @@ document.addEventListener('change',async e=>{
   if(el.id==='batch-select-all'){$$('form[data-form="remove-files"] input[name="file_ids"]').forEach(x=>x.checked=el.checked);updateBatchSelection();}
   if(el.name==='file_ids')updateBatchSelection();
   if(el.name==='source')$('#template-upload-area')?.classList.toggle('hidden',el.value==='sample');
-  if(el.id==='material-category')$('#material-years-hint').hidden=el.value!=='audit_report';
+  if(el.id==='material-category'){$('#material-years-hint').hidden=el.value!=='audit_report';if(el.form?.dataset.submission)syncReviewLayer(el.form);}
   if(el.closest('form[data-form="material"]'))queueMaterialValidation(el.closest('form'));
   if(el.name==='mode'){$('#material-text-area')?.classList.toggle('hidden',el.value!=='text');$('#material-upload-area')?.classList.toggle('hidden',el.value==='text');}
   if(el.dataset.mapField)mappingChange(el.dataset.mapId,el.dataset.mapField,el.type==='checkbox'?el.checked:el.value,el.dataset.mapField!=='note');

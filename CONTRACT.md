@@ -123,3 +123,28 @@ POST /api/materials/validate 接收材料表单字段、可选 material_id 与 u
 - GET /api/projects/:id/writing 支持 view=full（默认）、status、job。status 仅返回轻量任务状态和版本，不读取 Word、不遍历材料、不返回来源全文；输入或候选版本变化后再读取 full/job。
 - POST /api/projects/:id/writing/generate 可传 chapter_ids 选择目标章节；省略则生成全部可写章节。正文保存维护逐章修订；候选记录其输入依据和目标章修订，采纳时继续检查。单章重生成合并其他候选，不能清空其他章节或覆盖已保存正文。
 - 写作每批只发送本批要求所引用的采购来源，案例和已选材料仍按当前项目共享依据处理。共享依据变更仍采用保守失效，未实现按单份材料精确推断全部受影响章节。
+
+## 同事投稿与案例库
+
+投稿先进入暂存区（`data/submissions/<id>/`），入库前不进入材料库、项目自动匹配或正文写作。花生壳映射口可以提交和读取状态；文件读取、入库、退回和案例库维护仅限本机环回入口（映射口返回 403）。
+
+- POST /api/submissions {kind:'material'|'case', contributor, note, material?:{name,category_id,subject,version,years:[],valid_until,mode,content,description,client_name,case_name}, case?:{name,client_name,description}, files:[{name,data}]} -> 201 submission。
+  - 材料图片按直接上传的同一规则检查（单张 15 MB、最多 100 张）；mode 为 text 时不接收图片、须有正文。category_id 可为空，非空时须为已启用、非信用受管栏目。
+  - 案例文件经 `writing_cases.parse_uploads` 完整校验（类型、50 MB、ZIP 安全、可读文字），只保存原件及读取摘要。
+  - 校验在共享锁外完成，只有发布持锁；待审核最多 100 份、合计 1 GB，超出拒绝。
+- GET /api/submissions?status=pending|accepted|rejected|all（默认 pending） -> {items,total,status,counts:{pending,accepted,rejected}}，最多返回最近 200 份。
+- GET /api/submissions/:id -> submission。映射口响应不含文件名和读取提示，只返回 file_count、files_intranet_only:true 及 summary.warning_count。
+- GET /api/submissions/:id/files/:file_id（材料图片支持 ?thumb=1，案例原件以附件下载） -> 仅本机。
+- POST /api/submissions/:id/accept {revision, material?:{…与 POST /api/materials 相同字段}, case?:{name,client_name,description}} -> {submission, material|case}。仅本机。
+  - 材料通过 `Store.material` 创建，复用全部字段、主体、年度、有效期和图片校验，记录 material.contribution {submission_id,contributor,origin,submitted_at,accepted_at}；与关闭投稿在同一事务提交。
+  - 案例复制原件到 `data/case-library/<id>/` 并创建 library_case。
+  - 提交后删除暂存原件。投稿已处理或 revision 不符时返回 409。
+- POST /api/submissions/:id/reject {revision, reason} -> {submission}。仅本机；须填写原因，删除暂存原件，原因对提交人可见。
+- GET /api/case-library?archived=false|true -> {items,total,archived,counts:{active,archived}}。映射口返回文件名和大小，不含下载地址。
+- GET /api/case-library/:id/files/:file_id -> 案例原件下载，仅本机。
+- PATCH /api/case-library/:id {revision, name?, client_name?, description?, archived?} -> library_case。仅本机；移出不删除原件，也不改变已组成的案例包。
+- POST /api/projects/:id/writing/cases 增加 library_case_ids:[]（最多 20 个，不可重复）：所选案例原件与 files 合并后走同一解析和存储流程，逻辑文件名为“案例库/案例名称/文件名”；同名案例自动加“（2）”。pack 记录 library_case_ids。GET writing（full）同时返回 library_cases（可选案例摘要）和 library_case_ids。
+- bootstrap.stats 增加 pending_submission_count、library_case_count。
+
+submission: {id,kind,status:'pending'|'accepted'|'rejected',contributor,note,origin:'remote'|'local',material|case,files:[{id,name,size,mime,width,height,url}],file_count,size,summary,revision,created_at,updated_at,decision?:{at,material_id|case_id|reason},files_removed?}
+library_case: {id,name,client_name,description,contributor,submission_id,submitted_at,files:[{id,name,size,url}],file_count,size,summary,archived,revision,created_at,updated_at}
