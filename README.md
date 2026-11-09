@@ -141,6 +141,8 @@ python3 -m unittest discover -s tests -v
 
 测试覆盖年度约束、材料缺失、确认门槛、精确定位、导出、持久化和上传验证。端到端测试在临时数据目录中运行，不会修改日常使用的数据。
 
+废标红线识别的精确率、召回率按 [评测方案](REDLINE_EVAL.md) 对照人工金标准测量，脚本为 `scripts/eval_redline.py`。
+
 安装 `package.json` 中的 Playwright 及其 Chromium 后，可运行 `npm run test:workflow` 验证四步页面流程、专用材料搜索分页、预览、导出及重新打开。`BID_TEST_PYTHON` 可指定已安装 Python 依赖的解释器；默认自动清理测试数据和截图。
 
 ## 代码组成
