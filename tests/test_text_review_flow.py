@@ -60,8 +60,11 @@ class TextReviewFlowTests(unittest.TestCase):
         self.temp.cleanup()
 
     def prepare(self):
+        with self.store.lock:
+            revision = self.store.mapping_revision(self.store.require('project', self.project['id']))
         request = urllib.request.Request(self.base + '/api/projects/' + self.project['id'] + '/text-materials',
-            data=b'{}', headers={'Content-Type': 'application/json', 'Origin': self.base}, method='POST')
+            data=json.dumps({'mapping_revision': revision}).encode(),
+            headers={'Content-Type': 'application/json', 'Origin': self.base}, method='POST')
         with self.opener.open(request, timeout=10) as response:
             return json.load(response)
 

@@ -7,6 +7,34 @@ specific month requirement.
 import re
 
 
+PARTIAL_ISSUE_TYPES = frozenset({'missing_years', 'missing_evidence_kind', 'missing_months'})
+
+
+class ValidationIssues(list):
+    """Keep display messages unchanged while carrying machine-readable causes."""
+    def __init__(self):
+        super().__init__()
+        self.types = []
+
+    def append(self, message, issue_type='invalid'):
+        super().append(message)
+        self.types.append(issue_type)
+
+    def extend(self, messages):
+        if isinstance(messages, ValidationIssues):
+            for message, issue_type in zip(messages, messages.types):
+                self.append(message, issue_type)
+        else:
+            for message in messages:
+                self.append(message)
+
+
+def has_only_partial_issues(row):
+    """Missing coverage permits preselection; missing type metadata never does."""
+    return not row['issues'] or bool(row.get('issue_types')) and all(
+        kind in PARTIAL_ISSUE_TYPES for kind in row['issue_types'])
+
+
 def tax_kinds(text):
     kinds = set()
     if re.search(r'税收|税款|纳税|完税', text or ''):
@@ -151,18 +179,18 @@ def tax_errors(material, heading):
 
 def tax_coverage_errors(materials, heading):
     wanted, periods = tax_target(heading)
-    errors = []
+    errors = ValidationIssues()
     labels = {'tax': '纳税', 'social': '社保'}
     for kind in sorted(wanted):
         matching = [m for m in materials if kind in material_tax_kinds(m)]
         if not matching:
-            errors.append('缺少要求凭证：' + labels[kind] + '。')
+            errors.append('缺少要求凭证：' + labels[kind] + '。', 'missing_evidence_kind')
         elif periods[kind]:
             covered = set().union(*(_declared(m) for m in matching))
             missing = periods[kind] - covered
             if missing:
                 values = '、'.join(f'{v // 12}年{v % 12 + 1}月' for v in sorted(missing))
-                errors.append('缺少要求月份：' + labels[kind] + ' ' + values + '。')
+                errors.append('缺少要求月份：' + labels[kind] + ' ' + values + '。', 'missing_months')
     return errors
 
 
@@ -176,11 +204,7 @@ def text_kind(text):
     return ''
 
 
-def partial_issue(issue):
-    return issue.startswith(('缺少要求年度：', '缺少要求凭证：', '缺少要求月份：'))
-
-
-def automatic_ids(row, candidates, headings, categories):
+def automatic_ids(row, candidates, headings, categories, validation_context=None, *, preserve_forms=False):
     """Preselect a unique set, even when it covers the requirement only in part.
 
     Overlapping versions remain manual; missing years, kinds or months stay
@@ -220,5 +244,6 @@ def automatic_ids(row, candidates, headings, categories):
             return []
     ids = [m['id'] for m in sorted(candidates, key=lambda m: (min(engine._material_years(m) or [9999]), m['id']))]
     probe = dict(row, action='fill', material_ids=ids)
-    checked = engine.validate_mappings([probe], candidates, headings, categories)[0]
-    return ids if all(partial_issue(issue) for issue in checked['issues']) else []
+    checked = engine.validate_mappings([probe], candidates, headings, categories,
+                                      context=validation_context, preserve_forms=preserve_forms)[0]
+    return ids if has_only_partial_issues(checked) else []

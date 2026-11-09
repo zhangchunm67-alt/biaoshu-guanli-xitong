@@ -91,27 +91,59 @@ finally:s.server_close();s.store.close()
     const page=await browser.newPage({viewport:{width:1440,height:1000}});
     const errors=[];page.on('pageerror',e=>errors.push(e.message));
     await page.goto(base);
-    await page.getByRole('button',{name:'创建项目',exact:true}).click();
+    await page.getByRole('button',{name:'已有投标模板，直接填充材料',exact:true}).click();
     await page.locator('#project-name').fill('专用流程浏览器验收');
     await page.locator('#template-file').setInputFiles(path.join(root,'template.docx'));
     await page.getByRole('button',{name:'创建并扫描',exact:true}).click();
-    await page.locator('.review-stage-heading').getByRole('heading',{name:'核对图片材料',exact:true}).waitFor();
-    assert.equal(await page.locator('.mapping-card').count(),1);
-    assert.equal(await page.locator('.location-recognition').filter({hasText:'已匹配原文条目'}).count(),1);
-    assert.equal(await page.locator('[data-action="export-project"]').count(),0);
-    assert.equal(await page.getByRole('button',{name:'确认已就绪项',exact:true}).count(),0);
-    assert.deepEqual(await page.locator('.project-stepper strong').allTextContents(),['上传标书','核对图片材料','核对文字材料','导出标书']);
-    await page.getByRole('button',{name:'下一步：核对文字材料',exact:true}).click();
-    assert.equal(await page.locator('[data-project-industry]').count(),0);
-    assert.equal(await page.locator('[data-project-category]').count(),0);
+    await page.locator('.review-stage-heading').getByRole('heading',{name:'核对文字材料',exact:true}).waitFor();
+    assert.deepEqual(await page.locator('.project-stepper strong').allTextContents(),['上传标书','核对文字材料','核对图片材料','导出标书']);
     await page.locator('.review-stage-heading').getByRole('heading',{name:'核对文字材料',exact:true}).waitFor();
     assert.equal(await page.locator('.mapping-card').count(),8);
     assert.equal(await page.locator('.project-blocked-hint').evaluate(el=>getComputedStyle(el).fontSize),'18px');
+    // A guarded next step explains the blockers and focuses a concrete column.
+    const nextMaterials=page.getByRole('button',{name:'下一步：核对图片材料',exact:true});
+    assert.equal(await nextMaterials.isDisabled(),false);
+    await nextMaterials.click();
+    await page.locator('.material-completion-notice').waitFor();
+    await page.waitForFunction(()=>document.activeElement?.matches('.mapping-card.mapping-needs-attention'));
+    assert.match(await page.locator('.material-completion-notice').innerText(),/核对文字材料/);
+    assert.equal(await page.locator('.review-stage-heading').innerText(),'核对文字材料');
+    const problemLinks=page.locator('[data-action="locate-material-issue"]');
+    if(await problemLinks.count()>1){
+      await problemLinks.nth(1).click();
+      await page.waitForFunction(()=>document.activeElement?.matches('.mapping-card.mapping-needs-attention'));
+      assert.equal(await page.locator('.mapping-needs-attention').count(),1);
+    }
     assert.doesNotMatch(await page.locator('.mapping-list').innerText(),/已识别提交要求|查看原文依据|原位置已有内容/);
     const insurance=page.locator('.mapping-card').filter({has:page.getByRole('heading',{name:'保险项目业绩与案例',exact:true})});
+    await insurance.locator('input[data-project-search]').fill('保险核对材料11');
     await insurance.locator('input[data-map-material][value="'+materials.ids[11]+'"]').check();
+    await insurance.locator('input[data-project-search]').fill('');
     await insurance.locator('.mapping-preview img').last().waitFor();
     assert.equal(await insurance.locator('.mapping-preview img').count(),2);
+    // Conditional copy must keep actionable warnings and keyboard focus intact.
+    await insurance.locator('.mapping-preview-page').first().click();
+    await page.locator('.drawer').waitFor();
+    await page.locator('.drawer [data-action="batch-remove-files"]').click();
+    assert.equal(await page.locator('#batch-empty-warning').isVisible(),false);
+    await page.locator('input[name="file_ids"]').first().check();
+    assert.equal(await page.locator('#batch-empty-warning').isVisible(),false);
+    await page.locator('#batch-select-all').check();
+    assert.equal(await page.locator('#batch-empty-warning').isVisible(),true);
+    await page.locator('input[name="file_ids"]').first().uncheck();
+    assert.equal(await page.locator('#batch-empty-warning').isVisible(),false);
+    await page.locator('#active-modal .modal-footer [data-action="close-modal"]').click();
+    await page.locator('.drawer [data-action="edit-material"]').click();
+    await page.locator('#material-valid').fill('not-a-date');
+    const expiryLink=page.locator('[data-action="focus-material-field"][data-id="valid_until"]');
+    await expiryLink.waitFor();
+    await expiryLink.click();
+    assert.equal(await page.locator('#material-valid').evaluate(el=>document.activeElement===el),true);
+    assert.equal(await page.locator('#material-valid').getAttribute('aria-invalid'),'true');
+    await page.screenshot({path:path.join(root,'material-field-feedback.png'),fullPage:true});
+    await page.locator('#active-modal .modal-footer [data-action="close-modal"]').click();
+    await page.locator('.drawer [data-action="close-drawer"]').click();
+    assert.equal(await insurance.locator('input[value="'+materials.ids[11]+'"]').isChecked(),true);
     await insurance.getByRole('button',{name:'下一页',exact:true}).click();
     await insurance.locator('input[data-map-material][value="'+materials.ids[0]+'"]').waitFor();
     // Selected material remains visible when paging or searching.
@@ -130,8 +162,11 @@ finally:s.server_close();s.store.close()
       await card.locator('.mapping-text-preview').waitFor();
     }
     await page.getByRole('button',{name:'保存核对',exact:true}).first().click();
-    await page.waitForFunction(()=>!document.querySelector('.project-next button[data-id="export"]')?.disabled);
+    await page.waitForFunction(()=>!document.querySelector('.project-next button[data-id="common"]')?.disabled);
     await page.screenshot({path:path.join(root,'special-review.png'),fullPage:true});
+    await page.getByRole('button',{name:'下一步：核对图片材料',exact:true}).click();
+    await page.locator('.review-stage-heading').getByRole('heading',{name:'核对图片材料',exact:true}).waitFor();
+    assert.equal(await page.locator('.mapping-card').count(),1);
     await page.getByRole('button',{name:'下一步：导出标书',exact:true}).click();
     await page.getByRole('button',{name:'导出',exact:true}).click();
     await page.getByRole('link',{name:'Word 文件',exact:true}).waitFor();
@@ -140,7 +175,7 @@ finally:s.server_close();s.store.close()
     fs.writeFileSync(path.join(root,'draft.docx'),await response.body());
     await page.screenshot({path:path.join(root,'export.png'),fullPage:true});
     const bootstrap=await (await page.request.get(base+'/api/bootstrap')).json();
-    const project=bootstrap.projects[0];
+    const project=await (await page.request.get(base+'/api/projects/'+bootstrap.projects[0].id)).json();
     assert.equal(project.mappings.find(m=>m.category_id==='company_profile').locator_id.startsWith('at:'),true);
     assert.deepEqual(project.special_industry_ids,['insurance','bank']);
     assert.deepEqual(project.special_category_ids,['I01','I02','I03','I04','B01','B02','B03','B04']);

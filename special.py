@@ -2,8 +2,7 @@
 import copy
 import hashlib
 from pathlib import Path
-import re
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 INDUSTRIES = [('insurance', '保险', 'I'), ('fund', '基金', 'F'), ('bank', '银行', 'B'), ('wealth', '理财', 'W')]
 
@@ -37,23 +36,7 @@ class SpecialLibrary:
 
     def special_feedback(self, value, count):
         import engine
-        probe = dict(value, subject=engine.EXPECTED_SUBJECT, valid_until='长期')
-        result = engine.material_form_feedback(probe, count)
-        if not str(value.get('subject', '')).strip():
-            result['errors']['subject'] = '请填写实际证明主体；未确认时填写“待核对”。'
-        expiry = value.get('valid_until', '')
-        if expiry and expiry not in {'长期', '长期有效', '永久'}:
-            try:
-                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', expiry):
-                    raise ValueError()
-                if date.fromisoformat(expiry) < date.today():
-                    result['warnings']['valid_until'] = '历史证明已过期，可以归档；使用前须核对。'
-            except ValueError:
-                result['errors']['valid_until'] = '请填写真实日期 YYYY-MM-DD 或“长期”。'
-        elif not expiry:
-            result['warnings']['valid_until'] = '有效期待核对；历史合同年度不代表资格有效期。'
-        result['warnings']['description'] = '归档不代表审核通过，请核对主体、项目、签章和授权范围。'
-        return result
+        return engine.material_form_feedback(value, count, special=True)
 
     def special_fields(self, value, body, old):
         from server import text_value

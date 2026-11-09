@@ -62,7 +62,7 @@ class CommonLocationTests(unittest.TestCase):
         scanned = self.scan(doc, [material])
         row = next(r for r in scanned['mappings'] if r['category_id'] == 'legal_identity')
         self.assertEqual('ready', row['status'])
-        self.assertTrue(any('仅装配身份证附件' in w for w in row['warnings']))
+        self.assertIn('身份证附件不替代证明或授权正文，空白信息和签章须核对。', row['warnings'])
         self.assertIn('证明正文另行核对', row['title'])
         material['valid_until'] = '2001-01-01'
         checked = engine.validate_mappings([row], [material], scanned['headings'], self.categories)[0]
@@ -129,7 +129,7 @@ class CommonLocationTests(unittest.TestCase):
                     'materials': [], 'categories': self.categories})
             self.assertEqual(3, result['initial_page'])
             self.assertEqual([], result['markers'])
-            self.assertIn('新增通用材料区', result['description'])
+            self.assertIn('文末另起一页新增材料区', result['description'])
         finally:
             preview.close()
 

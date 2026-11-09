@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import re
+from bisect import bisect_right
 
 from docx.oxml.ns import qn
 
@@ -375,6 +376,30 @@ def resolve(document, records, categories, toc_elements=()):
         if not r['_inside_table'] and (r['_structural'] or r['_title_topics']):
             section_title = r['title']
         r['_section_title'] = section_title
+    # Financial evidence belongs to the book/lot containing its response slot.
+    # A document-wide union otherwise makes one lot inherit another lot's years.
+    scope, scope_level, shared = '', 0, False
+    scoped_top = {}
+    for r in top:
+        title = compact(r['title'])
+        explicit_lot = re.match(r'^(?:(?:子项目|包件|标段|标包|采购包)' + _NUMBER +
+                                r'|第' + _NUMBER + r'(?:包件|标段|标包|包))', title)
+        common = bool(re.search(r'共同(?:要求|适用|条件)|通用(?:要求|条件)|各(?:包件|标段|子项目).*(?:共同|统一)', title))
+        level = r['level']
+        if common:
+            scope, scope_level, shared = '', 0, True
+        elif explicit_lot:
+            scope, scope_level, shared = 'lot:' + explicit_lot[0], (level if level < 9 else 1), False
+        elif r['_structural'] and level <= (scope_level or 1):
+            scope, scope_level, shared = '', 0, False
+            if not region_title(r['title']) and not r['_title_topics']:
+                scope, scope_level, shared = 'section:' + str(r['_path'][0]), level, False
+        scoped_top[r['_path'][0]] = (scope, shared)
+    scope_positions = sorted(scoped_top)
+    for r in records:
+        before = bisect_right(scope_positions, r['_path'][0]) - 1
+        r['_requirement_scope'], r['_shared_requirements'] = (
+            scoped_top[scope_positions[before]] if before >= 0 else ('', False))
     # Rebuild ownership with all structural boundaries, even non-public attachments.
     children = list(document.element.body)
     by_top = {r['_path'][0]: r for r in top}
@@ -406,6 +431,26 @@ def resolve(document, records, categories, toc_elements=()):
                  legal_body_present=bool(re.search(r'兹证明|(?:系|为).{0,35}法定代表人', compact(txt))),
                  authorization_body_present=bool(re.search(r'本授权(?:委托)?书|本人.{0,40}系|现委托|现授权委托|兹授权', compact(txt))))
     reqs = requirements(records, categories)
+    source_records = list(records)
+    financial_category = next((c for c in categories if c['id'] == 'audit_report'), None)
+    financial_scopes = {}
+
+    def financial_requirement(record):
+        scope = record.get('_requirement_scope', '')
+        eligible = [r for r in source_records if not r.get('_requirement_scope')
+                    or r.get('_requirement_scope') == scope]
+        if not scope:
+            local = [record, *(r for r in source_records if r is not record
+                     and any(r['_element'] is e or r['_element'] in e.iterdescendants()
+                             for e in record.get('_own', [])))]
+            direct = requirements(local, [financial_category])['audit_report']
+            if direct['required_years'] or direct['year_options']:
+                common = [r for r in eligible if r not in local and
+                          (r.get('_region') == 'instructions' or r.get('_shared_requirements'))]
+                return requirements([*common, *local], [financial_category])['audit_report']
+        if scope not in financial_scopes:
+            financial_scopes[scope] = requirements(eligible, [financial_category])['audit_report']
+        return copy.deepcopy(financial_scopes[scope])
     # An agent ID label after an authorization letter is that letter's attachment
     # slot, also in bid frameworks without an explicit 投标文件格式 region.
     letter = False
@@ -607,4 +652,6 @@ def resolve(document, records, categories, toc_elements=()):
     # All headings retain the separate requirements map for scan/mapping consumers.
     for r in records:
         r['_requirements'] = reqs
+        if financial_category and 'audit_report' in r['category_ids'] and r['kind'] != 'common_appendix':
+            r['requirement'] = financial_requirement(r)
     return reqs

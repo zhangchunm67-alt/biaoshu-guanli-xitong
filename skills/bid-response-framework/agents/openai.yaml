@@ -1,0 +1,4 @@
+interface:
+  display_name: "招标文件生成投标框架"
+  short_description: "从采购原件生成投标目录、Word 框架与含指定格式的五类要求汇总"
+  default_prompt: "使用 $bid-response-framework，根据这份采购原件生成 Word 投标框架，附目录及废标条款、资格要求、评分细则、商务技术要求、指定格式五类汇总，展开每条的原文和位置。"

@@ -1,12 +1,13 @@
 # 本地标书管理系统实现约定
 
-本文件是开发接口约定。用户已选择完整材料管理、上传 Word、匹配、人工确认及导出。原始目录只读，所有运行数据在本目录 data/，本机 127.0.0.1 服务，无云服务。默认七个通用栏目，专用层初始化四行业及16栏目，迁移标识 special_v1。前端原生 HTML/CSS/JS，后端 Python 标准库 HTTP + SQLite，Word 使用 python-docx/Pillow。
+本文件是开发接口约定。用户已选择完整材料管理、上传 Word、匹配、人工确认及导出。原始目录只读，所有运行数据在本目录 data/，界面与数据库运行于本机 127.0.0.1；使用 AI 时，相关文本会发送至所配置的模型服务。默认七个通用栏目，专用层初始化四行业及16栏目，迁移标识 special_v1。前端原生 HTML/CSS/JS，后端 Python 标准库 HTTP + SQLite，Word 使用 python-docx/Pillow。
 
 ## API
 
 全部 JSON，错误 {error:中文说明}，POST/PATCH 要求同源；无跨源开放。文件上传 JSON base64（data 不带 data URL 前缀）。每项写入真实持久化。ID 为不透明字符串。
 
 - GET /api/bootstrap -> {categories:[],materials:[],projects:[],exports:[],industries:[],stats:{}}
+  - projects 仅含列表摘要（id、名称、模板名、状态、时间和框架关联），不包含 mappings、headings、材料明细或正文；读取列表不执行旧项目迁移。继续编制须 GET /api/projects/:id，不能把摘要当作可保存的完整项目。
 - GET /api/projects/:id -> 完整 project 对象（下述结构）
 - POST /api/categories {name,aliases:[],layer:'common',enabled:true} -> category
 - PATCH /api/categories/:id 修改 name,aliases,enabled（原栏目 id 不变）
@@ -112,3 +113,13 @@ POST /api/materials/validate 接收材料表单字段、可选 material_id 与 u
 - 小数编号（如4.1、4.2）隔开各自材料位置；共享分类新增正文位置在旧项目升级时补出核对项，已有材料、备注和人工决定保留。
 - 原页预览每次请求读取模板字节并校验指纹，校验、识别和渲染使用同一份字节；按模板指纹和栏目配置缓存解析识别结果（最多两份），逐卡片预览不重复解析模板。
 - `scripts/audit_matching.py --data-dir data --corpus 考题` 只读核查本地库和模板，在临时目录验证导出图片数量、目录不变及原稿指纹，结束自动清理。它不代表招标业务验收或可直接投标。
+
+## 框架和正文的收敛约定
+
+- 框架服务以单个有超时限制的工作进程完成规划、要求提取和 Word/HTML 生成；CLI 与服务共用构建函数。统计直接来自结构化结果，不能回读 HTML 样式节点取得业务数据。同次任务复用原文解析结果，已校验的 DOC 转换副本在后续修订中复用。
+- 当前框架仅持久化一份要求清单和来源表，要求的 references 保存来源 ID；对外响应按原接口展开原文。计划不重复保存完整要求，outline/books/metrics 为生成时派生的缓存。历史原件、工作稿和导出不因去重而删除。
+- 要求内容没有变化的保存或确认只更新状态及并发版本，不重建 Word/HTML，不新增产物修订目录；原件校验和过期页面拒绝规则继续有效。
+- 材料校验的 issue_types 为稳定问题类型，issues 仍为中文展示信息；自动预选依据类型判断部分覆盖，不解析中文提示前缀。材料解析及图片检查只在同一校验操作内复用；文件变化、后续操作和最终导出必须重新检查。
+- GET /api/projects/:id/writing 支持 view=full（默认）、status、job。status 仅返回轻量任务状态和版本，不读取 Word、不遍历材料、不返回来源全文；输入或候选版本变化后再读取 full/job。
+- POST /api/projects/:id/writing/generate 可传 chapter_ids 选择目标章节；省略则生成全部可写章节。正文保存维护逐章修订；候选记录其输入依据和目标章修订，采纳时继续检查。单章重生成合并其他候选，不能清空其他章节或覆盖已保存正文。
+- 写作每批只发送本批要求所引用的采购来源，案例和已选材料仍按当前项目共享依据处理。共享依据变更仍采用保守失效，未实现按单份材料精确推断全部受影响章节。

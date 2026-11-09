@@ -164,7 +164,7 @@ class AuthorizationImagesTests(unittest.TestCase):
             text = [p.text for p in Document(self.output).paragraphs]
             self.assertEqual(1, text.count('授权委托书文字模板正文'))
             self.assertEqual(2 if agent_slot else 0, len(Document(self.output).inline_shapes))
-            self.assertEqual(not agent_slot, any('待补：被授权人身份证附件' in t for t in text))
+            self.assertEqual(not agent_slot, any('待补：授权书底部' in t for t in text))
 
     def test_agent_id_slots_need_a_copy_and_accept_passports(self):
         categories = self.categories + [dict(id='text_template', name='文书模板', aliases=[],

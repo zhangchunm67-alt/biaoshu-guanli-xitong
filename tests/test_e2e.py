@@ -50,6 +50,15 @@ class FullWorkflow(unittest.TestCase):
         self.tmp.cleanup()
 
     def request(self, method, path, value=None, raw=False, origin=None):
+        if value is not None and method in {'POST', 'PATCH'}:
+            value = dict(value)
+            bits = path.strip('/').split('/')
+            if len(bits) == 4 and bits[:2] == ['api', 'projects'] and bits[3] in {
+                    'mappings', 'special-categories', 'text-materials', 'scan', 'export-jobs', 'export', 'chapter-drafts'}:
+                value.setdefault('mapping_revision', self.request('GET', '/api/projects/' + bits[2])['mapping_revision'])
+            elif bits[:2] == ['api', 'materials'] and ((method == 'PATCH' and len(bits) == 3)
+                    or (method == 'POST' and len(bits) == 4 and bits[3] == 'files')):
+                value.setdefault('revision', self.request('GET', '/api/materials/' + bits[2])['revision'])
         data = json.dumps(value).encode() if value is not None else None
         headers = {"Content-Type": "application/json"}
         if origin:

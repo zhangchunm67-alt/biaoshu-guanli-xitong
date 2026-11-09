@@ -1,4 +1,7 @@
+# 材料库原件、文字材料库、导出与业务数据 —— 不上 GitHub
 data/
+*.sqlite3*
+
 .venv/
 __pycache__/
 *.pyc
@@ -8,13 +11,17 @@ tests/artifacts/
 server.log
 node_modules/
 .runtime-deps/
+
+# 口令与密钥
 .env
 .env.*
 !.env.example
+!.env.oray.example
+.env.oray
 *.pem
 *.key
-*.sqlite3*
 *.log
+
 考题/
 测试结果/
 outputs/

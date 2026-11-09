@@ -104,7 +104,7 @@ class EngineTests(unittest.TestCase):
         row = engine.validate_mappings([row], [material], scanned["headings"], categories)[0]
         self.assertEqual(row["required_years"], [])
         self.assertEqual(row["status"], "blocked")
-        self.assertTrue(any("不默认" in w for w in row["warnings"]))
+        self.assertTrue(any("原文未明确审计年度" in w for w in row["warnings"]))
 
     def test_category_subject_expiry_and_missing_id_are_hard_constraints(self):
         self.doc("公司介绍")

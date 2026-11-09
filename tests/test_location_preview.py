@@ -16,6 +16,7 @@ import urllib.request
 
 from docx import Document
 from docx.oxml.ns import qn
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import engine
@@ -45,6 +46,52 @@ def make_fixture(path):
     table.style = 'Table Grid'
     doc.add_paragraph()
     doc.save(path)
+
+
+class SequentialMaterialPreviewTests(unittest.TestCase):
+    def test_sequential_materials_reserve_tables_like_export_without_mutating_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / 'source.docx', root / 'output.docx'
+            doc = Document()
+            doc.add_heading('营业执照', 1)
+            doc.add_table(rows=1, cols=2)
+            doc.add_table(rows=1, cols=2)
+            doc.save(source)
+            raw = source.read_bytes()
+            categories = [c for c in engine.DEFAULT_CATEGORIES if c['id'] == 'business_license']
+            materials = []
+            for index, color in enumerate(('red', 'blue')):
+                path = root / f'{index}.png'
+                Image.new('RGB', (60, 40), color).save(path)
+                materials.append({'id': str(index), 'category_id': 'business_license',
+                    'name': f'执照{index}', 'subject': engine.EXPECTED_SUBJECT, 'years': [],
+                    'valid_until': '长期', 'mode': 'side_by_side',
+                    'files': [{'name': path.name, 'path': str(path)}]})
+            scanned = engine.scan_document(source, categories, materials)
+            row = dict(scanned['mappings'][0], material_ids=['0', '1'], action='fill', confirmed=True)
+            preview = LocationPreview()
+            self.addCleanup(preview.close)
+            cached, _ = preview._recognize(raw, hashlib.sha256(raw).hexdigest(), categories)
+            before_xml = cached.element.xml
+
+            def position(document, paragraph, entry):
+                table = next(e for e in paragraph.iterancestors() if e.tag == qn('w:tbl'))
+                return {'page': 1, 'x': .5, 'y': .2 if table is document.tables[0]._tbl else .6}
+
+            snapshot = {'template': source, 'template_hash': hashlib.sha256(raw).hexdigest(),
+                        'template_name': source.name, 'categories': categories,
+                        'locator_id': row['locator_id'], 'action': 'fill', 'materials': materials}
+            with patch.object(preview, '_build', return_value={'preview_id': 'test', 'page_count': 1,
+                    'names': {}, 'destinations': {}}), patch.object(preview, '_cell_location', side_effect=position), \
+                    patch.object(preview, '_place_below_text'):
+                first, second = preview.describe(snapshot), preview.describe(snapshot)
+            self.assertEqual([.2, .6], [m['y'] for m in first['markers']])
+            self.assertEqual(first, second)
+            self.assertEqual(before_xml, cached.element.xml)
+            engine.export_document(source, output, [row], materials, 'reviewed', categories)
+            self.assertEqual([1, 1], [len(list(t._tbl.iter(qn('a:blip')))) for t in Document(output).tables])
+            self.assertEqual(raw, source.read_bytes())
 
 
 @unittest.skipUnless(find_converter(), 'Local LibreOffice is required for page rendering')
@@ -89,6 +136,16 @@ class RenderedLocationTests(unittest.TestCase):
         self.assertTrue(self.preview.page(result['preview_id'], 1).startswith(b'\x89PNG'))
         self.assertEqual(self.raw, self.source.read_bytes())
 
+    def test_retained_section_opens_its_original_page_without_fill_or_skip_markers(self):
+        rows = [r for r in self.scan['mappings'] if r['category_id'] == 'company_profile']
+        result = self.preview.describe(self.snapshot(rows[1]['locator_id'],
+            action='skip', preserve_original=True))
+        self.assertEqual(2, result['initial_page'])
+        self.assertEqual([2], result['target_pages'])
+        self.assertEqual([], result['markers'])
+        self.assertEqual('', result['description'])
+        self.assertEqual(self.raw, self.source.read_bytes())
+
     def test_wrapped_paragraph_marker_is_below_its_last_line(self):
         import pypdfium2 as pdfium
         document = Document()
@@ -122,7 +179,7 @@ class RenderedLocationTests(unittest.TestCase):
         table_box = self.preview._page_tables(self.preview.cache[result['preview_id']], 2)[0]
         self.assertLess(table_box['ys'][1], result['markers'][0]['y'])
         self.assertLess(result['markers'][0]['y'], table_box['ys'][2])
-        self.assertIn('占位符', result['description'])
+        self.assertNotIn('占位符', result['description'])
         heading = next(h for h in self.scan['headings'] if h['title'] == '身份证附件')
         pair = {'mode': 'side_by_side', 'files': [{}, {}]}
         cells = self.preview.describe(self.snapshot(heading['id'], materials=[pair]))
@@ -301,6 +358,36 @@ class LocationAPITests(unittest.TestCase):
         self.assertEqual([{'title': '公司介绍'}], responses)
         self.assertEqual(rows[1]['locator_id'], observed[0]['locator_id'])
         self.assertEqual(original, store.require('project', self.project['id']))
+
+    @unittest.skipUnless(find_converter(), 'Local LibreOffice is required for page rendering')
+    def test_authorization_preview_accepts_legal_identity_images_without_saving(self):
+        store = self.httpd.store
+        picture = io.BytesIO()
+        Image.new('RGB', (120, 80), 'navy').save(picture, format='PNG')
+        material = store.material({'name': '测试法定代表人身份证',
+            'category_id': 'legal_identity', 'subject': server.SUBJECT,
+            'mode': 'side_by_side', 'valid_until': '长期',
+            'files': [{'name': 'test-id.png', 'data': base64.b64encode(picture.getvalue()).decode()}]})
+        row = next(m for m in self.project['mappings'] if m['category_id'] == 'authorization')
+        original = copy.deepcopy(store.require('project', self.project['id']))
+        body = {'mapping_id': row['id'], 'locator_id': '', 'action': 'fill',
+                'material_ids': [material['id']]}
+        path = f'/api/projects/{self.project["id"]}/location-preview'
+        result = self.request('POST', path, body)
+        self.assertGreater(result['page_count'], 0)
+        self.assertEqual([], result['markers'])
+        url = self.base + path + '/' + result['preview_id'] + '/pages/1'
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=5) as response:
+            self.assertEqual('image/png', response.headers.get_content_type())
+            self.assertTrue(response.read().startswith(b'\x89PNG'))
+        self.assertEqual(original, store.require('project', self.project['id']))
+        # This exception is for identity images, not arbitrary text or archived evidence.
+        saved = store.require('material', material['id'])
+        for invalid in (dict(saved, mode='text', content='不能冒充身份证图片'),
+                        dict(saved, archived=True)):
+            store.put('material', invalid)
+            with self.assertRaisesRegex(ValueError, '不属于当前核对栏目'):
+                store.preview_snapshot(self.project['id'], body)
 
     def test_preview_rejects_unknown_mapping_foreign_locator_and_cross_origin(self):
         path = f'/api/projects/{self.project["id"]}/location-preview'

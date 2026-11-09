@@ -30,7 +30,7 @@ DEFAULT_CATEGORIES = [
     {"id": "legal_identity", "name": "法定代表人（负责人）身份证明", "aliases": ["法定代表人身份证明", "法人身份证明"]},
     {"id": "authorization", "name": "法定代表人（负责人）授权委托书", "aliases": ["法定代表人授权委托书", "授权委托书"]},
     {"id": "business_license", "name": "营业执照", "aliases": ["企业法人营业执照", "营业执照副本"]},
-    {"id": "audit_report", "name": "2023-2024年财务审计报告", "aliases": ["财务审计报告", "审计报告"]},
+    {"id": "audit_report", "name": "近三年财务审计报告", "aliases": ["财务审计报告", "审计报告"]},
     {"id": "tax_social", "name": "税收和社会保障资金缴纳凭证", "aliases": ["税收和社保缴纳凭证", "税收和社会保障资金缴纳证明"]},
     {"id": "company_profile", "name": "公司介绍", "aliases": ["公司简介", "企业介绍", "企业简介"]},
     {"id": "iso_cert", "name": "ISO相关资质证书", "aliases": ["ISO认证证书", "ISO资质证书"]},
@@ -42,7 +42,7 @@ _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 SPECIAL_LOCATOR_VERSION = 9
-COMMON_LOCATOR_VERSION = 11
+COMMON_LOCATOR_VERSION = 12
 
 
 def _common_title(text):
@@ -328,6 +328,7 @@ def _inspect(document, categories, toc_elements=None):
     for record in records:
         if 'authorization' in record['category_ids']:
             authorization.describe(record)
+    authorization.add_body_targets(records)
     return records, skipped_toc
 
 
@@ -357,10 +358,11 @@ def _document_warnings(document, records, skipped_toc):
     return warnings
 
 
-def scan_document(template_path, categories, materials, special_category_ids=()):
+def scan_document(template_path, categories, materials, special_category_ids=(), *, preserve_forms=False):
     from recognition import family
     from document_toc import excluded_paragraphs, excluded_locator_ids
     selected = set(special_category_ids)
+    context = ValidationContext()
     enabled = [dict(c) for c in categories if
                (c.get("layer", "common") == "common" or c["id"] in selected)
                and c.get("enabled", True)]
@@ -382,7 +384,7 @@ def scan_document(template_path, categories, materials, special_category_ids=())
         if match['status'] == 'ambiguous':
             locations[cid] = ('', match)
     for category in enabled:
-        hits = [r for r in records if category["id"] in r["category_ids"]]
+        hits = [r for r in records if category["id"] in r["category_ids"] and r['kind'] != 'authorization_bundle']
         if category.get('layer') == 'special' and category['id'] != 'text_template':
             hits = [r for r in hits if r['id'] == locations[category['id']][0]]
         # An explicit token is the insertion point for its enclosing same-category section.
@@ -398,7 +400,7 @@ def scan_document(template_path, categories, materials, special_category_ids=())
                    "material_ids": [], "action": "missing", "confirmed": False, "note": "",
                    "required_years": _years(hit["title"]) if hit else [], "issues": [],
                    "status": "missing", "existing_content": hit["existing_content"] if hit else False}
-            row['requirement'] = copy.deepcopy(requirements.get(category['id'], {'status':'not_detected','evidence':[]}))
+            row['requirement'] = copy.deepcopy((hit or {}).get('requirement') or requirements.get(category['id'], {'status':'not_detected','evidence':[]}))
             if category['id'] == 'audit_report':
                 row['required_years'] = list(row['requirement'].get('required_years', []))
             if hit and hit.get('location_match') and category.get('layer', 'common') == 'common':
@@ -412,24 +414,26 @@ def scan_document(template_path, categories, materials, special_category_ids=())
                                copy.deepcopy(hit.get('location_match', {'status': 'matched', 'candidates': []}))
                                if hit and category['id'] == 'text_template' else locations[category['id']][1]))
             elif hit:
-                from material_rules import partial_issue, automatic_ids
+                from material_rules import has_only_partial_issues, automatic_ids
                 candidates = []
                 for material in materials:
                     if material.get("category_id") != category["id"]:
                         continue
                     probe = dict(row, material_ids=[material["id"]], action="fill")
-                    checked = validate_mappings([probe], [material], headings, enabled)[0]
+                    checked = validate_mappings([probe], [material], headings, enabled, context=context,
+                                                preserve_forms=preserve_forms)[0]
                     # In a multi-year column a single valid year may be a partial candidate.
-                    severe = [s for s in checked["issues"] if not partial_issue(s)]
-                    if not severe:
+                    if has_only_partial_issues(checked):
                         candidates.append(material)
-                ids = automatic_ids(row, candidates, headings, enabled)
+                ids = automatic_ids(row, candidates, headings, enabled, validation_context=context,
+                                    preserve_forms=preserve_forms)
                 if ids:
                     row.update(material_ids=ids, action='fill')
                 elif candidates:
                     row['note'] = '存在重叠版本或需按截止日核对缴费期限，请人工选择材料。'
             mappings.append(row)
-    mappings = validate_mappings(mappings, materials, headings, enabled)
+    mappings = validate_mappings(mappings, materials, headings, enabled, context=context,
+                                preserve_forms=preserve_forms)
     return {"headings": headings, "mappings": mappings, "requirements": requirements,
             "excluded_locator_ids": excluded_locator_ids(document, toc_elements, categories),
             "warnings": _document_warnings(document, records, skipped)}
@@ -454,37 +458,100 @@ def _attachment_only(material):
     return bool(material.get("attachment_only") or "证件附件" in description or "身份证" in description.replace("身份证明", ""))
 
 
-def material_form_feedback(material, file_count=0):
+class ValidationContext:
+    """Caches live only within one validation operation, never on the store."""
+    def __init__(self):
+        self.today = date.today()
+        self._facts = {}
+        self._images = {}
+
+    def facts(self, material):
+        key = tuple(repr(material.get(k)) for k in
+                    ('name', 'subject', 'years', 'valid_until', 'mode', 'content'))
+        if key not in self._facts:
+            raw = str(material.get('valid_until') or '').strip()
+            expiry, expires = 'valid', None
+            if not raw:
+                expiry = 'missing'
+            elif raw in {'下一年度更新', '按年度更新', '每年更新'}:
+                expiry = 'annual'
+            elif raw not in {'长期', '永久', '长期有效'}:
+                try:
+                    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+                        raise ValueError()
+                    expires = date.fromisoformat(raw)
+                    expiry = 'expired' if expires < self.today else 'soon' if (expires - self.today).days <= 30 else 'valid'
+                except ValueError:
+                    expiry = 'invalid'
+            years = material.get('years', [])
+            self._facts[key] = dict(
+                name=str(material.get('name') or '').strip(),
+                subject=re.sub(r'\s+', '', str(material.get('subject') or '')),
+                years=_material_years(material) if isinstance(years, (list, tuple)) else set(),
+                years_valid=isinstance(years, list) and len(years) <= 30 and all(type(y) is int and 1900 <= y <= 2200 for y in years),
+                expiry=expiry, expiry_raw=raw, expires=expires,
+                mode=material.get('mode', 'page'), has_content=bool(str(material.get('content') or '').strip()))
+        return self._facts[key]
+
+    def image_issue(self, file):
+        path = Path(str(file.get('path') or ''))
+        try:
+            stat = path.stat()
+            if not path.is_file() or path.suffix.lower() not in _EXTENSIONS:
+                return 'unavailable'
+        except OSError:
+            return 'unavailable'
+        key = (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+               stat.st_ino, repr(file.get('rotation')))
+        if key not in self._images:
+            issue = None
+            try:
+                if int(file.get('rotation') or 0) % 90:
+                    raise ValueError('rotation')
+                with Image.open(path) as image:
+                    image.verify()
+            except Exception:
+                issue = 'invalid'
+            self._images[key] = issue
+        return self._images[key]
+
+
+def material_form_feedback(material, file_count=0, *, special=False, context=None):
     """Intrinsic checks shared by the material form and save endpoint."""
     errors, warnings = {}, {}
-    if not str(material.get('name') or '').strip():
+    facts = (context or ValidationContext()).facts(material)
+    if not facts['name']:
         errors['name'] = '请填写材料名称。'
-    if re.sub(r'\s+', '', str(material.get('subject') or '')) != EXPECTED_SUBJECT:
+    if special and not facts['subject']:
+        errors['subject'] = '请填写实际证明主体；未确认时填写“待核对”。'
+    elif not special and facts['subject'] != EXPECTED_SUBJECT:
         errors['subject'] = f'材料主体须为{EXPECTED_SUBJECT}。'
     years = material.get('years', [])
-    if not isinstance(years, list) or len(years) > 30 or any(type(y) is not int or not 1900 <= y <= 2200 for y in years):
+    if not facts['years_valid']:
         errors['years'] = '年度须为 1900—2200 之间的四位年份，多个年度用逗号分隔。'
     elif material.get('category_id') == 'audit_report' and not years:
         errors['years'] = '审计报告必须填写适用年度，不能只写在材料名称中。'
-    value = str(material.get('valid_until') or '').strip()
-    if not value:
+    value, expiry = facts['expiry_raw'], facts['expiry']
+    if special:
+        if expiry == 'missing':
+            warnings['valid_until'] = '有效期待核对；历史合同年度不代表资格有效期。'
+        elif expiry in {'invalid', 'annual'}:
+            errors['valid_until'] = '请填写真实日期 YYYY-MM-DD 或“长期”。'
+        elif expiry == 'expired':
+            warnings['valid_until'] = '历史证明已过期，可以归档；使用前须核对。'
+    elif expiry == 'missing':
         warnings['valid_until'] = '有效期未填写，请核对材料有效期；长期有效的材料可填写“长期”。'
-    elif value in {'下一年度更新', '按年度更新', '每年更新'}:
+    elif expiry == 'annual':
         warnings['valid_until'] = '尚未提供明确有效期，请按项目要求核对。'
-    elif value not in {'长期', '永久', '长期有效'}:
-        try:
-            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
-                raise ValueError()
-            expiry = date.fromisoformat(value)
-            if expiry < date.today():
-                errors['valid_until'] = f'材料已过期（{value}），请上传有效材料并填写真实到期日期。'
-            elif (expiry - date.today()).days <= 30:
-                warnings['valid_until'] = '材料将在 30 天内到期，请核对投标截止日期。'
-        except ValueError:
-            errors['valid_until'] = '有效期格式无效，请填写真实日期 YYYY-MM-DD（如 2027-12-31）或“长期”。'
-    mode = material.get('mode', 'page')
+    elif expiry == 'expired':
+        errors['valid_until'] = f'材料已过期（{value}），请上传有效材料并填写真实到期日期。'
+    elif expiry == 'soon':
+        warnings['valid_until'] = '材料将在 30 天内到期，请核对投标截止日期。'
+    elif expiry == 'invalid':
+        errors['valid_until'] = '有效期格式无效，请填写真实日期 YYYY-MM-DD（如 2027-12-31）或“长期”。'
+    mode = facts['mode']
     if mode == 'text':
-        if not str(material.get('content') or '').strip():
+        if not facts['has_content']:
             errors['content'] = '请填写文字材料正文。'
     elif mode in {'page', 'side_by_side'}:
         if not file_count:
@@ -493,11 +560,15 @@ def material_form_feedback(material, file_count=0):
         errors['mode'] = '请选择有效的排版方式。'
     if material.get('category_id') in {'legal_identity', 'authorization'}:
         warnings['description'] = '身份证附件不能替代证明或授权正文；请同时核对正文、人员、签章和日期。'
+    if special:
+        warnings['description'] = '归档不代表审核通过，请核对主体、项目、签章和授权范围。'
     return {'errors': errors, 'warnings': warnings}
 
 
-def _check_material(material, category_id, required, heading, special=False):
+def _check_material(material, category_id, required, heading, special=False, context=None):
     errors, warnings = [], []
+    context = context or ValidationContext()
+    facts = context.facts(material)
     name = str(material.get("name") or material.get("id") or "材料")
     if category_id == 'tax_social':
         from material_rules import tax_errors
@@ -510,72 +581,57 @@ def _check_material(material, category_id, required, heading, special=False):
     if material.get("category_id") != category_id and not (
             special and category_id in material.get("linked_category_ids", [])):
         errors.append(f"{name}：材料所属栏目不符。")
-    subject = re.sub(r"\s+", "", str(material.get("subject") or ""))
+    subject = facts['subject']
     if special:
         if not subject or subject in {"待核对", "未知"}:
             errors.append(f"{name}：请先在材料库登记实际证明主体。")
         if material.get("archived"):
             errors.append(f"{name}：材料已归档停用，请改选可用材料。")
-        warnings.append(f"{name}：请核对主体“{subject}”、项目要求、签章及授权范围。")
         if material.get("review_status", "pending") != "checked":
-            warnings.append(f"{name}：材料库尚未标记核对通过，本次使用须逐项核验原件。")
+            warnings.append(f"{name}：尚未核对通过，请核验原件。")
     elif subject != EXPECTED_SUBJECT:
         errors.append(f"{name}：主体必须核实为{EXPECTED_SUBJECT}，当前为{subject or '未填写'}。")
-    years = _material_years(material)
+    years = facts['years']
     if (required or category_id == "audit_report") and not years:
-        errors.append(f"{name}：缺少年度元数据，名称和别名不能替代年度。")
+        errors.append(f"{name}：未登记年度，请在材料库补充。")
     if required and years and not years.intersection(required):
         errors.append(f"{name}：年度与目标要求不符。")
-    valid_until = str(material.get("valid_until") or "").strip()
-    if not valid_until:
+    valid_until, expiry = facts['expiry_raw'], facts['expiry']
+    if expiry == 'missing':
         warnings.append(f"{name}：有效期未填写，须人工核对。")
-    elif valid_until in {"下一年度更新", "按年度更新", "每年更新"}:
+    elif expiry == 'annual':
         warnings.append(f"{name}：原台账标注“{valid_until}”，未提供明确有效期，须按本项目要求人工核对。")
-    elif valid_until not in {"长期", "永久", "长期有效"}:
-        try:
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", valid_until):
-                raise ValueError()
-            expiry = date.fromisoformat(valid_until)
-            if expiry < date.today():
-                target = warnings if special and str(category_id).endswith("01") else errors
-                target.append(f"{name}：材料已过期（{expiry.isoformat()}）。" +
-                              ("作为历史业绩使用时，请核对招标要求的业绩期限。" if target is warnings else ""))
-            elif (expiry - date.today()).days <= 30:
-                warnings.append(f"{name}：将在30天内到期，请核对投标截止日。")
-        except ValueError:
-            errors.append(f"{name}：有效期格式无效，请填写 YYYY-MM-DD 或长期。")
+    elif expiry == 'expired':
+        target = warnings if special and str(category_id).endswith("01") else errors
+        target.append(f"{name}：材料已过期（{facts['expires'].isoformat()}）。" +
+                      ("作为历史业绩使用时，请核对招标要求的业绩期限。" if target is warnings else ""))
+    elif expiry == 'soon':
+        warnings.append(f"{name}：将在30天内到期，请核对投标截止日。")
+    elif expiry == 'invalid':
+        errors.append(f"{name}：有效期格式无效，请填写 YYYY-MM-DD 或长期。")
     mode = material.get("mode")
     if mode == "text":
-        if not str(material.get("content") or "").strip():
+        if not facts['has_content']:
             errors.append(f"{name}：文字内容为空。")
     elif mode in {"page", "side_by_side"}:
         files = material.get("files") or []
         if not files:
             errors.append(f"{name}：没有材料图片。")
         for file in files:
-            path = Path(str(file.get("path") or ""))
             label = str(file.get("name") or "图片")
-            if not path.is_file() or path.suffix.lower() not in _EXTENSIONS:
+            issue = context.image_issue(file)
+            if issue == 'unavailable':
                 errors.append(f"{name}：图片不可用（{label}）。")
-                continue
-            try:
-                rotation = int(file.get("rotation") or 0)
-                if rotation % 90:
-                    raise ValueError("rotation")
-                with Image.open(path) as image:
-                    image.verify()
-            except Exception:
+            elif issue == 'invalid':
                 errors.append(f"{name}：图片损坏或旋转值无效（{label}）。")
     else:
         errors.append(f"{name}：插入方式无效。")
     if category_id in {"legal_identity", "authorization"} and _attachment_only(material):
+        warnings.append('身份证附件不替代证明或授权正文，空白信息和签章须核对。')
         body_key = "legal_body_present" if category_id == "legal_identity" else "authorization_body_present"
-        if category_id == 'authorization' or (category_id == 'legal_identity' and heading.get('identity_attachment_target')):
-            warnings.append(f"{name}：本次仅装配身份证附件，不代表身份证明或授权正文已填写；人员、日期和签章由商务核对。")
-        elif not heading.get(body_key):
+        if (category_id != 'authorization' and not heading.get('identity_attachment_target')
+                and not heading.get(body_key)):
             errors.append(f"{name}：身份证附件不能替代证明/授权正文，目标节未识别到相应文书正文。")
-        else:
-            warnings.append(f"{name}：仅作为身份证附件；原证明/授权正文、人员、日期和签章须单独核对。")
         if category_id == 'authorization' and heading.get('authorization_text'):
             import authorization
             _, original_agent = authorization._names(re.sub(r'\s+', '', heading['authorization_text']))
@@ -585,7 +641,12 @@ def _check_material(material, category_id, required, heading, special=False):
     return errors, warnings
 
 
-def validate_mappings(mappings, materials, headings, categories=None):
+def validate_mappings(mappings, materials, headings, categories=None, *, context=None, preserve_forms=False):
+    import authorization
+    from material_rules import ValidationIssues
+    context = context or ValidationContext()
+    mappings, authorization_bodies = authorization.link_body_targets(
+        mappings, headings, materials, preserve_forms=preserve_forms)
     by_material = {m["id"]: m for m in materials}
     if len(by_material) != len(materials):
         raise ValueError("材料 ID 重复，无法可靠核对。")
@@ -599,9 +660,12 @@ def validate_mappings(mappings, materials, headings, categories=None):
         if not mid or mid in seen_ids:
             raise ValueError("栏目记录 ID 缺失或重复，请重新扫描模板。")
         seen_ids.add(mid)
-        errors, warnings = [], []
+        errors, warnings = ValidationIssues(), []
+        row.pop('preserve_original', None)
         category_id = row.get("category_id")
         category = by_category.get(category_id) if by_category is not None else None
+        if category_id == 'audit_report' and row.get('category_name') in {'2023-2024年财务审计报告', '财务审计报告'}:
+            row['category_name'] = '近三年财务审计报告'
         special = bool(category and category.get("layer") == "special")
         row["layer"] = "special" if special else "common"
         if by_category is not None:
@@ -610,6 +674,8 @@ def validate_mappings(mappings, materials, headings, categories=None):
                     or original.get("layer", "common") != category.get("layer", "common")):
                 errors.append("该栏目已停用、分类已变更或未纳入本项目，请重新核对分类。")
         heading = by_heading.get(row.get("locator_id"))
+        retained_form = (preserve_forms and category_id == 'text_template'
+                         and authorization.preserves_form(heading))
         # Retire legacy text-generation settings; old confirmations covered a
         # different output and must be reviewed once under image-only filling.
         legacy_authorization = row.pop('authorization', None)
@@ -621,8 +687,6 @@ def validate_mappings(mappings, materials, headings, categories=None):
             row["existing_content"] = bool(heading.get("existing_content"))
             if heading.get("category_ids") and category_id not in heading["category_ids"]:
                 errors.append("选定位置与栏目类别不符。")
-            if not heading.get("category_ids"):
-                warnings.append("当前为人工指定位置，请核对栏目上下文。")
             if heading.get('kind') == 'common_appendix':
                 warnings.append('原文有材料要求但无独立位置，将在文末新增通用材料区；请核对是否需要提交及材料适用性。')
         requirement = (heading or {}).get('requirement') or row.get('requirement') or {}
@@ -640,16 +704,38 @@ def validate_mappings(mappings, materials, headings, categories=None):
         if action not in {"fill", "missing", "skip"}:
             errors.append("处理方式无效。")
         if action == "fill":
+            if heading and heading.get('authorization_source'):
+                body = authorization_bodies.get(heading['id'])
+                if not body:
+                    errors.append('请先核对授权书：已有原表可保留原表；无正文时请选择并保存授权书文字模板。')
+                else:
+                    heading = dict(heading, authorization_text=body.get('content', ''))
+                    legal_name, agent_name = authorization._names(re.sub(r'\s+', '', body.get('content', '')))
+                    for ident in row.get('material_ids', []):
+                        proof = by_material.get(ident, {})
+                        expected = legal_name if proof.get('category_id') == 'legal_identity' else agent_name
+                        actual = authorization.person(proof)
+                        if expected and actual and expected != actual:
+                            errors.append('授权书正文与所选身份证姓名不一致，请核对双方人员。')
+                roles = [by_material.get(i, {}).get('category_id') for i in row.get('material_ids', [])]
+                if roles.count('legal_identity') != 1 or roles.count('authorization') != 1 or len(roles) != 2:
+                    errors.append('请选择一份授权人身份证和一份代理人身份证。')
             if not heading:
                 errors.append("未找到有效填充位置，请选择原模板中的位置。")
             location = row.get("locator_id")
             if location and location in used_locations:
                 errors.append("同一位置被多个栏目重复使用，请核对映射。")
                 used_locations[location]["issues"].append("同一位置被多个栏目重复使用，请核对映射。")
+                if 'invalid' not in used_locations[location]['issue_types']:
+                    used_locations[location]['issue_types'].append('invalid')
                 used_locations[location]["status"] = "blocked"
             if location:
                 used_locations[location] = row
             ids = row.get("material_ids") or []
+            if category_id == 'text_template' and heading:
+                from material_rules import text_kind
+                if text_kind(heading['title']) == 'authorization' and len(ids) != 1:
+                    errors.append('授权书请选择一份文字模板，核对后再附双方身份证。')
             if len(ids) != len(set(ids)):
                 errors.append("同一栏目重复选择同一材料。")
             if not ids:
@@ -658,6 +744,7 @@ def validate_mappings(mappings, materials, headings, categories=None):
                 errors.append('原授权书已含证件图片，系统保留原件；请先核对已有附件，避免重复或混用人员。')
             covered = set()
             valid_materials = []
+            supplementary_year_errors = []
             for material_id in ids:
                 material = by_material.get(material_id)
                 if not material:
@@ -672,7 +759,13 @@ def validate_mappings(mappings, materials, headings, categories=None):
                         check_category = 'legal_identity'
                         target = dict(target, identity_attachment_target=True)
                 accepted_years = sorted({y for option in year_options for y in option}) if year_options else row['required_years']
-                errs, warns = _check_material(material, check_category, accepted_years, target, special)
+                errs, warns = _check_material(material, check_category, accepted_years, target, special, context)
+                # Audit years describe required coverage, not a ban on supplementary reports.
+                if category_id == 'audit_report':
+                    year_error = f"{str(material.get('name') or material.get('id') or '材料')}：年度与目标要求不符。"
+                    if year_error in errs:
+                        supplementary_year_errors.append(year_error)
+                        errs = [err for err in errs if err != year_error]
                 errors.extend(errs)
                 warnings.extend(warns)
                 if not errs:
@@ -682,22 +775,30 @@ def validate_mappings(mappings, materials, headings, categories=None):
                 from material_rules import tax_coverage_errors
                 errors.extend(tax_coverage_errors(valid_materials, heading))
             missing_years = sorted(set(row["required_years"]) - covered)
+            if supplementary_year_errors:
+                coverage_complete = not missing_years and (not year_options or any(set(option) <= covered for option in year_options))
+                if coverage_complete:
+                    warnings.append('已覆盖要求年度，其他年度报告作为补充材料。')
+                else:
+                    errors.extend(supplementary_year_errors)
             if missing_years:
-                errors.append("缺少要求年度：" + "、".join(map(str, missing_years)) + "。")
+                errors.append("缺少要求年度：" + "、".join(map(str, missing_years)) + "。", 'missing_years')
             if year_options and not any(set(option) <= covered for option in year_options):
                 errors.append('缺少可接受年度：' + ' 或 '.join('、'.join(map(str, option)) for option in year_options) + '。')
             row["status"] = "blocked" if errors else "ready"
         elif action == "skip":
-            row["status"] = "skipped" if not errors else "blocked"
-            warnings.append("本栏目人工跳过，不视为材料齐全。")
+            row["status"] = ("ready" if retained_form else "skipped") if not errors else "blocked"
+            if retained_form or (category_id == 'text_template' and heading and heading.get('authorization_original_body_present')):
+                row['preserve_original'] = True
         else:
             row["status"] = "missing" if not errors else "blocked"
             errors.append("本栏目待补材料。" if heading else "模板未识别到本栏目位置，需人工核对；初稿将在末尾列出。")
         if category_id == "audit_report" and not row["required_years"] and not year_options:
-            warnings.append("目标审计栏目未注明年度，不默认采用2023/2024年；请按本项目要求核对。")
-        if row.get("existing_content"):
+            warnings.append("原文未明确审计年度，请核对。")
+        if row.get("existing_content") and not row.get('preserve_original'):
             warnings.append("本节已有内容，将保留并追加，请检查旧版或重复材料。")
         row["issues"], row["warnings"] = _unique(errors), _unique(warnings)
+        row['issue_types'] = _unique(errors.types)
         row["confirmed"] = row.get("confirmed") is True
         result.append(row)
     return result
@@ -759,11 +860,13 @@ def _remove_token(record):
         cursor = node_end
 
 
-def _vacant_cells(document, record, file_count):
+def _vacant_cells(document, record, file_count, occupied_tables=None):
     """Share the exact empty-table target between export and location preview."""
     if record["kind"] == "placeholder":
         return None
     for block in record["_own"]:
+        if occupied_tables and block in occupied_tables:
+            continue
         if block.tag != qn("w:tbl") or _text(block).strip() or _drawing(block):
             continue
         table = Table(block, document._body)
@@ -794,6 +897,11 @@ def _insert_materials(document, record, selected):
                 break
     page_material = False
     for material in selected:
+        if record['kind'] == 'authorization_bundle' and material['mode'] != 'text':
+            role = '授权人身份证' if material['category_id'] == 'legal_identity' else '代理人身份证'
+            paragraph = _paragraph_after(anchor, document, role)
+            paragraph.paragraph_format.keep_with_next = True
+            anchor = paragraph._p
         if material["mode"] == "text":
             for line in str(material["content"]).splitlines() or [""]:
                 paragraph = _paragraph_after(anchor, document, line)
@@ -850,6 +958,7 @@ def _insert_materials(document, record, selected):
         if not already_break:
             paragraph = _paragraph_after(anchor, document)
             paragraph.paragraph_format.page_break_before = True
+    return anchor
 
 
 def _update_fields(document):
@@ -866,12 +975,12 @@ def _update_fields(document):
     element.set(qn("w:val"), "true")
 
 
-def export_document(template_path, output_path, mappings, materials, mode="draft", categories=None, progress=None):
+def export_document(template_path, output_path, mappings, materials, mode="draft", categories=None, progress=None, framework_drafts=None):
     if mode not in {"draft", "reviewed"}:
         raise ValueError("导出模式无效。")
     if Path(template_path).resolve() == Path(output_path).resolve():
         raise ValueError("不能覆盖原始 Word 模板。")
-    if not mappings:
+    if not mappings and not (framework_drafts is not None and mode == "draft"):
         raise ValueError("没有可导出的栏目，请先扫描模板。")
     if mode == "reviewed" and any(row.get("confirmed") is not True for row in mappings):
         raise ValueError("所有栏目必须先逐项确认后才能导出。")
@@ -893,7 +1002,8 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
     records, skipped = _inspect(document, enabled)
     by_locator = {r["id"]: r for r in records}
     public = [_public(r) for r in records]
-    checked = validate_mappings(mappings, materials, public, categories)
+    checked = validate_mappings(mappings, materials, public, categories,
+                                preserve_forms=framework_drafts is not None)
     if mode == 'reviewed' and any(row.get('confirmed') is not True for row in checked):
         raise ValueError('填充方式已变更，请重新核对并确认栏目后再导出。')
     invalid = [r for r in checked if r["status"] == "blocked"]
@@ -937,14 +1047,26 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
     # Resolve every target against the original tree. Reverse token order keeps
     # multiple same-paragraph token occurrences stable while they are removed.
     ordered = sorted(checked, key=lambda r: (by_locator.get(r.get("locator_id"), {}).get("_path", (999999,)), by_locator.get(r.get("locator_id"), {}).get("_occurrence", -1)), reverse=True)
+    # Body templates are inserted first. Their exact final paragraph becomes the
+    # attachment anchor, so two identity sets cannot land above the new body.
+    ordered.sort(key=lambda r: bool(by_locator.get(r.get('locator_id'), {}).get('authorization_source')))
     report(20, "正在填入材料")
     for index, row in enumerate(ordered):
         report(20 + int(65 * index / max(1, len(ordered))), f"正在填入材料 {index + 1}/{len(ordered)}")
         record = by_locator.get(row.get("locator_id"))
         selected = [by_material[i] for i in row.get("material_ids", [])] if row["action"] == "fill" else []
-        if row["status"] == "ready":
-            _insert_materials(document, record, selected)
-        else:
+        if row.get('preserve_original'):
+            pass
+        elif row["status"] == "ready":
+            if record.get('authorization_source'):
+                selected = sorted(selected, key=lambda m: m['category_id'] != 'legal_identity')
+                selected = [dict(m, mode='side_by_side') for m in selected]
+                record = dict(record, _own=[])
+            anchor = _insert_materials(document, record, selected)
+            for target in records:
+                if target.get('authorization_source') == row.get('locator_id'):
+                    target['_anchor'] = anchor
+        elif not row.get('preserve_original'):
             label = "待补" if row["status"] == "missing" else "人工跳过"
             text = f"【{label}：{row['title']}】" + (" " + row["note"] if row.get("note") else "")
             if record:
@@ -959,6 +1081,7 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
         warnings.extend(row.get("warnings", []))
         results.append({"mapping_id": row["id"], "category_id": row["category_id"], "title": row["title"],
                         "locator_id": row.get("locator_id", ""), "status": row["status"], "action": row["action"],
+                        "preserve_original": bool(row.get('preserve_original')),
                         "material_ids": [m["id"] for m in selected], "material_names": [m["name"] for m in selected],
                         "file_count": sum(len(m.get("files", [])) for m in selected if m["mode"] != "text"),
                         "issues": row["issues"], "warnings": row.get("warnings", []), "note": row.get("note", "")})
@@ -968,6 +1091,9 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
         run = Paragraph(notice, document._body).add_run("待补初稿｜仅供内部核对，不可直接投标。请处理红色标记并检查原模板残留信息、签章及页码。")
         run.font.color.rgb = RGBColor(192, 0, 0)
         run.font.bold = True
+    if framework_drafts:
+        from chapter_drafts import insert_responses
+        insert_responses(document, framework_drafts)
     report(88, "正在保存 Word 文件")
     _update_fields(document)
     destination = Path(output_path)
@@ -986,6 +1112,6 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
         raise ValueError("导出 Word 失败，未生成完整结果。") from exc
     order = {r["id"]: index for index, r in enumerate(checked)}
     results.sort(key=lambda r: order[r["mapping_id"]])
-    return {"results": results, "filled_count": sum(r["status"] == "ready" for r in checked),
+    return {"results": results, "filled_count": sum(r["status"] == "ready" and not r.get('preserve_original') for r in checked),
             "missing_count": sum(r["status"] == "missing" for r in checked),
             "skipped_count": sum(r["status"] == "skipped" for r in checked), "warnings": _unique(warnings)}

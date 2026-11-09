@@ -89,6 +89,7 @@ class LocationPreview:
         self._temporary = tempfile.TemporaryDirectory(prefix='bid-page-preview-')
         self.root = Path(self._temporary.name)
         self.cache = OrderedDict()
+        self.composed_grants = OrderedDict()
         # Inline previews ask once per review card: recognize each template
         # version once. Every request still hashes the bytes it actually uses.
         self._recognized = OrderedDict()
@@ -97,6 +98,7 @@ class LocationPreview:
     def close(self):
         with _RENDER_LOCK:
             self.cache.clear()
+            self.composed_grants.clear()
             self._temporary.cleanup()
         with self._recognized_lock:
             self._recognized.clear()
@@ -187,34 +189,74 @@ class LocationPreview:
         raw = Path(snapshot['template']).read_bytes()
         if hashlib.sha256(raw).hexdigest() != snapshot['template_hash']:
             raise ValueError('模板已变化，请重新上传或扫描后再预览。')
+        template_hash = snapshot['template_hash']
+        if snapshot.get('authorization_body'):
+            # Render a private composition of the reviewed body. Never alter the
+            # source or a cached document when showing the subsequent image slot.
+            document = engine._read_template(io.BytesIO(raw))
+            records, _ = engine._inspect(document, snapshot['categories'])
+            target = next((r for r in records if r['id'] == snapshot['locator_id']), None)
+            source = next((r for r in records if target and r['id'] == target.get('authorization_source')), None)
+            if source is None:
+                raise ValueError('授权书正文位置已变化，请重新核对。')
+            engine._insert_materials(document, source, [snapshot['authorization_body']])
+            output = io.BytesIO()
+            document.save(output)
+            raw = output.getvalue()
+            template_hash = hashlib.sha256(raw).hexdigest()
         if not snapshot['locator_id']:
             with _RENDER_LOCK:
-                entry = self._build(raw, snapshot['template_hash'])
+                entry = self._build(raw, template_hash)
                 return {'preview_id': entry['preview_id'], 'page_count': entry['page_count'],
                         'initial_page': 1, 'target_pages': [], 'markers': [],
                         'title': '标书原页',
                         'description': '尚未选择插入位置。可先翻页查看原文，再从上方选择位置查看标记。',
                         'template_name': snapshot['template_name']}
-        document, records = self._recognize(raw, snapshot['template_hash'], snapshot['categories'])
+        document, records = self._recognize(raw, template_hash, snapshot['categories'])
         record = records.get(snapshot['locator_id'])
         if record is None:
             raise ValueError('所选插入位置已失效，请重新扫描后再选择。')
         if record['kind'] == 'common_appendix':
             with _RENDER_LOCK:
-                entry = self._build(raw, snapshot['template_hash'])
+                entry = self._build(raw, template_hash)
                 return {'preview_id': entry['preview_id'], 'page_count': entry['page_count'],
                         'initial_page': entry['page_count'], 'target_pages': [], 'markers': [],
                         'title': record['title'],
-                        'description': '原稿没有独立填报位置。导出时会在原文末尾另起一页新增通用材料区；此处展示原稿末页，新增材料不会插入采购要求或评分规则。',
+                        'description': '将在文末另起一页新增材料区；当前预览为原稿末页。',
+                        'template_name': snapshot['template_name']}
+        if snapshot.get('preserve_original'):
+            # Show the retained section itself, with no insertion or skip marker.
+            paragraph = record['_element']
+            if paragraph.tag == qn('w:tbl'):
+                paragraph = next(paragraph.iter(qn('w:p')))
+            with _RENDER_LOCK:
+                entry = self._build(raw, template_hash)
+                path = engine._xml_path(paragraph, document.element.body)
+                name = entry['names'].get(path, {}).get('S')
+                location = entry['destinations'].get(name)
+                if not location and record['_inside_table']:
+                    location = self._cell_location(document, paragraph, entry)
+                if not location:
+                    raise ValueError('本节未能可靠定位到原页，请检查模板。')
+                return {'preview_id': entry['preview_id'], 'page_count': entry['page_count'],
+                        'initial_page': location['page'], 'target_pages': [location['page']],
+                        'markers': [], 'title': record['title'], 'description': '',
                         'template_name': snapshot['template_name']}
         targets = []
         selected = snapshot['materials']
+        if record.get('authorization_source'):
+            record = dict(record, _own=[])
+            selected = [dict(m, mode='side_by_side') for m in selected]
         use_anchor = not selected or snapshot['action'] != 'fill'
+        occupied_tables = set()
         if snapshot['action'] == 'fill':
             for material in selected:
-                cells = (engine._vacant_cells(document, record, len(material.get('files', [])))
+                cells = (engine._vacant_cells(document, record, len(material.get('files', [])), occupied_tables)
                          if material.get('mode') == 'side_by_side' and material.get('files') else None)
                 if cells is not None:
+                    # Export fills this table before considering the next material.
+                    # Reserve it locally; cached document XML must remain read-only.
+                    occupied_tables.add(next(e for e in cells[0]._tc.iterancestors() if e.tag == qn('w:tbl')))
                     for index, cell in enumerate(cells[:len(material['files'])]):
                         targets.append((cell.paragraphs[0]._p, 'S', 'cell', f'第 {index + 1} 张图片填入此单元格'))
                 else:
@@ -233,20 +275,13 @@ class LocationPreview:
                 targets.append((paragraph, 'E', 'after', '材料从此处之后插入'))
         if snapshot['action'] == 'missing':
             description = '当前保留为缺项，导出初稿时会在此位置之后添加待补标记。'
-        elif snapshot['action'] == 'skip':
-            description = '当前选择跳过，不填入材料；导出初稿时会在此位置之后添加跳过说明。'
-        elif record['kind'] == 'placeholder':
-            description = '导出时移除本占位符，并在其所在段落之后插入材料。'
-        elif any(t[2] == 'cell' for t in targets) and not use_anchor:
-            description = '图片将填入本节现有的空白表格单元格。'
-        elif after_table:
-            description = '材料将在此表格结束后追加，原表格内容保留。'
         else:
-            description = '材料将在本节原有内容结束后追加；原文保留。'
+            # The precise paragraph/cell/table markers already describe placement.
+            description = ''
         if snapshot['action'] == 'fill' and any(m.get('mode') == 'page' for m in selected) and not record['_inside_table']:
-            description += '整页图片材料会从此处之后另起一页。'
+            description = '整页图片将另起一页。'
         with _RENDER_LOCK:
-            entry = self._build(raw, snapshot['template_hash'])
+            entry = self._build(raw, template_hash)
             markers, anchors = [], []
             for paragraph, edge, kind, label in targets:
                 path = engine._xml_path(paragraph, document.element.body)
