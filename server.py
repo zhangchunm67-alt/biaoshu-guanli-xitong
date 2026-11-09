@@ -1269,7 +1269,17 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_port
         return {f'127.0.0.1:{port}', f'localhost:{port}'}
 
+    def access_mode(self):
+        """remote = 花生壳映射口（材料永不可下）；local = 本机环回口；None = 未启用花生壳。"""
+        return getattr(self.server, 'access_mode', None)
+
     def allowed_hosts(self):
+        mode = self.access_mode()
+        if mode == 'remote':
+            public = getattr(self.server, 'public_host', None)
+            return {public.lower()} if public else set()
+        if mode == 'local':
+            return self.local_hosts()
         hosts = self.local_hosts()
         public = getattr(self.server, 'public_host', None)
         if public:
@@ -1292,10 +1302,16 @@ class Handler(BaseHTTPRequestHandler):
         return parsed.scheme, parsed.hostname.lower().rstrip('.'), port
 
     def allowed_origin_keys(self):
-        keys = {('http', '127.0.0.1', self.server.server_port),
-                ('http', 'localhost', self.server.server_port)}
+        mode = self.access_mode()
+        if mode == 'remote':
+            keys = set()
+        else:
+            keys = {('http', '127.0.0.1', self.server.server_port),
+                    ('http', 'localhost', self.server.server_port)}
+            if mode == 'local':
+                return keys
         public = getattr(self.server, 'public_host', None)
-        if public:
+        if public and mode != 'local':
             try:
                 parsed = urlsplit('//' + public)
                 host = (parsed.hostname or '').lower().rstrip('.')
@@ -1321,11 +1337,17 @@ class Handler(BaseHTTPRequestHandler):
         return (self.headers.get('Host') or '').strip().lower()
 
     def is_public_request(self):
+        # 花生壳映射口与本机环回口拆开：不靠 Host 判断，避免穿透流量伪造 Host 绕过材料门禁。
+        mode = self.access_mode()
+        if mode == 'remote':
+            return True
+        if mode == 'local':
+            return False
         public = getattr(self.server, 'public_host', None)
         return bool(public) and self.request_host() == public.lower()
 
     def require_intranet_files(self):
-        """身份证、营业执照等材料原件仅允许本机/内网入口读取，花生壳外网不可下载。"""
+        """身份证、营业执照等材料原件仅允许本机环回入口读取，花生壳映射口不可下载。"""
         if self.is_public_request():
             raise PermissionError('营业执照、身份证等材料原件仅限内网查看；花生壳外网不可下载或导出含材料文件。')
 
@@ -1346,10 +1368,14 @@ class Handler(BaseHTTPRequestHandler):
             for material in payload.get(key) or []:
                 self._redact_material_files(material)
         self._redact_material_files(payload)
+        intranet_port = getattr(self.server, 'intranet_port', None)
+        local_hint = (f'http://127.0.0.1:{intranet_port}/'
+                      if intranet_port else '本机环回入口')
         payload['remote_access'] = {
             'public': True,
             'materials_intranet_only': True,
-            'message': '外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机内网。',
+            'intranet_port': intranet_port,
+            'message': f'外网可编制标书；营业执照、身份证等材料原件与含材料导出请在本机打开 {local_hint}',
         }
         return payload
 
@@ -1366,7 +1392,12 @@ class Handler(BaseHTTPRequestHandler):
         return bool(morsel and secrets.compare_digest(unquote(morsel.value), token))
 
     def login_page(self, message='', status=401):
-        notice = html.escape(message or '请输入访问口令。营业执照、身份证等材料原件仅本机可查看。')
+        intranet_port = getattr(self.server, 'intranet_port', None)
+        if self.access_mode() == 'remote' and intranet_port:
+            default = f'请输入访问口令。材料原件请在本机打开 http://127.0.0.1:{intranet_port}/'
+        else:
+            default = '请输入访问口令。营业执照、身份证等材料原件仅本机可查看。'
+        notice = html.escape(message or default)
         body = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>标书管理系统 · 访问验证</title>
 <style>body{{font:16px/1.5 system-ui,sans-serif;margin:0;background:#f4f6f8;color:#1f2937}}
@@ -1546,6 +1577,7 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 self.require_intranet_files()
                 return self.send_bytes(store.path(f'exports/{item["id"]}.docx').read_bytes(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename=item['filename'])
             if bits[3] == 'report':
+                self.require_intranet_files()
                 return self.send_bytes(store.path(f'exports/{item["id"]}.json').read_bytes(), 'application/json; charset=utf-8', filename=item['filename'].replace('.docx', '_核对报告.json'))
         if method in {'POST', 'PATCH'}:
             body = self.body()
@@ -1759,8 +1791,22 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
         self.json_response({'error': '不支持跨源访问'}, 403)
 
 
+def _attach_server(httpd, *, store, bind_host, public, token, access_mode=None, intranet_port=None,
+                   owns_store=True):
+    httpd.daemon_threads = True
+    httpd.store = store
+    httpd.bind_host = bind_host
+    httpd.public_host = public
+    httpd.access_token = token
+    httpd.access_mode = access_mode
+    httpd.intranet_port = intranet_port
+    httpd.owns_store = owns_store
+    return httpd
+
+
 def create_server(port=8766, data_dir=DEFAULT_DATA, seed=None, source_root=SOURCE_ROOT,
-                  host='127.0.0.1', public_host=None, access_token=None):
+                  host='127.0.0.1', public_host=None, access_token=None, access_mode=None,
+                  intranet_port=None, store=None):
     seed = Path(data_dir).resolve() == DEFAULT_DATA.resolve() if seed is None else seed
     bind_host = normalize_bind_host(host)
     public = normalize_public_host(public_host) if public_host else None
@@ -1769,16 +1815,68 @@ def create_server(port=8766, data_dir=DEFAULT_DATA, seed=None, source_root=SOURC
         raise ValueError('启用花生壳公网域名时必须设置访问口令（--access-token）')
     if token and not public and bind_host == '0.0.0.0':
         raise ValueError('绑定 0.0.0.0 时请同时配置 --public-host 与 --access-token')
-    store = Store(data_dir, seed=seed, source_root=source_root)
+    if public and access_mode is None:
+        access_mode = 'remote'
+    if access_mode not in {None, 'remote', 'local'}:
+        raise ValueError('access_mode 仅支持 remote 或 local')
+    if access_mode and not public:
+        raise ValueError('未启用公网域名时不能指定 access_mode')
+    if access_mode == 'local':
+        bind_host = '127.0.0.1'
+    owns_store = store is None
+    store = store or Store(data_dir, seed=seed, source_root=source_root)
     try:
         httpd = ThreadingHTTPServer((bind_host, port), Handler)
-        httpd.daemon_threads = True
-        httpd.store = store
-        httpd.bind_host = bind_host
-        httpd.public_host = public
-        httpd.access_token = token
-        return httpd
+        return _attach_server(
+            httpd, store=store, bind_host=bind_host, public=public, token=token,
+            access_mode=access_mode, intranet_port=intranet_port, owns_store=owns_store)
     except Exception:
+        if owns_store:
+            store.close()
+        raise
+
+
+def create_oray_servers(port=8766, intranet_port=None, data_dir=DEFAULT_DATA, seed=None,
+                        source_root=SOURCE_ROOT, host='0.0.0.0', public_host=None, access_token=None):
+    """花生壳模式：映射口（remote）永不下发材料；本机环回口（local）可查看材料。"""
+    public = normalize_public_host(public_host) if public_host else None
+    if not public:
+        raise ValueError('create_oray_servers 需要 public_host')
+    remote_port = int(port)
+    requested_local = None if intranet_port in (None, 0) else int(intranet_port)
+    if remote_port < 0 or remote_port > 65535:
+        raise ValueError('端口号无效')
+    if requested_local is not None and (requested_local < 1 or requested_local > 65535):
+        raise ValueError('本机材料端口号无效')
+    if requested_local is not None and remote_port not in {0} and requested_local == remote_port:
+        raise ValueError('本机材料端口不能与花生壳映射端口相同')
+    seed_flag = Path(data_dir).resolve() == DEFAULT_DATA.resolve() if seed is None else seed
+    store = Store(data_dir, seed=seed_flag, source_root=source_root)
+    remote = None
+    try:
+        # 先绑映射口，再决定本机口：未指定时用映射口+1；映射口为 0（测试）时交给系统分配。
+        remote = create_server(
+            port=remote_port, data_dir=data_dir, seed=seed_flag, source_root=source_root,
+            host=host, public_host=public, access_token=access_token, access_mode='remote',
+            intranet_port=None, store=store)
+        remote.owns_store = True
+        if requested_local is None:
+            local_port = 0 if remote_port == 0 else remote.server_port + 1
+        else:
+            local_port = requested_local
+        if local_port == remote.server_port:
+            raise ValueError('本机材料端口不能与花生壳映射端口相同')
+        local = create_server(
+            port=local_port, data_dir=data_dir, seed=False, source_root=source_root,
+            host='127.0.0.1', public_host=public, access_token=access_token, access_mode='local',
+            intranet_port=None, store=store)
+        local.owns_store = False
+        remote.intranet_port = local.server_port
+        local.intranet_port = local.server_port
+        return remote, local
+    except Exception:
+        if remote is not None:
+            remote.server_close()
         store.close()
         raise
 
@@ -1788,6 +1886,8 @@ def main():
     writing_model.load_local_env(APP_DIR)
     parser = argparse.ArgumentParser(description='标书管理系统（默认仅本机；花生壳模式可远程访问）')
     parser.add_argument('--port', type=int, default=8766)
+    parser.add_argument('--intranet-port', type=int, default=0,
+                        help='花生壳模式下本机材料入口端口，默认映射口+1')
     parser.add_argument('--host', default='127.0.0.1', help='监听地址：127.0.0.1（默认）或 0.0.0.0（花生壳）')
     parser.add_argument('--public-host', default='', help='花生壳访问域名，例如 xxx.imwork.net')
     parser.add_argument('--access-token', default='', help='远程访问口令；启用公网域名时必填')
@@ -1797,26 +1897,43 @@ def main():
     args = parser.parse_args()
     public_host = args.public_host.strip() or None
     access_token = args.access_token.strip() or None
-    server = create_server(args.port, args.data_dir, args.seed, host=args.host,
-                           public_host=public_host, access_token=access_token)
+    intranet_port = args.intranet_port or None
+    local_server = None
+    if public_host:
+        server, local_server = create_oray_servers(
+            port=args.port, intranet_port=intranet_port, data_dir=args.data_dir, seed=args.seed,
+            host=args.host, public_host=public_host, access_token=access_token)
+    else:
+        server = create_server(args.port, args.data_dir, args.seed, host=args.host,
+                               public_host=public_host, access_token=access_token)
+
     def stop_service(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stop_service)
-    local = f'http://127.0.0.1:{server.server_port}'
-    print(f'标书管理系统已启动：{local}', flush=True)
-    if server.public_host:
-        print(f'花生壳远程入口：http://{server.public_host}/ （须先在花生壳映射到 127.0.0.1:{server.server_port}）', flush=True)
-        print('外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机内网。', flush=True)
+    open_url = (f'http://127.0.0.1:{local_server.server_port}'
+                if local_server else f'http://127.0.0.1:{server.server_port}')
+    if local_server:
+        print(f'本机材料入口：{open_url} （仅 127.0.0.1，勿映射到花生壳）', flush=True)
+        print(f'花生壳映射口：http://127.0.0.1:{server.server_port}/ （外网不可下载材料）', flush=True)
+        print(f'花生壳远程入口：http://{server.public_host}/ （须映射到 127.0.0.1:{server.server_port}）', flush=True)
+        print('外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机材料入口。', flush=True)
+        threading.Thread(target=local_server.serve_forever, daemon=True).start()
+    else:
+        print(f'标书管理系统已启动：{open_url}', flush=True)
     if args.open:
         import webbrowser
-        threading.Timer(0.5, webbrowser.open, args=(local,)).start()
+        threading.Timer(0.5, webbrowser.open, args=(open_url,)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if local_server:
+            local_server.shutdown()
+            local_server.server_close()
         server.server_close()
-        server.store.close()
+        if getattr(server, 'owns_store', True):
+            server.store.close()
 
 
 if __name__ == '__main__':

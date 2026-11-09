@@ -33,11 +33,14 @@ if [[ -z "${ORAY_PUBLIC_HOST:-}" || -z "${ORAY_ACCESS_TOKEN:-}" ]]; then
   exit 1
 fi
 PORT="${ORAY_PORT:-8766}"
-echo "本机服务：http://127.0.0.1:${PORT}"
+INTRANET_PORT="${ORAY_INTRANET_PORT:-$((PORT + 1))}"
+echo "本机材料入口：http://127.0.0.1:${INTRANET_PORT}/ （仅本机，勿映射到花生壳）"
+echo "花生壳映射口：127.0.0.1:${PORT}"
 echo "花生壳域名：http://${ORAY_PUBLIC_HOST}/ （请在花生壳客户端映射到 127.0.0.1:${PORT}）"
-echo '外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机。'
+echo '外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机材料入口。'
 echo '已启用防空闲休眠；合盖、手动睡眠或退出花生壳后外网会断开。'
 echo '保留这个窗口以持续运行；按 Control+C 停止。'
 export PYTHONDONTWRITEBYTECODE=1
 exec /usr/bin/caffeinate -i "$APP_PYTHON" server.py --host 0.0.0.0 --port "$PORT" \
+  --intranet-port "$INTRANET_PORT" \
   --public-host "$ORAY_PUBLIC_HOST" --access-token "$ORAY_ACCESS_TOKEN" "$@"

@@ -416,23 +416,31 @@ class OrayRemoteAccessTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='bid-oray-test-')
         self.public = 'demo.imwork.net'
         self.token = 'test-access-token'
-        self.httpd = server.create_server(
+        self.httpd, self.intranet = server.create_oray_servers(
             port=0, data_dir=self.tmp.name, seed=False, host='127.0.0.1',
             public_host=self.public, access_token=self.token)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.intranet_thread = threading.Thread(target=self.intranet.serve_forever, daemon=True)
         self.thread.start()
+        self.intranet_thread.start()
         self.port = self.httpd.server_port
+        self.intranet_port = self.intranet.server_port
         self.local = f'http://127.0.0.1:{self.port}'
+        self.intranet_base = f'http://127.0.0.1:{self.intranet_port}'
         self.public_origin = f'http://{self.public}'
 
     def tearDown(self):
         self.httpd.shutdown()
+        self.intranet.shutdown()
         self.httpd.server_close()
+        self.intranet.server_close()
         self.thread.join()
+        self.intranet_thread.join()
         self.httpd.store.close()
         self.tmp.cleanup()
 
-    def call(self, method, path, *, host=None, origin=None, headers=None, payload=None, data=None, content_type=None):
+    def call(self, method, path, *, host=None, origin=None, headers=None, payload=None, data=None,
+             content_type=None, base=None):
         values = {}
         if host:
             values['Host'] = host
@@ -444,7 +452,7 @@ class OrayRemoteAccessTests(unittest.TestCase):
             values['Content-Type'] = 'application/json'
         values.update(headers or {})
         body = data if data is not None else (json.dumps(payload).encode() if payload is not None else None)
-        req = urllib.request.Request(self.local + path, data=body, method=method, headers=values)
+        req = urllib.request.Request((base or self.local) + path, data=body, method=method, headers=values)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         try:
             with opener.open(req, timeout=10) as response:
@@ -457,6 +465,34 @@ class OrayRemoteAccessTests(unittest.TestCase):
             ctype = error.headers.get('Content-Type', '') if error.headers else ''
             parsed = json.loads(raw) if 'json' in ctype and raw else raw
             return parsed, dict(error.headers or {}), error.code
+
+    def seed_material_and_export(self):
+        material = self.httpd.store.put('material', {
+            'id': 'material_oray', 'name': '营业执照', 'subject': server.SUBJECT,
+            'category_id': 'business_license', 'mode': 'page', 'file_ids': [],
+            'revision': 0, 'created_at': server.now(), 'updated_at': server.now()})
+        raw = io.BytesIO()
+        Image.new('RGB', (20, 10), 'white').save(raw, 'PNG')
+        file_id = 'file_oray'
+        path = Path(self.tmp.name) / 'files'
+        path.mkdir(parents=True, exist_ok=True)
+        (path / (file_id + '.png')).write_bytes(raw.getvalue())
+        self.httpd.store.put('file', {
+            'id': file_id, 'name': '执照.png', 'mime': 'image/png', 'storage': f'files/{file_id}.png',
+            'rotation': 0, 'width': 20, 'height': 10, 'source': ''})
+        material['file_ids'] = [file_id]
+        self.httpd.store.put('material', material)
+        export = self.httpd.store.put('export', {
+            'id': 'export_oray', 'project_id': 'p', 'project_name': 'x', 'filename': 'a.docx',
+            'mode': 'draft', 'created_at': server.now()})
+        exports = Path(self.tmp.name) / 'exports'
+        exports.mkdir(parents=True, exist_ok=True)
+        (exports / (export['id'] + '.docx')).write_bytes(b'PK')
+        (exports / (export['id'] + '.json')).write_bytes(json.dumps({
+            'id': export['id'], 'files': [{'id': file_id, 'name': '执照.png', 'sha256': 'abc'}],
+            'subject': server.SUBJECT}).encode())
+        self.httpd.store.db.commit()
+        return material, file_id, export
 
     def test_public_host_requires_token_and_allows_login(self):
         body, _, status = self.call('GET', '/api/bootstrap', host=self.public)
@@ -478,6 +514,7 @@ class OrayRemoteAccessTests(unittest.TestCase):
             headers={'Cookie': cookie.split(';', 1)[0]})
         self.assertEqual(200, status)
         self.assertTrue(state['remote_access']['materials_intranet_only'])
+        self.assertEqual(self.intranet_port, state['remote_access']['intranet_port'])
 
     def test_https_forwarded_login_cookie_is_secure(self):
         _, headers, status = self.call(
@@ -500,22 +537,7 @@ class OrayRemoteAccessTests(unittest.TestCase):
             self.assertEqual(303, status)
 
     def test_public_host_blocks_material_files_and_exports(self):
-        material = self.httpd.store.put('material', {
-            'id': 'material_oray', 'name': '营业执照', 'subject': server.SUBJECT,
-            'category_id': 'business_license', 'mode': 'page', 'file_ids': [],
-            'revision': 0, 'created_at': server.now(), 'updated_at': server.now()})
-        raw = io.BytesIO()
-        Image.new('RGB', (20, 10), 'white').save(raw, 'PNG')
-        file_id = 'file_oray'
-        path = Path(self.tmp.name) / 'files'
-        path.mkdir(parents=True, exist_ok=True)
-        (path / (file_id + '.png')).write_bytes(raw.getvalue())
-        self.httpd.store.put('file', {
-            'id': file_id, 'name': '执照.png', 'mime': 'image/png', 'storage': f'files/{file_id}.png',
-            'rotation': 0, 'width': 20, 'height': 10, 'source': ''})
-        material['file_ids'] = [file_id]
-        self.httpd.store.put('material', material)
-        self.httpd.store.db.commit()
+        material, file_id, export = self.seed_material_and_export()
         auth = {'Authorization': f'Bearer {self.token}'}
         detail, _, status = self.call('GET', '/api/materials/' + material['id'], host=self.public, headers=auth)
         self.assertEqual(200, status)
@@ -523,14 +545,46 @@ class OrayRemoteAccessTests(unittest.TestCase):
         self.assertTrue(detail['files_intranet_only'])
         _, _, status = self.call('GET', '/api/files/' + file_id, host=self.public, headers=auth)
         self.assertEqual(403, status)
-        export = self.httpd.store.put('export', {
-            'id': 'export_oray', 'project_id': 'p', 'project_name': 'x', 'filename': 'a.docx',
-            'mode': 'draft', 'created_at': server.now()})
-        (Path(self.tmp.name) / 'exports').mkdir(parents=True, exist_ok=True)
-        (Path(self.tmp.name) / 'exports' / (export['id'] + '.docx')).write_bytes(b'PK')
-        self.httpd.store.db.commit()
         _, _, status = self.call('GET', '/api/exports/' + export['id'] + '/download', host=self.public, headers=auth)
         self.assertEqual(403, status)
+        _, _, status = self.call('GET', '/api/exports/' + export['id'] + '/report', host=self.public, headers=auth)
+        self.assertEqual(403, status)
+
+    def test_host_spoof_cannot_unlock_materials_on_mapped_port(self):
+        _, file_id, export = self.seed_material_and_export()
+        auth = {'Authorization': f'Bearer {self.token}'}
+        spoof = f'127.0.0.1:{self.port}'
+        _, _, status = self.call('GET', '/api/files/' + file_id, host=spoof, headers=auth)
+        self.assertEqual(403, status)
+        _, _, status = self.call('GET', '/api/exports/' + export['id'] + '/download', host=spoof, headers=auth)
+        self.assertEqual(403, status)
+        _, _, status = self.call('GET', '/api/exports/' + export['id'] + '/report', host=spoof, headers=auth)
+        self.assertEqual(403, status)
+
+    def test_intranet_port_allows_material_files_and_reports(self):
+        material, file_id, export = self.seed_material_and_export()
+        auth = {'Authorization': f'Bearer {self.token}'}
+        local_host = f'127.0.0.1:{self.intranet_port}'
+        detail, _, status = self.call(
+            'GET', '/api/materials/' + material['id'], host=local_host, headers=auth,
+            base=self.intranet_base)
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(detail['files']))
+        self.assertNotIn('files_intranet_only', detail)
+        body, _, status = self.call(
+            'GET', '/api/files/' + file_id, host=local_host, headers=auth, base=self.intranet_base)
+        self.assertEqual(200, status)
+        self.assertTrue(body.startswith(b'\x89PNG'))
+        raw, _, status = self.call(
+            'GET', '/api/exports/' + export['id'] + '/download', host=local_host, headers=auth,
+            base=self.intranet_base)
+        self.assertEqual(200, status)
+        self.assertEqual(b'PK', raw)
+        report, _, status = self.call(
+            'GET', '/api/exports/' + export['id'] + '/report', host=local_host, headers=auth,
+            base=self.intranet_base)
+        self.assertEqual(200, status)
+        self.assertEqual(file_id, report['files'][0]['id'])
 
     def test_wrong_host_still_rejected_with_token(self):
         _, _, status = self.call(
