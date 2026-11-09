@@ -23,6 +23,7 @@ node_modules/
 *.log
 
 考题/
+红线评测集/
 测试结果/
 outputs/
 tmp/
