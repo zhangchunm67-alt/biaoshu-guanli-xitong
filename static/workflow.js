@@ -13,7 +13,8 @@ const tenderFlow = (() => {
     step:1, name:'', record:null, library:[], archive:null, busy:'', error:'',
     editor:null, chapter:'', edits:new Map(), writing:null, writingError:'', businessNotes:'', businessNotesDirty:false, requirements:[], requirementKey:'', requirementCategory:'redline',
     requirementEditing:false, outlineEditing:false, requirementsDirty:false, outlineDraft:[], outlineKey:'', outlineDirty:false, previewLoaded:false, sourceQuery:'', draftSequence:0,
-    notesAcknowledged:false, removedAcknowledged:new Set(), redline:null, redlineError:''
+    notesAcknowledged:false, removedAcknowledged:new Set(), redline:null, redlineError:'',
+    librarySelection:null, libraryOpen:false
   });
   let ui = fresh();
   let writingTimer=null, writingEpoch=0, writingRequest=0;
@@ -253,12 +254,33 @@ const tenderFlow = (() => {
       ${conflicts.length?`<div class="wf-error"><strong>需要核对的冲突</strong><ul>${conflicts.map(n=>`<li>${esc(n)}</li>`).join('')}</ul></div>`:''}
       ${writingSources(candidate)}<div class="wf-file-actions wf-candidate-actions">${wfButton(accepted?'本章已采纳':current.trim()?'采纳并替换本章正文':'采纳本章正文','accept-writing',{primary:true,disabled:accepted||stale||generating})}${wfButton('采纳全部可用候选（'+remaining.length+'）','accept-all-writing',{subtle:true,disabled:!remaining.length})}${generate}</div>${generating?'<p class="wf-help">正在重新生成本章；其他章节候选仍可采纳。</p>':!accepted&&stale?'<p class="wf-help">本章正文或依据已变化，请重新生成本章。</p>':!accepted&&!current.trim()?'<p class="wf-help">采纳后自动保存。</p>':''}`;
   }
+  function libraryCasesPanel(disabled) {
+    // Reviewed colleague cases from the material library; selecting them replaces the package.
+    const library=ui.writing?.library_cases||[], chosen=ui.librarySelection||new Set(ui.writing?.library_case_ids||[]);
+    const rows=library.map(c=>`<label class="wf-library-case"><input type="checkbox" name="wf-library-case" value="${esc(c.id)}" ${chosen.has(c.id)?'checked':''} ${disabled?'disabled':''}><span><strong>${esc(c.name)}</strong><small>${esc([c.client_name,`${c.file_count} 个文件`,c.contributor?'提交人 '+c.contributor:''].filter(Boolean).join(' · '))}</small></span></label>`).join('');
+    return `<details class="wf-library-cases" ${ui.libraryOpen?'open':''}><summary>从案例库选择${library.length?`（${library.length} 个可用）`:''}</summary>${library.length?`<div class="wf-library-list">${rows}</div><div class="wf-file-actions">${wfButton('使用所选案例','use-library-cases',{disabled})}<span class="wf-help">所选案例将替换当前案例包。</span></div>`:'<p class="wf-help">案例库暂无案例。同事可在材料库“案例库”提交案例，经本机核对后即可在此选用。</p>'}</details>`;
+  }
+  async function useLibraryCases() {
+    const ids=[...document.querySelectorAll('input[name="wf-library-case"]:checked')].map(el=>el.value);
+    if(!ids.length)throw new Error('请先勾选案例库中的案例。');
+    if(!ui.writing||ui.writingError)throw new Error('请先重新读取案例写作状态。');
+    if(writingRunning())throw new Error('请等待本次写作完成后再替换案例包。');
+    if(ui.writing.files.length&&!window.confirm('所选案例将替换整个案例包，之前生成的候选将失效。已保存的正文保留。继续？'))return;
+    ui.busy='正在读取案例库案例…';ui.error='';stopWritingPoll();paint();
+    try{
+      await saveWritingInputs();
+      bindWriting(await api(writingUrl(state.project.id)+'/cases',{method:'POST',body:{library_case_ids:ids,case_revision:ui.writing.case_revision,mapping_revision:state.project.mapping_revision}}));
+      ui.librarySelection=null;
+      toast(`已使用 ${ids.length} 个案例库案例。`);
+    }finally{ui.busy='';paint();scheduleWritingPoll();}
+  }
   function writingInputs() {
     const writing=ui.writing, running=writingRunning(), uploaded=writing?.files||[], ready=writing?.model?.ready===true;
     const disabled=!writing||!!ui.writingError||running;
-    return `<section class="wf-writing-inputs" aria-label="项目案例与 AI 写作"><h3 class="wf-section-title">1. 上传相关项目案例</h3><p class="wf-help">支持多文件或 ZIP。</p>
+    return `<section class="wf-writing-inputs" aria-label="项目案例与 AI 写作"><h3 class="wf-section-title">1. 上传相关项目案例</h3><p class="wf-help">支持多文件或 ZIP，也可从案例库选择。</p>
       <input id="wf-case-upload" type="file" hidden multiple accept=".doc,.docx,.pdf,.pptx,.txt,.md,.zip"><button type="button" class="wf-dropzone wf-case-dropzone" data-wf="upload-cases" ${disabled?'disabled':''} aria-label="上传相关项目案例"><span class="wf-drop-icon">${icon('upload')}</span><strong class="wf-drop-title">${uploaded.length?'点击或拖拽替换案例包':'点击或拖拽上传相关项目案例'}</strong><small class="wf-drop-help">DOC、DOCX、PDF、PPTX、TXT、MD、ZIP · 合计 ≤ 50 MB</small></button>
-      ${uploaded.length?`<div class="wf-case-files" aria-label="已上传案例文件">${uploaded.map(file=>`<div class="wf-file"><div class="wf-file-info"><strong class="wf-file-name">${esc(file.name)}</strong><small class="wf-file-meta">${(Number(file.size||0)/1024/1024).toFixed(2)} MB</small></div><span class="wf-status">已上传</span></div>`).join('')}</div>`:''}
+      ${uploaded.length?`<div class="wf-case-files" aria-label="已上传案例文件">${uploaded.map(file=>`<div class="wf-file"><div class="wf-file-info"><strong class="wf-file-name">${esc(file.name)}</strong><small class="wf-file-meta">${(Number(file.size||0)/1024/1024).toFixed(2)} MB</small></div><span class="wf-status">${String(file.name).startsWith('案例库/')?'案例库':'已上传'}</span></div>`).join('')}</div>`:''}
+      ${libraryCasesPanel(disabled)}
       <label class="wf-field" for="wf-business-notes">业务补充信息（选填）<textarea class="input" id="wf-business-notes" rows="3" maxlength="10000" placeholder="填写已确认的范围、团队安排或案例说明；不确定处标注待确认。">${esc(ui.businessNotes)}</textarea></label><p class="wf-help" id="wf-business-notes-status" role="status" ${ui.businessNotesDirty?'':'hidden'}>补充信息已修改，将用于下次生成。</p>
       <div class="wf-file-actions wf-writing-generate">${wfButton(running?'正在生成初稿正文…':writing?.job?'重新生成初稿正文':'生成初稿正文','generate-writing',{primary:true,disabled:disabled||!uploaded.length||!ready||!ui.editor?.chapters?.length})}${!uploaded.length?'<span class="wf-help">请先上传案例包。</span>':!ready?`<span class="wf-help">${esc(writing?.model?.message||'AI 写作暂不可用，请检查项目模型配置。')}</span>`:''}</div><div id="wf-writing-status">${writingStatus()}</div></section>`;
   }
@@ -420,6 +442,7 @@ const tenderFlow = (() => {
     const disabled=!!ui.busy||!!ui.pending||!ui.writing||!!ui.writingError||writingRunning();
     if(generate){generate.disabled=disabled||!ui.writing?.files?.length||ui.writing?.model?.ready!==true||!ui.editor?.chapters?.length;generate.textContent=writingRunning()?'正在生成初稿正文…':ui.writing?.job?'重新生成初稿正文':'生成初稿正文';}
     if(upload)upload.disabled=disabled;
+    for(const control of document.querySelectorAll('[data-wf="use-library-cases"],input[name="wf-library-case"]'))control.disabled=disabled;
   }
   function bindWriting(result) {
     // A newer query or completed edit supersedes every earlier in-flight read.
@@ -728,6 +751,7 @@ const tenderFlow = (() => {
     if (action==='reload-writing'){await loadWriting();paint();return;}
     if (action==='reload-redline'){await loadRedline();paint();return;}
     if (action==='save-redline')return saveRedline();
+    if (action==='use-library-cases')return useLibraryCases();
     if (action==='generate-writing')return generateWriting();
     if (action==='generate-chapter-writing')return generateWriting(true);
     if (action==='accept-writing'||action==='accept-all-writing')return acceptWriting(action==='accept-all-writing');
@@ -856,6 +880,7 @@ const tenderFlow = (() => {
   document.addEventListener('toggle',e=>{
     if(!e.target.isConnected)return;
     if(e.target.matches('.wf-outline-editor'))ui.outlineEditing=e.target.open;
+    if(e.target.matches('.wf-library-cases'))ui.libraryOpen=e.target.open;
     if(e.target.matches('.wf-requirement-edit')){
       const wasEditing=ui.requirementEditing;ui.requirementEditing=e.target.open;
       if(wasEditing&&!e.target.open)paint();
@@ -866,6 +891,7 @@ const tenderFlow = (() => {
     try{
       if(el.id==='wf-upload')await upload(el.files?.[0]);
       if(el.id==='wf-case-upload'){await uploadCases(el.files||[]);el.value='';}
+      if(el.name==='wf-library-case'){ui.librarySelection=new Set([...document.querySelectorAll('input[name="wf-library-case"]:checked')].map(x=>x.value));return;}
       if(el.id==='wf-chapter'){ui.chapter=el.value;paint();}
       if(el.id==='wf-requirement-category'&&requirement()){requirement().category=el.value;ui.requirementCategory=el.value;ui.requirementsDirty=true;paint();}
       if(el.id==='wf-notes-ack'){ui.notesAcknowledged=el.checked;return;}

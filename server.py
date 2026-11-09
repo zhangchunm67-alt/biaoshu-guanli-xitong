@@ -32,7 +32,9 @@ import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageOps
 
+from contributions import Contributions
 from credit_service import CreditService, MANAGED_IDS
+from errors import ConflictError
 from special import SpecialLibrary
 from export_jobs import ExportJobs
 from word_import import normalize_word
@@ -53,10 +55,6 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 IMAGE_FORMATS = {'PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF'}
 ACCESS_COOKIE = 'bid_access'
 LOGIN_PATH = '/login'
-
-
-class ConflictError(ValueError):
-    """The browser's editable snapshot is older than persisted state."""
 
 
 class AuthRequired(PermissionError):
@@ -254,6 +252,7 @@ class Store(SpecialLibrary):
             self.credit = CreditService(self)
             self.location_preview = LocationPreview()
             self.migrate_special()
+            self.contributions = Contributions(self)
             self.export_jobs = ExportJobs(self)
             from writing_service import WritingService
             self.writing = WritingService(self)
@@ -620,7 +619,7 @@ class Store(SpecialLibrary):
         exports = list(reversed(self.all('export')))
         source = self.get('meta', 'source_status') or {'state': 'not_imported', 'message': '此数据目录未导入示例材料'}
         source.pop('id', None)
-        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': self.all('industry'), 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(self.is_special(m) and not m.get('archived') for m in self.all('material')), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': len(exports), 'source_status': source}}
+        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': self.all('industry'), 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(self.is_special(m) and not m.get('archived') for m in self.all('material')), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': len(exports), 'source_status': source, **self.contributions.stats()}}
 
     @staticmethod
     def project_summary(project):
@@ -789,7 +788,9 @@ class Store(SpecialLibrary):
                             result['project_warnings'].append(project['name'] + '：' + message)
         return result
 
-    def material(self, body, key=None):
+    def material(self, body, key=None, *, provenance=None, commit=True):
+        """Create or edit a material. A reviewed contribution passes its provenance and commits
+        together with closing the submission."""
         old = self.require('material', key) if key else None
         if body.get('category_id') in MANAGED_IDS or (old and old.get('category_id') in MANAGED_IDS):
             raise PermissionError('信用查询材料仅由全自动官方查询归档，不能手工新增或修改。')
@@ -845,6 +846,8 @@ class Store(SpecialLibrary):
                 raise ValueError('；'.join(feedback['errors'].values()))
         if not old:
             value['file_ids'] = self.create_files(value['id'], body.get('files', []))
+            if provenance:
+                value['contribution'] = copy.deepcopy(provenance)
         for fid, rotation in rotations.items():
             file = self.require('file', fid)
             file['rotation'] = rotation
@@ -853,7 +856,8 @@ class Store(SpecialLibrary):
         value['updated_at'] = now()
         self.put('material', value)
         self.material_changed(value)
-        self.db.commit()
+        if commit:
+            self.db.commit()
         return self.public_material(value)
 
     def add_files(self, key, body):
@@ -1351,6 +1355,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.is_public_request():
             raise PermissionError('营业执照、身份证等材料原件仅限内网查看；花生壳外网不可下载或导出含材料文件。')
 
+    def require_reviewer(self):
+        """投稿可从花生壳提交，但查看投稿文件、入库和退回只在本机环回入口进行。"""
+        if self.is_public_request():
+            raise PermissionError('投稿审核与文件查看仅限本机入口；花生壳外网只能提交和查看处理状态。')
+
+    def send_image(self, raw, mime, thumb=False):
+        if thumb:
+            with Image.open(io.BytesIO(raw)) as picture:
+                picture = ImageOps.exif_transpose(picture)
+                picture.thumbnail((1000, 1000))
+                out = io.BytesIO()
+                picture.convert('RGB').save(out, format='JPEG', quality=85)
+                raw, mime = out.getvalue(), 'image/jpeg'
+        return self.send_bytes(raw, mime)
+
     def _redact_material_files(self, material):
         if not isinstance(material, dict) or 'files' not in material:
             return
@@ -1561,16 +1580,23 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
         if method == 'GET' and len(bits) == 3 and bits[:2] == ['api', 'files']:
             self.require_intranet_files()
             file = store.require('file', bits[2])
-            raw = store.path(file['storage']).read_bytes()
-            mime = file['mime']
-            if url.query == 'thumb=1':
-                with Image.open(io.BytesIO(raw)) as picture:
-                    picture = ImageOps.exif_transpose(picture)
-                    picture.thumbnail((1000, 1000))
-                    out = io.BytesIO()
-                    picture.convert('RGB').save(out, format='JPEG', quality=85)
-                    raw, mime = out.getvalue(), 'image/jpeg'
-            return self.send_bytes(raw, mime)
+            return self.send_image(store.path(file['storage']).read_bytes(), file['mime'], url.query == 'thumb=1')
+        if method == 'GET' and path == '/api/submissions':
+            return self.json_response(store.contributions.list(parse_qs(url.query), remote=self.is_public_request()))
+        if method == 'GET' and len(bits) == 3 and bits[:2] == ['api', 'submissions']:
+            return self.json_response(store.contributions.describe(bits[2], remote=self.is_public_request()))
+        if method == 'GET' and len(bits) == 5 and bits[:2] == ['api', 'submissions'] and bits[3] == 'files':
+            self.require_reviewer()
+            meta, raw, kind = store.contributions.file(bits[2], bits[4])
+            if kind == 'material':
+                return self.send_image(raw, meta['mime'], url.query == 'thumb=1')
+            return self.send_bytes(raw, 'application/octet-stream', filename=PurePosixPath(meta['name']).name)
+        if method == 'GET' and path == '/api/case-library':
+            return self.json_response(store.contributions.cases(parse_qs(url.query), remote=self.is_public_request()))
+        if method == 'GET' and len(bits) == 5 and bits[:2] == ['api', 'case-library'] and bits[3] == 'files':
+            self.require_reviewer()
+            meta, raw = store.contributions.case_file(bits[2], bits[4])
+            return self.send_bytes(raw, 'application/octet-stream', filename=PurePosixPath(meta['name']).name)
         if method == 'GET' and len(bits) == 4 and bits[:2] == ['api', 'exports']:
             item = store.require('export', bits[2])
             if bits[3] == 'download':
@@ -1596,6 +1622,13 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                     (method == 'PATCH' and len(bits) == 3) or
                     (method == 'POST' and len(bits) == 4 and bits[3] == 'files')):
                 store.require_material_revision(store.require('material', bits[2]), body)
+            if method == 'POST' and len(bits) == 4 and bits[:2] == ['api', 'submissions'] and bits[3] in {'accept', 'reject'}:
+                self.require_reviewer()
+                decide = store.contributions.accept if bits[3] == 'accept' else store.contributions.reject
+                return self.json_response(decide(bits[2], body))
+            if method == 'PATCH' and len(bits) == 3 and bits[:2] == ['api', 'case-library']:
+                self.require_reviewer()
+                return self.json_response(store.contributions.update_case(bits[2], body))
             if method == 'POST' and path == '/api/credit-automation/check':
                 return self.json_response(store.credit.check(body), 202)
             if method == 'POST' and path == '/api/categories':
@@ -1685,6 +1718,15 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 self.validate_origin(True)
                 if path != LOGIN_PATH:
                     self.body()  # Receive and validate bytes before holding the shared DB lock.
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:
+                return self.request_error(exc)
+        if self.command == 'POST' and urlsplit(self.path).path == '/api/submissions':
+            # Image and case checks may take seconds; only publishing takes the store lock.
+            try:
+                return self.json_response(self.server.store.contributions.submit(
+                    self.body(), remote=self.is_public_request()), 201)
             except (BrokenPipeError, ConnectionResetError):
                 return
             except Exception as exc:

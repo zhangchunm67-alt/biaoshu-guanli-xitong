@@ -162,3 +162,15 @@
   .material-table td:nth-child(5)::before{content:"操作"}
   .material-table td>.table-subtitle{grid-column:2}
 }
+/* Colleague submissions and the shared case library. */
+.submission-policy{margin:0 0 18px}.submission-meta{margin:0 0 18px}
+.submission-preview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;max-height:38vh;overflow:auto;padding:2px}
+.submission-thumb{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#f7f9fc;color:#52627b;font-size:10px;min-width:0}
+.submission-thumb:hover{border-color:#b4c1df;text-decoration:none}
+.submission-thumb img{width:100%;height:92px;object-fit:contain}
+.submission-thumb span{overflow-wrap:anywhere}
+.submission-table .submission-reason{white-space:normal;overflow:visible;max-width:320px;color:#a26a62}
+.case-file-list{margin:0;padding-left:16px;font-size:11px;line-height:1.9;white-space:normal}
+.case-file-list a{overflow-wrap:anywhere}
+.case-warnings{margin:8px 0 0}
+@media(max-width:600px){.submission-preview{grid-template-columns:repeat(2,minmax(0,1fr))}}

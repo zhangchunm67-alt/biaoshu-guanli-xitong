@@ -578,3 +578,14 @@
 .wf-redline-item.is-risk { border-color: #e2b0b0; background: #fff7f7; }
 .wf-redline-item p { margin: 8px 0 0; color: #4a5c73; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
 .wf-redline-item ul { margin: 8px 0 0; padding-left: 20px; color: #5b4630; font-size: 13px; }
+
+/* Reviewed colleague cases selectable from the material library. */
+.wf-library-cases { margin: 4px 0 6px; border: 1px solid var(--wf-line); border-radius: 10px; background: #fff; }
+.wf-library-cases > summary { cursor: pointer; padding: 12px 15px; font-weight: 600; font-size: 15px; }
+.wf-library-cases > .wf-help, .wf-library-cases > .wf-file-actions { padding: 0 15px 14px; }
+.wf-library-list { display: grid; gap: 8px; padding: 0 15px 12px; max-height: 300px; overflow-y: auto; }
+.wf-library-case { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--wf-line); border-radius: 9px; cursor: pointer; }
+.wf-library-case:has(input:checked) { border-color: #9db4f3; background: #f0f5ff; }
+.wf-library-case input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--wf-blue); flex-shrink: 0; }
+.wf-library-case strong { display: block; font-size: 15px; overflow-wrap: anywhere; }
+.wf-library-case small { display: block; color: var(--wf-muted); font-size: 13px; margin-top: 2px; }

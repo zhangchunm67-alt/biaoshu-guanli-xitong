@@ -127,6 +127,8 @@ class WritingService:
             return result
         selected = {mid for r in project.get('mappings', []) if r.get('action') == 'fill' for mid in r.get('material_ids', [])}
         result.update(files=copy.deepcopy(pack['files']),
+                    library_case_ids=list(pack.get('library_case_ids', [])),
+                    library_cases=self.store.contributions.library_summary(),
                     warnings=pack['warnings'], case_sources=copy.deepcopy(pack['sources']),
                     procurement_sources=copy.deepcopy(framework.get('sources', [])),
                     materials=[{'id':m['id'],'name':m['name']} for m in self.store.all('material') if m['id'] in selected],
@@ -134,25 +136,39 @@ class WritingService:
         return result
 
     def upload(self, key, body):
-        """Parsing runs outside the store lock; publish only against the same snapshot."""
+        """Parsing runs outside the store lock; publish only against the same snapshot.
+
+        The package is the uploaded files plus any selected case-library cases, which pass
+        through the same parser and are stored the same way as a direct upload.
+        """
         import writing_cases
+        selection = body.get('library_case_ids') or []
+        uploads = body.get('files') if body.get('files') is not None else []
+        if not isinstance(uploads, list):
+            raise ValueError('案例上传数据格式不正确，请重新选择文件')
         with self.store.lock:
             self._check_request(key, body)
             versions = self._versions(key)
-        parsed = writing_cases.parse_uploads(body.get('files'))
+            library = self.store.contributions.package(selection) if selection else []
+        files = list(uploads) + [{'name': item['name'], 'data': base64.b64encode(
+            self.store.path(item['storage']).read_bytes()).decode()} for item in library]
+        parsed = writing_cases.parse_uploads(files)
         with self.store.lock:
             self._check_request(key, body)
             if versions != self._versions(key):
                 raise ValueError('上传期间项目已更新，请重新上传案例资料。')
+            if selection and self.store.contributions.package(selection) != library:
+                raise ValueError('所选案例已在案例库中更新，请重新选择。')
             directory = self.store.root / 'writing-cases' / key / uuid.uuid4().hex
             try:
                 directory.mkdir(parents=True)
                 # Keep the actual submitted package for later evidence inspection.
-                for index, upload in enumerate(body['files']):
+                for index, upload in enumerate(files):
                     suffix = Path(upload['name']).suffix.lower()
                     (directory / f'{index + 1}{suffix}').write_bytes(base64.b64decode(upload['data'], validate=True))
                 pack = dict(id=key, revision=versions['case_revision'] + 1,
-                            storage=str(directory.relative_to(self.store.root)), **parsed)
+                            storage=str(directory.relative_to(self.store.root)),
+                            library_case_ids=list(selection), **parsed)
                 self.store.put('writing_cases', pack)
                 self.store.db.commit()
             except Exception:
