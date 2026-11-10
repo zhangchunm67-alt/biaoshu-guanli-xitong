@@ -1174,6 +1174,9 @@ class Store(SpecialLibrary):
             raise ValueError('请先进入文字材料核对，再导出标书。')
         if project.get('material_flow') == 'text-first' and not project.get('text_review_confirmed'):
             raise ValueError('请先保存文字材料核对，再导出标书。')
+        if project.get('framework_id'):
+            import redline_scan
+            redline_scan.require_complete(self, project)
         materials = self.internal_materials(include_special=True, project=project)
         categories = self.matching_categories(project)
         mappings = engine.validate_mappings(project['mappings'], materials, project['headings'], categories, context=context,

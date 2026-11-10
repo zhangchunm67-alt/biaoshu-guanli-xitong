@@ -578,6 +578,10 @@
 .wf-redline-item.is-risk { border-color: #e2b0b0; background: #fff7f7; }
 .wf-redline-item p { margin: 8px 0 0; color: #4a5c73; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
 .wf-redline-item ul { margin: 8px 0 0; padding-left: 20px; color: #5b4630; font-size: 13px; }
+.wf-redline-item ul.wf-redline-hints { color: #4a5c73; }
+.wf-redline-tag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; background: #f6dede; color: #9b3530; font-size: 12px; font-weight: 600; }
+.wf-redline-item p.wf-redline-expired { color: #9b5a12; font-weight: 600; }
+.wf-redline-fix { margin-top: 10px; gap: 8px; flex-wrap: wrap; }
 
 /* Reviewed colleague cases selectable from the material library. */
 .wf-library-cases { margin: 4px 0 6px; border: 1px solid var(--wf-line); border-radius: 10px; background: #fff; }

@@ -174,3 +174,7 @@
 .case-file-list a{overflow-wrap:anywhere}
 .case-warnings{margin:8px 0 0}
 @media(max-width:600px){.submission-preview{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.remote-banner{display:flex;align-items:center;gap:8px;margin:12px 38px 0;padding:8px 14px;border:1px solid #f0d9a8;border-radius:10px;background:#fff8e8;color:#7a5410;font-size:13px;line-height:1.5}.remote-banner svg{flex:none;width:16px;height:16px}
+@media(max-width:800px){.remote-banner{margin:12px 16px 0;font-size:12px}}
+.mapping-card-collapsed .mapping-conclusion{margin:0 0 6px;font-weight:600;color:#24334c}.mapping-card-collapsed .mapping-manual{margin-top:12px}.mapping-card-collapsed .mapping-manual summary{cursor:pointer;color:var(--primary);font-size:13px}.mapping-card-collapsed .mapping-manual[open] .mapping-main{margin-top:12px}
+.mode-tabs{display:inline-flex;gap:4px;padding:3px;border:1px solid var(--line);border-radius:999px;background:#fff}.mode-tab{border:0;background:transparent;padding:5px 12px;border-radius:999px;font:inherit;font-size:12px;color:var(--muted);cursor:pointer}.mode-tab.active{background:#eef1fd;color:var(--primary);font-weight:600}
