@@ -2041,14 +2041,31 @@ def create_oray_servers(port=8766, intranet_port=None, data_dir=DEFAULT_DATA, se
         raise
 
 
+ORAY_ENV_KEYS = {'ORAY_PUBLIC_HOST', 'ORAY_LAN_HOSTS', 'ORAY_ACCESS_TOKEN', 'ORAY_PORT', 'ORAY_INTRANET_PORT'}
+
+
+def load_oray_env(path):
+    """读取 .env.oray（KEY=VALUE，# 开头为注释）；已存在的环境变量优先。"""
+    path = Path(path)
+    if not path.is_file():
+        raise SystemExit(f'未找到 {path.name}。请复制 .env.oray.example 为 .env.oray 并填写访问地址与口令。')
+    for line in path.read_text(encoding='utf-8-sig').splitlines():
+        key, sep, value = line.strip().partition('=')
+        key = key.strip()
+        if sep and key in ORAY_ENV_KEYS and not key.startswith('#'):
+            os.environ.setdefault(key, value.strip().strip('"\''))
+
+
 def main():
     import writing_model
     writing_model.load_local_env(APP_DIR)
     parser = argparse.ArgumentParser(description='标书管理系统（默认仅本机；花生壳模式可远程访问）')
-    parser.add_argument('--port', type=int, default=8766)
+    parser.add_argument('--port', type=int, default=None, help='端口，默认 8766（或 .env.oray 中的 ORAY_PORT）')
+    parser.add_argument('--env-file', type=Path, default=None,
+                        help='读取远程访问配置，例如 .env.oray（Windows 启动脚本使用）')
     parser.add_argument('--intranet-port', type=int, default=0,
                         help='花生壳模式下本机材料入口端口，默认映射口+1')
-    parser.add_argument('--host', default='127.0.0.1',
+    parser.add_argument('--host', default=None,
                         help='远程口监听地址：127.0.0.1（默认，仅花生壳客户端可连）或 0.0.0.0（局域网/节点直连）')
     parser.add_argument('--public-host', default='', help='花生壳访问域名，例如 xxx.imwork.net')
     parser.add_argument('--lan-host', action='append', default=[],
@@ -2059,13 +2076,27 @@ def main():
     parser.add_argument('--seed', action='store_true', default=None, help='向自定义数据目录导入交付包材料')
     parser.add_argument('--open', action='store_true', help='启动后打开浏览器')
     args = parser.parse_args()
-    public_host = args.public_host.strip() or None
-    lan_hosts = normalize_remote_hosts(args.lan_host)
-    access_token = args.access_token.strip() or os.environ.get('ORAY_ACCESS_TOKEN', '').strip() or None
+    if args.env_file:
+        load_oray_env(args.env_file)
+    env = os.environ.get
+    try:
+        if args.port is None:
+            args.port = int(env('ORAY_PORT', '').strip() or 8766)
+        if not args.intranet_port and env('ORAY_INTRANET_PORT', '').strip() and args.env_file:
+            args.intranet_port = int(env('ORAY_INTRANET_PORT').strip())
+    except ValueError:
+        parser.error('ORAY_PORT / ORAY_INTRANET_PORT 须为数字')
+    public_host = args.public_host.strip() or (env('ORAY_PUBLIC_HOST', '').strip() if args.env_file else '') or None
+    lan_hosts = normalize_remote_hosts(args.lan_host or ([env('ORAY_LAN_HOSTS', '')] if args.env_file else []))
+    access_token = args.access_token.strip() or env('ORAY_ACCESS_TOKEN', '').strip() or None
     intranet_port = args.intranet_port or None
     local_server = None
+    if args.host is None:
+        args.host = '0.0.0.0' if lan_hosts else '127.0.0.1'
     if lan_hosts and args.host != '0.0.0.0':
         parser.error('配置了 --lan-host 时须同时使用 --host 0.0.0.0，局域网或节点才能连上')
+    if args.env_file and not (public_host or lan_hosts):
+        parser.error('.env.oray 须至少设置 ORAY_PUBLIC_HOST 或 ORAY_LAN_HOSTS')
     if public_host or lan_hosts:
         server, local_server = create_oray_servers(
             port=args.port, intranet_port=intranet_port, data_dir=args.data_dir, seed=args.seed,
