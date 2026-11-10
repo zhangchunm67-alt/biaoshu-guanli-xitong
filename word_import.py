@@ -72,7 +72,18 @@ def normalize_word(name, raw, limit):
             '<oor:items xmlns:oor="http://openoffice.org/2001/registry">'
             '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
             '<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>'
-            '</item></oor:items>', encoding='utf-8')
+            '</item>'
+            # 外网投稿的旧版 DOC 可能带远程链接、OLE/DDE 对象；转换时一律不更新、不激活，避免本机对外发请求。
+            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+            '<prop oor:name="DisableActiveContent" oor:op="fuse"><value>true</value></prop>'
+            '</item>'
+            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+            '<prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop>'
+            '</item>'
+            '<item oor:path="/org.openoffice.Office.Writer/Content/Update">'
+            '<prop oor:name="Link" oor:op="fuse"><value>0</value></prop>'
+            '</item>'
+            '</oor:items>', encoding='utf-8')
         try:
             result = subprocess.run([
                 converter, f'-env:UserInstallation={profile.as_uri()}',

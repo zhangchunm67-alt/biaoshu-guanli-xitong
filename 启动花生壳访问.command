@@ -20,7 +20,7 @@ if ! "$APP_PYTHON" -c 'import olefile, pypdf, pypdfium2' 2>/dev/null; then
   "$APP_PYTHON" -m pip install -r requirements.txt
 fi
 if [[ ! -f .env.oray ]]; then
-  echo '未找到 .env.oray。请复制 .env.oray.example 为 .env.oray，填写花生壳域名与访问口令。'
+  echo '未找到 .env.oray。请复制 .env.oray.example 为 .env.oray，填写访问地址与访问口令。'
   echo '示例：cp .env.oray.example .env.oray'
   exit 1
 fi
@@ -28,19 +28,39 @@ fi
 set -a
 source .env.oray
 set +a
-if [[ -z "${ORAY_PUBLIC_HOST:-}" || -z "${ORAY_ACCESS_TOKEN:-}" ]]; then
-  echo '.env.oray 须设置 ORAY_PUBLIC_HOST 与 ORAY_ACCESS_TOKEN'
+if [[ -z "${ORAY_PUBLIC_HOST:-}" && -z "${ORAY_LAN_HOSTS:-}" ]]; then
+  echo '.env.oray 须至少设置 ORAY_PUBLIC_HOST（花生壳域名）或 ORAY_LAN_HOSTS（局域网/节点地址）之一'
+  exit 1
+fi
+if [[ -z "${ORAY_ACCESS_TOKEN:-}" ]]; then
+  echo '.env.oray 须设置 ORAY_ACCESS_TOKEN（至少 12 个字符）'
   exit 1
 fi
 PORT="${ORAY_PORT:-8766}"
 INTRANET_PORT="${ORAY_INTRANET_PORT:-$((PORT + 1))}"
-echo "本机材料入口：http://127.0.0.1:${INTRANET_PORT}/ （仅本机，勿映射到花生壳）"
-echo "花生壳映射口：127.0.0.1:${PORT}"
-echo "花生壳域名：http://${ORAY_PUBLIC_HOST}/ （请在花生壳客户端映射到 127.0.0.1:${PORT}）"
-echo '外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机材料入口。'
-echo '已启用防空闲休眠；合盖、手动睡眠或退出花生壳后外网会断开。'
+ARGS=(--port "$PORT" --intranet-port "$INTRANET_PORT")
+if [[ -n "${ORAY_PUBLIC_HOST:-}" ]]; then
+  ARGS+=(--public-host "$ORAY_PUBLIC_HOST")
+fi
+if [[ -n "${ORAY_LAN_HOSTS:-}" ]]; then
+  # 局域网（腾宝AI WiFi）或节点直连：远程口须监听所有网卡。
+  ARGS+=(--host 0.0.0.0 --lan-host "$ORAY_LAN_HOSTS")
+else
+  # 只用花生壳：远程口只给本机花生壳客户端连接，局域网其他电脑连不上。
+  ARGS+=(--host 127.0.0.1)
+fi
+echo "本机材料入口：http://127.0.0.1:${INTRANET_PORT}/ （仅本机，勿映射、勿告诉同事）"
+if [[ -n "${ORAY_PUBLIC_HOST:-}" ]]; then
+  echo "花生壳域名：http://${ORAY_PUBLIC_HOST}/ （花生壳客户端映射到 127.0.0.1:${PORT}）"
+fi
+if [[ -n "${ORAY_LAN_HOSTS:-}" ]]; then
+  printf '%s\n' "$ORAY_LAN_HOSTS" | tr '，,' '\n\n' | while read -r host; do
+    [[ -n "$host" ]] && echo "局域网/节点地址：http://${host}/"
+  done
+fi
+echo '远程同事可编制标书；营业执照、身份证等材料原件、材料库维护与含材料导出仅限本机材料入口。'
+echo '已启用防空闲休眠；合盖、手动睡眠或断网后远程同事会断开。'
 echo '保留这个窗口以持续运行；按 Control+C 停止。'
 export PYTHONDONTWRITEBYTECODE=1
-exec /usr/bin/caffeinate -i "$APP_PYTHON" server.py --host 0.0.0.0 --port "$PORT" \
-  --intranet-port "$INTRANET_PORT" \
-  --public-host "$ORAY_PUBLIC_HOST" --access-token "$ORAY_ACCESS_TOKEN" "$@"
+# 口令经环境变量 ORAY_ACCESS_TOKEN 传给服务，不出现在命令行与进程列表中。
+exec /usr/bin/caffeinate -i "$APP_PYTHON" server.py "${ARGS[@]}" "$@"

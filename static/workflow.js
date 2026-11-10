@@ -13,11 +13,11 @@ const tenderFlow = (() => {
     step:1, name:'', record:null, library:[], archive:null, busy:'', error:'',
     editor:null, chapter:'', edits:new Map(), writing:null, writingError:'', businessNotes:'', businessNotesDirty:false, requirements:[], requirementKey:'', requirementCategory:'redline',
     requirementEditing:false, outlineEditing:false, requirementsDirty:false, outlineDraft:[], outlineKey:'', outlineDirty:false, previewLoaded:false, sourceQuery:'', draftSequence:0,
-    notesAcknowledged:false, removedAcknowledged:new Set(), redline:null, redlineError:'',
+    notesAcknowledged:false, removedAcknowledged:new Set(), redline:null, redlineError:'', outlineCheckAck:false,
     librarySelection:null, libraryOpen:false
   });
   let ui = fresh();
-  let writingTimer=null, writingEpoch=0, writingRequest=0;
+  let writingTimer=null, writingEpoch=0, writingRequest=0, redlineRefreshPending=false;
   const base = id => '/api/frameworks/' + encodeURIComponent(id);
   const projectUrl = id => '/api/projects/' + encodeURIComponent(id);
   const draftsUrl = id => projectUrl(id) + '/chapter-drafts';
@@ -175,13 +175,26 @@ const tenderFlow = (() => {
       <div class="wf-file-actions">${wfButton(selected?'新增同级':'新增章节','outline-add-sibling',{subtle:true})}${selected?wfButton('新增子级','outline-add-child',{subtle:true,disabled:selected.level>=9})+wfButton('删除章节','outline-delete',{subtle:true}):''}</div></div></div>
       <div class="wf-review-heading wf-outline-save"><p class="wf-help" id="wf-outline-status" role="status" ${ui.outlineDirty?'':'hidden'}>${ui.outlineDirty?'有未保存修改；下方预览仍为已保存版本':''}</p><div class="wf-file-actions">${ui.error?wfButton('重新读取','reload-review',{subtle:true}):''}${wfButton('保存目录并更新预览','save-outline',{primary:true,disabled:!ui.outlineDirty})}</div></div></details>`;
   }
+  function outlineIssues() { return ui.record?.outline_check?.issues||[]; }
+  function outlineCheckPanel() {
+    const check=ui.record?.outline_check;
+    if(!check)return '';
+    const issues=check.issues||[];
+    if(!issues.length)return `<section class="wf-section wf-outline-check is-ok" aria-label="目录校验"><p class="wf-help">目录校验通过：${Number(check.checked)||0} 个章节，未发现序号乱序、重复、跳号或编号混用。</p></section>`;
+    const titles=new Map((ui.record.outline||[]).map(row=>[row.id,row.text]));
+    const canEdit=editable();
+    return `<section class="wf-section wf-outline-check" aria-label="目录校验"><h3 class="wf-section-title">目录校验 · ${issues.length} 项需核对</h3>
+      <p class="wf-help">${ui.outlineDirty?'以下为已保存目录的校验结果；保存目录后会重新校验。':'从招标文件拆出的标题常带原文序号，请核对后再进入系统填充。可按建议修正，修正后须保存目录。'}</p>
+      <ol class="wf-outline-issues">${issues.map((issue,i)=>`<li><p>${esc(issue.message)}</p><div class="wf-outline-issue-chapters">${(issue.chapter_ids||[]).slice(0,12).map(id=>canEdit?`<button type="button" class="wf-chip" data-wf="select-outline" data-id="${esc(id)}">${esc(titles.get(id)||id)}</button>`:`<span class="wf-chip">${esc(titles.get(id)||id)}</span>`).join('')}${(issue.chapter_ids||[]).length>12?`<span class="wf-help">等 ${issue.chapter_ids.length} 个章节</span>`:''}</div>${canEdit&&issue.fixes?.length?`<details class="wf-outline-fix"><summary>查看建议修正（${issue.fixes.length} 处）</summary><ul>${issue.fixes.map(fix=>`<li>${esc(titles.get(fix.id)||fix.id)} → <strong>${esc(fix.text)}</strong></li>`).join('')}</ul>${wfButton('按建议修正','outline-fix',{id:String(i),subtle:true})}</details>`:''}</li>`).join('')}</ol>
+      ${ui.outlineDirty?'':`<label class="wf-ack"><input type="checkbox" id="wf-outline-check-ack" ${ui.outlineCheckAck?'checked':''}>已逐项核对目录校验提示，确认无需再修改（例如附件号须与采购原件一致）</label>`}</section>`;
+  }
   function outline() {
     const preview=html(), word=files().find(f=>f.kind==='word');
     if(!preview||!word)return `<p class="wf-error" role="alert">${esc(ui.record.migration_error||'无法读取整本预览。请返回招标文件解读，核对采购原件。')}</p>`;
     const url=preview.url+(preview.url.includes('?')?'&':'?')+'revision='+encodeURIComponent(ui.record.revision||0);
     const books=ui.record.books||[];
     const summary=books.length?`<section class="wf-section" aria-label="分册目录"><h2 class="wf-section-title">分册目录</h2><div class="wf-file-actions">${books.map(book=>wfButton(book.name+'目录 · '+book.chapters.length+' 个章节','select-outline',{id:book.id,subtle:true})).join('')}</div></section>`:'';
-    return summary+outlineEditor()+`<iframe class="wf-preview-frame" title="投标文件目录预览" src="${esc(url)}" sandbox="allow-same-origin"></iframe>
+    return summary+outlineCheckPanel()+outlineEditor()+`<iframe class="wf-preview-frame" title="投标文件目录预览" src="${esc(url)}" sandbox="allow-same-origin"></iframe>
       <p class="wf-help wf-preview-state" role="status">正在读取目录预览…</p>
       <div class="wf-actions">${wfButton('上一步','step',{id:2})}${wfButton('确认目录，进入系统填充','confirm',{primary:true,disabled:!ui.previewLoaded||ui.outlineDirty||ui.record.requirements_confirmed===false})}</div>`;
   }
@@ -290,10 +303,22 @@ const tenderFlow = (() => {
     if(!scan)return `<section class="wf-section wf-redline-scan" id="wf-redline-scan"><h3 class="wf-section-title">3. 废标红线扫描</h3><p class="wf-note">正在读取废标红线…</p></section>`;
     if(!scan.items?.length)return `<section class="wf-section wf-redline-scan" id="wf-redline-scan"><h3 class="wf-section-title">3. 废标红线扫描</h3><p class="wf-help">本项目未识别到废标红线条款；若采购原文确有否决条款，请返回招标解读补充后再扫描。</p></section>`;
     const pending=scan.pending_count||0;
+    const unsaved=redlineUnsaved();
+    const chapters=ui.editor?.chapters||[];
+    const fixLinks=item=>{
+      const links=[];
+      if(item.status==='risk'&&(item.material_category_ids||[]).length)links.push(wfButton('去材料核对处理','step',{id:4,subtle:true}));
+      for(const id of item.empty_chapter_ids||[]){
+        const chapter=chapters.find(c=>c.id===id);
+        if(chapter&&!String(chapter.text||'').trim())links.push(wfButton(`去编写「${chapter.title||chapter.path||id}」`,'redline-chapter',{id,subtle:true}));
+      }
+      return links.length?`<div class="wf-file-actions wf-redline-fix">${links.join('')}</div>`:'';
+    };
     return `<section class="wf-section wf-redline-scan" id="wf-redline-scan"><h3 class="wf-section-title">3. 废标红线扫描</h3>
-      <p class="wf-help" role="status">${scan.complete?'全部红线已勾选核对。':`尚有 ${pending} 条红线待人工勾选确认。`}修改正文或材料后须重新确认。</p>
-      <div class="wf-redline-list">${scan.items.map(item=>`<article class="wf-redline-item ${item.status==='risk'?'is-risk':''}" data-redline="${esc(item.id)}"><label class="wf-ack"><input type="checkbox" data-wf="ack-redline" data-id="${esc(item.id)}" ${item.acknowledged?'checked':''}><strong>${esc(item.label)}</strong></label><p>${esc(item.text)}</p><ul>${(item.findings||[]).map(note=>`<li>${esc(note)}</li>`).join('')}</ul></article>`).join('')}</div>
-      <div class="wf-file-actions">${wfButton('保存红线核对','save-redline',{primary:true})}${wfButton('重新扫描','reload-redline',{subtle:true})}</div></section>`;
+      <p class="wf-help">${esc(scan.scope||'自动检查：材料栏目是否缺漏或待补，关联章节是否已有正文；其余为人工核对提示。')}只有正文或材料与某条红线相关时，才需要重新确认该条。</p>
+      <p class="wf-help" role="status" id="wf-redline-status">${redlineStatusText()}</p>
+      <div class="wf-redline-list">${scan.items.map(item=>`<article class="wf-redline-item ${item.status==='risk'?'is-risk':''}" data-redline="${esc(item.id)}"><label class="wf-ack"><input type="checkbox" data-wf="ack-redline" data-id="${esc(item.id)}" ${item.acknowledged?'checked':''}><strong>${esc(item.label)}</strong>${item.status==='risk'?'<span class="wf-redline-tag">有风险</span>':''}</label>${item.ack_expired?'<p class="wf-redline-expired">相关正文或材料已变化，之前的确认已失效，请重新核对。</p>':''}<p>${esc(item.text)}</p>${(item.findings||[]).length?`<ul>${item.findings.map(note=>`<li>${esc(note)}</li>`).join('')}</ul>`:''}${(item.hints||[]).length?`<ul class="wf-redline-hints">${item.hints.map(note=>`<li>${esc(note)}</li>`).join('')}</ul>`:''}${fixLinks(item)}</article>`).join('')}</div>
+      <div class="wf-file-actions">${wfButton(unsaved?'保存红线核对（有未保存勾选）':'保存红线核对','save-redline',{primary:true})}${wfButton('重新扫描','reload-redline',{subtle:true})}</div></section>`;
   }
   function writing() {
     const editor=ui.editor, chapter=editor?.chapters.find(c=>c.id===ui.chapter);
@@ -357,7 +382,7 @@ const tenderFlow = (() => {
     ui.requirementKey=ui.requirements.find(item=>item._key===previousRequirement&&item.category===ui.requirementCategory)?previousRequirement:ui.requirements.find(item=>item.category===ui.requirementCategory)?._key||'';
     ui.outlineDraft=clone(record.outline||[]).map(item=>({...item,_key:item.id||newKey(),level:Number(item.level)||1}));
     ui.outlineKey=ui.outlineDraft.some(item=>item._key===previousOutline)?previousOutline:ui.outlineDraft[0]?._key||'';
-    ui.requirementsDirty=false;ui.outlineDirty=false;ui.previewLoaded=false;ui.sourceQuery='';
+    ui.requirementsDirty=false;ui.outlineDirty=false;ui.previewLoaded=false;ui.sourceQuery='';ui.outlineCheckAck=false;
     ui.notesAcknowledged=false;ui.removedAcknowledged=new Set();
     if(state.project?.framework_id===record.id&&record.projects?.word!==state.project.id){state.project=null;state.dirty=false;}
   }
@@ -518,11 +543,25 @@ const tenderFlow = (() => {
     try{
       await saveWritingInputs();
       const business_notes=ui.businessNotes;
-      const job=await api(writingUrl(state.project.id)+'/generate',{method:'POST',body:{case_revision:ui.writing.case_revision,mapping_revision:state.project.mapping_revision,revision:ui.editor.revision,business_notes,...(chapterOnly?{chapter_ids:[ui.chapter]}:{})}});
+      const request={case_revision:ui.writing.case_revision,mapping_revision:state.project.mapping_revision,revision:ui.editor.revision,business_notes,...(chapterOnly?{chapter_ids:[ui.chapter]}:{})};
+      const outbound=await api(writingUrl(state.project.id)+'/outbound',{method:'POST',body:request});
+      if(!window.confirm(outboundSummary(outbound)))return;
+      const job=await api(writingUrl(state.project.id)+'/generate',{method:'POST',body:request});
       bindWriting({job:job.job||job});ui.businessNotesDirty=false;
       // The generation request only queues work. Keep navigation and hand editing available.
       paint();
     }finally{scheduleWritingPoll();}
+  }
+  function outboundSummary(info) {
+    const list=(items,limit=8)=>items.length?items.slice(0,limit).join('、')+(items.length>limit?` 等 ${items.length} 项`:''):'无';
+    return ['生成初稿将把以下资料发送至所配置的 AI 模型服务'+(info.model?`（${info.model}）`:'')+'：','',
+      `· 待编写章节：${info.chapter_count} 章，分 ${info.group_count} 次发送`,
+      `· 采购要求：${info.requirement_count} 条，相关采购原文 ${info.procurement_source_count} 段`,
+      `· 案例资料：${list(info.case_files||[])}（每次都会发送）`,
+      `· 发送正文的材料：${list(info.materials_with_text||[])}`,
+      `· 只发送名称的材料：${list(info.materials_name_only||[])}（证件、授权书等正文不发送）`,
+      `· 业务补充信息：${info.business_notes_length?info.business_notes_length+' 字':'无'}`,'',
+      '营业执照、身份证等图片不会发送。确认发送并开始生成？'].join('\n');
   }
   async function acceptWriting(all=false) {
     const job=ui.writing?.job;
@@ -539,7 +578,7 @@ const tenderFlow = (() => {
       catch(err){await loadWriting();throw err;}
       ui.editor=result.editor;
       if(ui.editor.mapping_revision!==undefined)state.project.mapping_revision=ui.editor.mapping_revision;
-      bindWriting(result.writing);paint();if(candidates.length>1)toast(`已采纳并保存 ${candidates.length} 个章节正文。`);
+      bindWriting(result.writing);paint();redlineRefreshPending=true;backgroundRedlineRefresh();if(candidates.length>1)toast(`已采纳并保存 ${candidates.length} 个章节正文。`);
     }finally{scheduleWritingPoll();}
   }
   async function saveDrafts() {
@@ -554,6 +593,7 @@ const tenderFlow = (() => {
       ui.editor=await api(draftsUrl(state.project.id),{method:'PATCH',body:{chapters,revision:ui.editor.revision,mapping_revision:state.project.mapping_revision}});
       if(ui.editor.mapping_revision)state.project.mapping_revision=ui.editor.mapping_revision;
       for(const {id,text} of chapters)if(ui.edits.get(id)===text)ui.edits.delete(id);
+      redlineRefreshPending=true;
       if(ui.writing?.job){
         const changed=chapters.filter(({id})=>ui.writing.job.chapter_revisions?.[id]!==ui.editor.chapters.find(c=>c.id===id)?.revision).map(c=>c.id);
         ui.writing.job.stale_chapter_ids=[...new Set([...(ui.writing.job.stale_chapter_ids||[]),...changed])];
@@ -610,32 +650,84 @@ const tenderFlow = (() => {
       toast(confirmed?'采购要求已确认，目录已更新。':'要求修改已保存。');
     }finally{ui.busy='';paint();}
   }
-  async function loadRedline() {
+  function bindRedline(scan, previous=null) {
+    // 服务端确认状态单独保存；页面勾选只是本地草稿，导出前必须保存到服务端。
+    scan.saved_ids=[...(scan.acknowledged_ids||[])];
+    if(previous?.items){
+      // 重新扫描时保留尚未保存、且依据未变化的本地勾选。
+      const local=new Map(previous.items.map(item=>[item.id,item]));
+      for(const item of scan.items||[]){
+        const old=local.get(item.id);
+        if(old&&old.basis===item.basis&&old.acknowledged)item.acknowledged=true;
+      }
+    }
+    syncRedlineCounts(scan);
+    ui.redline=scan;ui.redlineError='';
+  }
+  function syncRedlineCounts(scan=ui.redline) {
+    if(!scan?.items)return;
+    scan.acknowledged_ids=scan.items.filter(row=>row.acknowledged).map(row=>row.id);
+    scan.pending_count=scan.items.filter(row=>!row.acknowledged).length;
+    scan.complete=!scan.pending_count;
+  }
+  function redlineUnsaved() {
+    const scan=ui.redline;
+    if(!scan?.items)return false;
+    const saved=new Set(scan.saved_ids||[]);
+    return scan.items.some(item=>item.acknowledged!==saved.has(item.id));
+  }
+  function redlineStatusText() {
+    const scan=ui.redline;
+    if(!scan)return '';
+    const unsaved=redlineUnsaved()?'勾选尚未保存，导出时会自动保存。':'';
+    return (scan.complete?'全部红线已勾选核对。':`尚有 ${scan.pending_count} 条红线待人工勾选确认。`)+unsaved;
+  }
+  async function loadRedline({keepLocal=false}={}) {
     if(!hasProject()){ui.redline=null;ui.redlineError='';return;}
-    const request=++writingRequest;
+    const request=++writingRequest, previous=keepLocal?ui.redline:null;
     try{
       const scan=await api(redlineUrl(state.project.id));
       if(request!==writingRequest)return;
-      ui.redline=scan;ui.redlineError='';
+      bindRedline(scan,previous);
     }catch(err){
       if(request!==writingRequest)return;
       ui.redline=null;ui.redlineError=err.message;
     }
   }
-  async function saveRedline() {
+  async function refreshRedline() {
+    // 正文或材料保存后重新扫描，避免用过期的依据保存确认。
+    if(ui.redline||ui.redlineError)await loadRedline({keepLocal:true});
+  }
+  async function saveRedline({quiet=false}={}) {
     if(!ui.redline)throw new Error('请先重新扫描废标红线。');
     if(ui.edits.size)await saveDrafts();
-    const acknowledged=[...document.querySelectorAll('[data-wf="ack-redline"]:checked')].map(node=>node.dataset.id);
+    await refreshRedline();
+    if(!ui.redline)throw new Error(ui.redlineError||'请先重新扫描废标红线。');
+    const acknowledged=Object.fromEntries(ui.redline.items.filter(item=>item.acknowledged).map(item=>[item.id,item.basis]));
     ui.busy='正在保存红线核对…';ui.error='';paint();
     try{
-      ui.redline=await api(redlineUrl(state.project.id),{method:'POST',body:{
-        mapping_revision:state.project.mapping_revision,
-        chapter_revision:ui.editor?.revision??ui.redline.chapter_revision,
-        input_token:ui.redline.input_token,
-        acknowledged_ids:acknowledged}});
-      ui.redlineError='';
-      toast(ui.redline.complete?'废标红线已全部勾选确认。':`已保存；仍有 ${ui.redline.pending_count} 条红线待确认。`);
+      const scan=await api(redlineUrl(state.project.id),{method:'POST',body:{
+        mapping_revision:state.project.mapping_revision,acknowledged}});
+      bindRedline(scan);
+      if(!quiet)toast(ui.redline.complete?'废标红线已全部勾选确认。':`已保存；仍有 ${ui.redline.pending_count} 条红线待确认。`);
+    }catch(err){
+      await loadRedline({keepLocal:true});
+      throw err;
     }finally{ui.busy='';paint();}
+  }
+  function paintRedline() {
+    // 只替换红线面板，避免整页重绘打断用户正在输入的其他字段。
+    const panel=document.querySelector('#wf-redline-scan');
+    if(panel&&state.view==='dashboard'&&ui.step===5)panel.outerHTML=redlinePanel();
+  }
+  function backgroundRedlineRefresh() {
+    // 不阻塞当前操作：操作期间页面处于锁定状态，等待网络会让用户的其他输入被忽略。
+    flushRedlineRefresh().then(paintRedline).catch(()=>{});
+  }
+  async function flushRedlineRefresh() {
+    if(!redlineRefreshPending)return;
+    redlineRefreshPending=false;
+    await refreshRedline();
   }
   function guideRedlineCompletion() {
     if(!ui.redline){ui.error='请先完成废标红线扫描。';paint();document.querySelector('#wf-redline-scan')?.scrollIntoView({block:'center'});return true;}
@@ -743,6 +835,7 @@ const tenderFlow = (() => {
   }
   function error(err) {
     ui.error=err.message;paint();document.querySelector('.wf-error')?.scrollIntoView({block:'nearest'});
+    toast(err.message,true);
   }
   async function action(target) {
     const action=target.dataset.wf, id=target.dataset.id;
@@ -767,8 +860,11 @@ const tenderFlow = (() => {
       if(ui.outlineDirty)throw new Error('请先保存目录并核对更新后的预览。');
       if(ui.record.requirements_confirmed===false)throw new Error('请先确认采购要求。');
       if(!ui.previewLoaded)throw new Error('请等待整本预览加载完成。');
+      if(outlineIssues().length&&!ui.outlineCheckAck&&!ui.record.projects?.word){
+        guideWorkflowCompletion(3,`目录校验有 ${outlineIssues().length} 项需核对：请按建议修正后保存目录，或逐项核对后勾选确认。`,'#wf-outline-check-ack');return;
+      }
       if(state.dirty)await saveProject(false);
-      const project=await api(base(ui.record.id)+'/confirm',{method:'POST',body:{artifact_id:'word',revision:ui.record.revision}});
+      const project=await api(base(ui.record.id)+'/confirm',{method:'POST',body:{artifact_id:'word',revision:ui.record.revision,outline_check_acknowledged:!!ui.outlineCheckAck}});
       if(project.framework_id!==ui.record.id||project.framework_artifact_id!=='word')throw new Error('未能取得此框架的整本项目。');
       state.project=project;state.dirty=false;
       state.data.projects=[project,...state.data.projects.filter(p=>p.id!==project.id)];
@@ -800,6 +896,19 @@ const tenderFlow = (() => {
     if(action==='save-requirements'){await saveRequirements(false);return;}
     if(action==='confirm-requirements'){await saveRequirements(true);return;}
     if(action==='select-outline'){ui.outlineEditing=true;ui.outlineKey=id;paint();return;}
+    if(action==='outline-fix'){
+      const issue=outlineIssues()[Number(id)];
+      if(!issue)return;
+      let applied=0;
+      for(const fix of issue.fixes||[]){
+        const row=ui.outlineDraft.find(item=>item.id===fix.id);
+        if(row&&row.text!==fix.text){row.text=fix.text;applied++;}
+      }
+      if(!applied){toast('这些章节已按建议修改，或已在目录编辑中调整。');return;}
+      ui.outlineDirty=true;ui.outlineEditing=true;ui.outlineCheckAck=false;paint();
+      toast(`已按建议修改 ${applied} 个章节名称，请核对后点“保存目录并更新预览”。`);
+      document.querySelector('[data-wf="save-outline"]')?.scrollIntoView({block:'center'});return;
+    }
     if(action.startsWith('outline-')){editOutline(action);return;}
     if(action==='save-outline'){await saveOutline();return;}
     if(action==='reload-review'){
@@ -817,18 +926,26 @@ const tenderFlow = (() => {
       if(ui.edits.size&&!window.confirm('放弃本页尚未保存的正文修改，重新读取已存版本？'))return;
       await loadEditor();ui.edits.clear();paint();return;
     }
-    if(action==='save'){await saveDrafts();paint();return;}
+    if(action==='save'){await saveDrafts();paint();backgroundRedlineRefresh();return;}
+    if(action==='redline-chapter'){
+      if(ui.editor?.chapters?.some(c=>c.id===id)){ui.chapter=id;paint();document.querySelector('#wf-body')?.scrollIntoView({block:'center'});document.querySelector('#wf-body')?.focus({preventScroll:true});}
+      return;
+    }
     if(action==='export'){
       await saveDrafts();
       if(!ui.redline&&!ui.redlineError)await loadRedline();
+      else await refreshRedline();
+      redlineRefreshPending=false;
       paint();
       if(ui.redline?.items?.length){
-        const checked=[...document.querySelectorAll('[data-wf="ack-redline"]:checked')].map(node=>node.dataset.id);
-        if(checked.length!==ui.redline.items.length){if(guideRedlineCompletion())return;}
-        else if(!ui.redline.complete||checked.some(id=>!(ui.redline.acknowledged_ids||[]).includes(id))){
-          await saveRedline();
-          if(!ui.redline.complete){guideRedlineCompletion();return;}
+        if(!ui.redline.complete){guideRedlineCompletion();return;}
+        // 页面勾选须先保存到服务端；服务端也会在导出时再次校验。
+        if(redlineUnsaved()||(ui.redline.saved_ids||[]).length!==ui.redline.items.length){
+          await saveRedline({quiet:true});
+          if(!ui.redline.complete||redlineUnsaved()){guideRedlineCompletion();return;}
         }
+        const risks=ui.redline.items.filter(item=>item.status==='risk');
+        if(risks.length&&!window.confirm(`以下 ${risks.length} 条废标红线仍有风险提示，导出后请在递交前处理：\n\n${risks.map(item=>`· ${item.label}：${(item.findings||[])[0]||''}`).join('\n')}\n\n确认已知晓风险并继续导出？`))return;
       }else if(guideRedlineCompletion())return;
       await exportProject(target);return;
     }
@@ -895,6 +1012,7 @@ const tenderFlow = (() => {
       if(el.id==='wf-chapter'){ui.chapter=el.value;paint();}
       if(el.id==='wf-requirement-category'&&requirement()){requirement().category=el.value;ui.requirementCategory=el.value;ui.requirementsDirty=true;paint();}
       if(el.id==='wf-notes-ack'){ui.notesAcknowledged=el.checked;return;}
+      if(el.id==='wf-outline-check-ack'){ui.outlineCheckAck=el.checked;return;}
       if(el.matches?.('[data-wf="ack-removed"]')){
         if(el.checked)ui.removedAcknowledged.add(el.dataset.id);else ui.removedAcknowledged.delete(el.dataset.id);
         return;
@@ -903,11 +1021,11 @@ const tenderFlow = (() => {
         const item=ui.redline.items.find(row=>row.id===el.dataset.id);
         if(!item)return;
         item.acknowledged=el.checked;
-        ui.redline.acknowledged_ids=ui.redline.items.filter(row=>row.acknowledged).map(row=>row.id);
-        ui.redline.pending_count=ui.redline.items.filter(row=>!row.acknowledged).length;
-        ui.redline.complete=!ui.redline.pending_count;
-        const status=document.querySelector('#wf-redline-scan [role="status"]');
-        if(status)status.textContent=ui.redline.complete?'全部红线已勾选核对。':`尚有 ${ui.redline.pending_count} 条红线待人工勾选确认。修改正文或材料后须重新确认。`;
+        syncRedlineCounts();
+        const status=document.querySelector('#wf-redline-status');
+        if(status)status.textContent=redlineStatusText();
+        const save=document.querySelector('[data-wf="save-redline"]');
+        if(save)save.textContent=redlineUnsaved()?'保存红线核对（有未保存勾选）':'保存红线核对';
         return;
       }
     }catch(err){error(err);}

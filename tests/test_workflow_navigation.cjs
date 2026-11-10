@@ -102,7 +102,7 @@ test('completed prerequisites load writing without confirming or saving material
   const h=harness();h.ui.businessNotes='未用于生成的业务信息';h.ui.businessNotesDirty=true;
   await h.setStep(5);
   assert.equal(h.ui.step,5);assert.deepEqual(h.guidance,[{target:'export',step:4}]);
-  assert.deepEqual(h.calls.map(call=>call.url),['/api/projects/project/chapter-drafts','/api/projects/project/writing']);
+  assert.deepEqual(h.calls.map(call=>call.url),['/api/projects/project/chapter-drafts','/api/projects/project/writing','/api/projects/project/redline-scan']);
   assert.equal(h.ui.businessNotes,'未用于生成的业务信息');assert.equal(h.ui.businessNotesDirty,true);
 });
 

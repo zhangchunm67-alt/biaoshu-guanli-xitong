@@ -17,6 +17,41 @@ from docx.oxml.ns import qn
 
 import chapter_drafts
 
+# 证件、授权、文书模板等材料的正文含姓名、证件号等个人信息，从不发给 AI，只发名称。
+NAME_ONLY_CATEGORIES = {'legal_identity', 'authorization', 'text_template', 'business_license',
+                        'tax_social', 'audit_report'}
+# 公司简介、资质认证等不含个人信息的公司概况，任何方案章节都可能引用，始终附上正文。
+ALWAYS_CATEGORIES = {'company_profile', 'iso_cert', 'qualification'}
+# 其余栏目与章节标题的对应关系；章节命中时才附上该栏目材料正文。
+CATEGORY_TOPICS = {
+    'case': r'案例|业绩|经验|类似项目',
+    'people': r'团队|人员|项目经理|负责人|组织|配置|简历',
+    'resource': r'资源|渠道|媒体|平台|合作|优势',
+}
+
+
+def material_relevant(material, category_name, chapters):
+    """按本组章节标题、路径和原文判断材料是否相关；不相关的材料只发名称。"""
+    if material.get('category_id') in ALWAYS_CATEGORIES:
+        return True
+    text = '\n'.join(f"{c.get('path', '')}\n{c.get('title', '')}\n{c.get('original_text', '')}" for c in chapters)
+    pattern = CATEGORY_TOPICS.get(material.get('category_id'))
+    if pattern and re.search(pattern, text):
+        return True
+    names = [n for n in (category_name, material.get('name')) if n and len(n) >= 2]
+    return any(name in text for name in names)
+
+
+def outbound_materials(materials, chapters, categories):
+    rows = []
+    for material in materials:
+        row = dict(material)
+        cid = material.get('category_id')
+        if cid in NAME_ONLY_CATEGORIES or not material_relevant(material, categories.get(cid, ''), chapters):
+            row.update(content='', description='', text_available=False, content_withheld=True)
+        rows.append(row)
+    return rows
+
 
 class WritingService:
     def __init__(self, store):
@@ -247,15 +282,43 @@ class WritingService:
         materials = [{k:m.get(k, '') for k in ('id','name','category_id','subject','content','description','years','valid_until')} |
                      {'text_available':m.get('mode') == 'text'}
                      for m in self.store.all('material') if m['id'] in selected and not m.get('archived')]
+        category_names = {c['id']: c.get('name', '') for c in self.store.all('category')}
+        # 先按全部目标章节过滤一次；分组发送时再按每组章节过滤。
+        materials = outbound_materials(materials, chapters, category_names)
         req_ids = {i for c in chapters for i in c['requirement_ids']}
         requirements = [r for r in framework.get('requirements', []) if r['id'] in req_ids]
         source_ids = {ref.get('source_id', ref.get('id')) for r in requirements for ref in r.get('references', [])}
         context = dict(project={'id':key,'name':project['name']}, chapters=chapters,
+            category_names=category_names,
             requirements=requirements, procurement_sources=[s for s in framework.get('sources', []) if s['id'] in source_ids],
             case_sources=pack['sources'], materials=materials, business_notes=notes)
         if len(json.dumps(context, ensure_ascii=False)) > 650000:
             raise ValueError('本次正文资料超过处理容量，请精简或拆分案例包；未截断资料。')
         return context, skipped
+
+    def outbound(self, key, body):
+        """生成前确认：列出本次将发给 AI 服务的资料，不启动生成、不发送任何内容。"""
+        import writing_model
+        self._check_request(key, body, chapters=True)
+        notes = body.get('business_notes', '')
+        if not isinstance(notes, str) or len(notes) > 10000:
+            raise ValueError('业务补充信息最多 10000 字。')
+        context, skipped = self._context(key, notes, body.get('chapter_ids'))
+        groups = [context['chapters'][i:i+6] for i in range(0, len(context['chapters']), 6)]
+        sent = {m['id'] for group in groups
+                for m in outbound_materials(context['materials'], group, context['category_names'])
+                if not m.get('content_withheld')}
+        return dict(
+            model=writing_model.configuration().get('model'),
+            chapter_count=len(context['chapters']), group_count=len(groups),
+            chapters=[c['title'] for c in context['chapters']][:40], skipped=skipped,
+            requirement_count=len(context['requirements']),
+            procurement_source_count=len(context['procurement_sources']),
+            case_files=list(dict.fromkeys(s.get('file_name') or s.get('id') for s in context['case_sources']))[:40],
+            case_source_count=len(context['case_sources']),
+            materials_with_text=[m['name'] for m in context['materials'] if m['id'] in sent],
+            materials_name_only=[m['name'] for m in context['materials'] if m['id'] not in sent],
+            business_notes_length=len(notes))
 
     def start(self, key, body):
         import writing_model
@@ -307,6 +370,8 @@ class WritingService:
                     if self._stale(self.store.require('writing_job', ident)):
                         raise ValueError('生成期间目录、材料、案例或正文已更新，请重新生成。')
                 payload = dict(context, chapters=chapters)
+                payload['materials'] = outbound_materials(context['materials'], chapters, context['category_names'])
+                payload.pop('category_names', None)
                 reqs = {r for c in chapters for r in c['requirement_ids']}
                 payload['requirements'] = [r for r in context['requirements'] if r['id'] in reqs]
                 source_ids = {ref.get('source_id', ref.get('id'))

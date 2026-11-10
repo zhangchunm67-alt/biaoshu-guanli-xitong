@@ -124,9 +124,33 @@ POST /api/materials/validate 接收材料表单字段、可选 material_id 与 u
 - POST /api/projects/:id/writing/generate 可传 chapter_ids 选择目标章节；省略则生成全部可写章节。正文保存维护逐章修订；候选记录其输入依据和目标章修订，采纳时继续检查。单章重生成合并其他候选，不能清空其他章节或覆盖已保存正文。
 - 写作每批只发送本批要求所引用的采购来源，案例和已选材料仍按当前项目共享依据处理。共享依据变更仍采用保守失效，未实现按单份材料精确推断全部受影响章节。
 
+- POST /api/projects/:id/writing/outbound（请求体同 generate）-> 本次将发给 AI 的资料清单 {model, chapter_count, group_count, requirement_count, procurement_source_count, case_files, materials_with_text, materials_name_only, business_notes_length}，不启动生成。页面在 generate 前展示并须确认。
+- 发给 AI 的材料：法定代表人身份证明、授权委托书、文书模板、营业执照、纳税社保、审计报告只发名称；公司简介、ISO、资质始终发正文；其余栏目仅当本组章节标题、路径或原文与栏目相关时发正文。
+
+## 目录校验
+
+- GET /api/frameworks/:id 返回 `outline_check: {checked, issues:[{code, severity, message, chapter_ids, fixes:[{id, text}]}]}`，由 `skills/bid-response-framework/scripts/outline_check.py` 按当前目录计算。code：sequence（同级原文序号乱序/重复/跳号/不从 1 开始，附重新编号建议）、mixed_auto（原文序号与 Word 自动编号混用，附去掉原文序号建议）、mixed_style、level_style、attachment（只提示）、duplicate_title。
+- POST /api/frameworks/:id/confirm 首次确认时，有校验提示须带 `outline_check_acknowledged: true`，否则 400。
+
+## 废标红线扫描
+
+- GET /api/projects/:id/redline-scan -> {items:[{id,label,text,status:'risk'|'attention',findings,hints,auto_checked,linked_chapter_ids,material_category_ids,basis,acknowledged,ack_expired}],acknowledged_ids,pending_count,complete,scope}。
+- 自动检查只覆盖材料栏目缺漏/待补与关联章节是否有正文；保证金、签章、限价、有效期、工期、★条款等给出 hints 供人工核对。“重大税收违法”等违法失信表述不视为纳税凭证要求。
+- 每条红线的 basis 由该红线原文、关联章节正文、相关材料栏目计算；只有 basis 变化的红线确认失效。
+- POST /api/projects/:id/redline-scan {acknowledged:{红线id: basis}} 保存确认；basis 与当前不符的条目整体拒绝（400）。旧版 {input_token, acknowledged_ids} 仍接受，但 input_token 须与当前一致。
+- 框架项目导出（export / export-jobs）时服务端校验红线全部确认且依据未变，否则 400。
+
+## 远程入口（花生壳 / 局域网 / 节点）
+
+- 远程口 Host 须为 `--public-host` 或 `--lan-host` 登记的地址；材料新增修改、文件追加、栏目与行业维护、信用查询一律 403，投稿审核与材料原件读取同样 403。
+- 本机上传模板（非框架项目）的原页预览在远程口 403。
+- 登录：同一来源错 5 次后锁定 1 分钟并逐次翻倍（最长 30 分钟），远程口 10 分钟内累计错 30 次锁定 10 分钟；锁定返回 429。Bearer 口令同样计数。
+- 登录成功签发随机会话号 Cookie `bid_session`（HttpOnly、SameSite=Lax、Max-Age 12 小时，经 HTTPS 代理时加 Secure）；口令至少 12 个字符，支持中文。
+- 操作日志 `data/logs/access.log`：登录结果、POST/PATCH 与导出下载的时间、入口、来源地址、路径、状态码，不含正文与口令。
+
 ## 同事投稿与案例库
 
-投稿先进入暂存区（`data/submissions/<id>/`），入库前不进入材料库、项目自动匹配或正文写作。花生壳映射口可以提交和读取状态；文件读取、入库、退回和案例库维护仅限本机环回入口（映射口返回 403）。
+投稿先进入暂存区（`data/submissions/<id>/`），入库前不进入材料库、项目自动匹配或正文写作。远程口可以提交和读取状态（不含材料正文与给审核人的说明）；文件读取、入库、退回和案例库维护仅限本机环回入口（远程口返回 403）。含图片的投稿不能以文字排版入库。
 
 - POST /api/submissions {kind:'material'|'case', contributor, note, material?:{name,category_id,subject,version,years:[],valid_until,mode,content,description,client_name,case_name}, case?:{name,client_name,description}, files:[{name,data}]} -> 201 submission。
   - 材料图片按直接上传的同一规则检查（单张 15 MB、最多 100 张）；mode 为 text 时不接收图片、须有正文。category_id 可为空，非空时须为已启用、非信用受管栏目。

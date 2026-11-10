@@ -36,6 +36,21 @@ def metric_module():
     return tender_metrics
 
 
+def outline_check(record):
+    """目录校验（序号乱序、重复、跳号、混用自动编号、层级错位、附件序号、同级重名）。"""
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
+    from outline_check import check_outline
+    return check_outline(record.get('outline') or [])
+
+
+def require_outline_check_ack(record, body):
+    result = outline_check(record)
+    if result['issues'] and body.get('outline_check_acknowledged') is not True:
+        raise ValueError(f'目录校验发现 {len(result["issues"])} 项序号或结构问题。请按提示修正后保存目录，'
+                         '或逐项核对后勾选“已核对目录校验提示”再确认。')
+
+
 def ensure_required_sections(plan):
     if str(SCRIPTS) not in sys.path:
         sys.path.insert(0, str(SCRIPTS))
@@ -268,6 +283,7 @@ def public(record):
     if not record.get('review_version'):
         value.update(review_editable=False, revision=0, requirements_confirmed=True,
                      requirements=[], sources=[])
+    value['outline_check'] = outline_check(record)
     return value
 
 
@@ -546,6 +562,8 @@ def confirm(store, key, body):
             if pid:
                 project = store.require('project', pid)
             else:
+                if record.get('review_version'):
+                    require_outline_check_ack(record, body)
                 project = new_project(store, record)
                 # Edits publish a new template; old projects/exports stay immutable.
                 # Surviving stable chapter IDs retain the user's authored text.

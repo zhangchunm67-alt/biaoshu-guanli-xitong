@@ -8,7 +8,7 @@ let chromium;
 try { ({chromium}=require('playwright')); }
 catch { ({chromium}=require('/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright')); }
 const app=path.resolve(__dirname,'..'),root=fs.mkdtempSync(path.join(os.tmpdir(),'bid-books-ui-'));
-const python=path.join(app,'.venv/bin/python');
+const python=process.env.BID_TEST_PYTHON||path.join(app,'.venv/bin/python');
 const setup=spawnSync(python,['-B','-c',`
 import base64,json,os,sys
 from pathlib import Path

@@ -32,6 +32,7 @@ import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageOps
 
+from access_guard import AuditLog, LoginGuard, LoginLocked, Sessions
 from contributions import Contributions
 from credit_service import CreditService, MANAGED_IDS
 from errors import ConflictError
@@ -53,7 +54,9 @@ MAX_PIXELS = 40_000_000
 REQUEST_READ_TIMEOUT = 30
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 IMAGE_FORMATS = {'PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF'}
-ACCESS_COOKIE = 'bid_access'
+ACCESS_COOKIE = 'bid_session'
+MIN_TOKEN_LENGTH = 12
+PLACEHOLDER_TOKENS = {'请改成足够长的口令', 'changeme', 'password'}
 LOGIN_PATH = '/login'
 
 
@@ -70,6 +73,18 @@ def normalize_public_host(value):
     return host
 
 
+def normalize_remote_hosts(values):
+    """花生壳域名、局域网地址、节点地址等远程入口 Host，去重后保持顺序。"""
+    hosts = []
+    for value in values or []:
+        for part in str(value).replace('，', ',').split(','):
+            if part.strip():
+                host = normalize_public_host(part)
+                if host not in hosts:
+                    hosts.append(host)
+    return hosts
+
+
 def normalize_bind_host(value):
     host = text_value(value, '监听地址', 64, True)
     if host not in {'127.0.0.1', '0.0.0.0'}:
@@ -79,8 +94,10 @@ def normalize_bind_host(value):
 
 def normalize_access_token(value):
     token = text_value(value, '访问口令', 200, True)
-    if len(token) < 8:
-        raise ValueError('访问口令至少 8 个字符')
+    if '请改成' in token or token in PLACEHOLDER_TOKENS:
+        raise ValueError('访问口令仍是示例占位内容，请在 .env.oray 中改成自己的口令')
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise ValueError(f'访问口令至少 {MIN_TOKEN_LENGTH} 个字符')
     return token
 
 
@@ -1157,6 +1174,9 @@ class Store(SpecialLibrary):
             raise ValueError('请先进入文字材料核对，再导出标书。')
         if project.get('material_flow') == 'text-first' and not project.get('text_review_confirmed'):
             raise ValueError('请先保存文字材料核对，再导出标书。')
+        if project.get('framework_id'):
+            import redline_scan
+            redline_scan.require_complete(self, project)
         materials = self.internal_materials(include_special=True, project=project)
         categories = self.matching_categories(project)
         mappings = engine.validate_mappings(project['mappings'], materials, project['headings'], categories, context=context,
@@ -1277,18 +1297,21 @@ class Handler(BaseHTTPRequestHandler):
         """remote = 花生壳映射口（材料永不可下）；local = 本机环回口；None = 未启用花生壳。"""
         return getattr(self.server, 'access_mode', None)
 
+    def remote_hosts(self):
+        """花生壳域名及局域网、节点地址；这些 Host 都按远程入口对待。"""
+        hosts = list(getattr(self.server, 'remote_hosts', None) or [])
+        public = getattr(self.server, 'public_host', None)
+        if public and public.lower() not in hosts:
+            hosts.insert(0, public.lower())
+        return hosts
+
     def allowed_hosts(self):
         mode = self.access_mode()
         if mode == 'remote':
-            public = getattr(self.server, 'public_host', None)
-            return {public.lower()} if public else set()
+            return set(self.remote_hosts())
         if mode == 'local':
             return self.local_hosts()
-        hosts = self.local_hosts()
-        public = getattr(self.server, 'public_host', None)
-        if public:
-            hosts.add(public.lower())
-        return hosts
+        return self.local_hosts() | set(self.remote_hosts())
 
     def origin_key(self, value):
         try:
@@ -1314,8 +1337,7 @@ class Handler(BaseHTTPRequestHandler):
                     ('http', 'localhost', self.server.server_port)}
             if mode == 'local':
                 return keys
-        public = getattr(self.server, 'public_host', None)
-        if public and mode != 'local':
+        for public in self.remote_hosts():
             try:
                 parsed = urlsplit('//' + public)
                 host = (parsed.hostname or '').lower().rstrip('.')
@@ -1347,13 +1369,17 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if mode == 'local':
             return False
-        public = getattr(self.server, 'public_host', None)
-        return bool(public) and self.request_host() == public.lower()
+        return self.request_host() in self.remote_hosts()
 
     def require_intranet_files(self):
         """身份证、营业执照等材料原件仅允许本机环回入口读取，花生壳映射口不可下载。"""
         if self.is_public_request():
             raise PermissionError('营业执照、身份证等材料原件仅限内网查看；花生壳外网不可下载或导出含材料文件。')
+
+    def require_local_admin(self):
+        """材料库与栏目维护只在本机入口进行；远程同事通过投稿提交，由本机审核入库。"""
+        if self.is_public_request():
+            raise PermissionError('材料库维护仅限本机入口；外网请通过“投稿入库”提交材料，由本机审核后入库。')
 
     def require_reviewer(self):
         """投稿可从花生壳提交，但查看投稿文件、入库和退回只在本机环回入口进行。"""
@@ -1398,17 +1424,44 @@ class Handler(BaseHTTPRequestHandler):
         }
         return payload
 
+    def client_source(self):
+        return self.client_address[0] if self.client_address else ''
+
+    def token_matches(self, candidate):
+        expected = getattr(self.server, 'access_token', None)
+        if not expected or not isinstance(candidate, str):
+            return False
+        # compare_digest 只接受 ASCII 字符串；统一转字节，中文口令才能正常比较。
+        return secrets.compare_digest(candidate.encode('utf-8'), expected.encode('utf-8'))
+
     def access_authenticated(self):
         token = getattr(self.server, 'access_token', None)
         if not token:
             return True
-        auth = self.headers.get('Authorization', '')
-        if auth.startswith('Bearer ') and secrets.compare_digest(auth[7:], token):
-            return True
         cookie = SimpleCookie()
-        cookie.load(self.headers.get('Cookie', ''))
+        try:
+            cookie.load(self.headers.get('Cookie', ''))
+        except Exception:
+            cookie = SimpleCookie()
         morsel = cookie.get(ACCESS_COOKIE)
-        return bool(morsel and secrets.compare_digest(unquote(morsel.value), token))
+        if morsel and self.server.sessions.valid(unquote(morsel.value)):
+            return True
+        auth = self.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            guard, source = self.server.login_guard, self.client_source()
+            guard.check(source)
+            if self.token_matches(auth[7:]):
+                guard.success(source)
+                return True
+            guard.failure(source)
+            self.audit('login', result='failed', via='bearer')
+        return False
+
+    def audit(self, action, **fields):
+        log = getattr(self.server, 'audit_log', None)
+        if log:
+            log.write(action=action, entry=self.access_mode() or 'single',
+                      source=self.client_source(), **fields)
 
     def login_page(self, message='', status=401):
         intranet_port = getattr(self.server, 'intranet_port', None)
@@ -1417,6 +1470,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             default = '请输入访问口令。营业执照、身份证等材料原件仅本机可查看。'
         notice = html.escape(message or default)
+        help_line = '<p class=help>没有口令或忘记口令，请联系本机管理员。</p>'
         body = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>标书管理系统 · 访问验证</title>
 <style>body{{font:16px/1.5 system-ui,sans-serif;margin:0;background:#f4f6f8;color:#1f2937}}
@@ -1424,18 +1478,20 @@ main{{max-width:420px;margin:12vh auto;padding:28px;background:#fff;border-radiu
 h1{{font-size:1.25rem;margin:0 0 8px}}p{{color:#64748b;margin:0 0 18px}}label{{display:block;margin-bottom:12px}}
 input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;font:inherit}}
 button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f766e;color:#fff;font:inherit;cursor:pointer}}
-.err{{color:#b91c1c;margin-bottom:12px}}</style>
+.err{{color:#b91c1c;margin-bottom:12px}}.help{{font-size:.875rem;margin:14px 0 0}}</style>
 <main><h1>标书管理系统</h1><p>本机服务器远程访问。材料原件不出内网。</p>
 {"<p class=err>"+notice+"</p>" if message else "<p>"+notice+"</p>"}
 <form method="post" action="{LOGIN_PATH}"><label>访问口令<input type="password" name="token" required minlength="8" autocomplete="current-password"></label>
-<button type="submit">进入系统</button></form></main>'''.encode()
+<button type="submit">进入系统</button></form>{help_line}</main>'''.encode()
         self.send_bytes(body, 'text/html; charset=utf-8', status, login=True)
 
-    def set_access_cookie(self, token):
+    def set_access_cookie(self, session_id):
+        # Cookie 只携带随机会话号，不含口令；会话到期后需重新登录。
         # 花生壳免费映射是 HTTP；只有反向代理明确告知 HTTPS 时才加 Secure，
         # 否则浏览器会丢弃该 Cookie，导致登录后仍停在验证页。
         forwarded_proto = (self.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
-        attrs = f'{ACCESS_COOKIE}={quote(token, safe="")}; Path=/; HttpOnly; SameSite=Lax'
+        ttl = int(self.server.sessions.ttl)
+        attrs = f'{ACCESS_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}'
         if forwarded_proto == 'https':
             attrs += '; Secure'
         return [('Set-Cookie', attrs)]
@@ -1468,13 +1524,28 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             token = payload.get('token', '') if isinstance(payload, dict) else ''
         else:
             raise ValueError('请使用登录表单提交口令')
-        expected = getattr(self.server, 'access_token', None)
-        if not expected or not isinstance(token, str) or not secrets.compare_digest(token, expected):
-            return self.login_page('口令不正确', 401)
+        guard, source = self.server.login_guard, self.client_source()
+        try:
+            guard.check(source)
+        except LoginLocked as exc:
+            self.audit('login', result='locked')
+            return self.login_page(str(exc), 429)
+        if not self.token_matches(token):
+            remaining = guard.failure(source)
+            self.audit('login', result='failed')
+            if remaining:
+                return self.login_page(f'口令不正确，还可尝试 {remaining} 次；如忘记口令，请联系本机管理员。', 401)
+            try:
+                guard.check(source)
+            except LoginLocked as exc:
+                return self.login_page(str(exc), 429)
+            return self.login_page('口令不正确，请联系本机管理员。', 401)
+        guard.success(source)
+        self.audit('login', result='ok')
         body = ('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/">'
                 '<p>验证成功，正在进入…</p>').encode()
         self.send_bytes(body, 'text/html; charset=utf-8', 303, login=True,
-                        extra_headers=self.set_access_cookie(expected) + [('Location', '/')])
+                        extra_headers=self.set_access_cookie(self.server.sessions.create()) + [('Location', '/')])
 
     def require_access(self):
         if not getattr(self.server, 'access_token', None):
@@ -1621,6 +1692,7 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             if len(bits) >= 3 and bits[:2] == ['api', 'materials'] and (
                     (method == 'PATCH' and len(bits) == 3) or
                     (method == 'POST' and len(bits) == 4 and bits[3] == 'files')):
+                self.require_local_admin()
                 store.require_material_revision(store.require('material', bits[2]), body)
             if method == 'POST' and len(bits) == 4 and bits[:2] == ['api', 'submissions'] and bits[3] in {'accept', 'reject'}:
                 self.require_reviewer()
@@ -1630,12 +1702,16 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 self.require_reviewer()
                 return self.json_response(store.contributions.update_case(bits[2], body))
             if method == 'POST' and path == '/api/credit-automation/check':
+                self.require_local_admin()
                 return self.json_response(store.credit.check(body), 202)
             if method == 'POST' and path == '/api/categories':
+                self.require_local_admin()
                 return self.json_response(store.category(body), 201)
             if method == 'PATCH' and len(bits) == 3 and bits[:2] == ['api', 'categories']:
+                self.require_local_admin()
                 return self.json_response(store.category(body, bits[2]))
             if method == 'POST' and path == '/api/industries':
+                self.require_local_admin()
                 name = text_value(body.get('name', ''), '行业名称', 80, True)
                 if any(v['name'] == name for v in store.all('industry')):
                     raise ValueError('该行业已存在')
@@ -1645,10 +1721,10 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             if method == 'POST' and path == '/api/materials/validate':
                 return self.json_response(store.validate_material_form(body))
             if method == 'POST' and path == '/api/materials':
-                if body.get('files'):
-                    self.require_intranet_files()
+                self.require_local_admin()
                 return self.json_response(self.redact_public_payload(store.material(body)), 201)
             if method == 'PATCH' and len(bits) == 3 and bits[:2] == ['api', 'materials']:
+                self.require_local_admin()
                 return self.json_response(self.redact_public_payload(store.material(body, bits[2])))
             if method == 'POST' and len(bits) == 4 and bits[:2] == ['api', 'materials'] and bits[3] == 'files':
                 self.require_intranet_files()
@@ -1661,6 +1737,8 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             if method == 'POST' and len(bits) == 5 and bits[:2] == ['api', 'projects'] and bits[3] == 'writing':
                 if bits[4] == 'generate':
                     return self.json_response(store.writing.start(bits[2], body), 202)
+                if bits[4] == 'outbound':
+                    return self.json_response(store.writing.outbound(bits[2], body))
                 if bits[4] == 'accept':
                     return self.json_response(store.writing.accept(bits[2], body))
             if method == 'PATCH' and len(bits) == 4 and bits[:2] == ['api', 'projects'] and bits[3] == 'chapter-drafts':
@@ -1695,7 +1773,31 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 return self.send_bytes((APP_DIR / target[0]).read_bytes(), target[1])
         raise LookupError('页面或接口不存在')
 
+    def send_response(self, code, message=None):
+        self._status = code
+        super().send_response(code, message)
+
     def run_request(self):
+        self._status = None
+        try:
+            return self._run_request()
+        finally:
+            self.audit_request()
+
+    def audit_request(self):
+        path = urlsplit(self.path).path
+        if path == LOGIN_PATH:
+            return  # 登录结果已单独记录
+        if self.command in {'POST', 'PATCH'}:
+            action = 'change'
+        elif self.command == 'GET' and re.fullmatch(r'/api/exports/[^/]+/(?:download|report)', path):
+            action = 'download'
+        else:
+            return
+        # 只记录接口路径（含对象标识）与结果，不记录请求正文。
+        self.audit(action, method=self.command, path=path[:300], status=self._status)
+
+    def _run_request(self):
         # A keep-alive handler serves multiple requests. Never reuse a prior body.
         self.__dict__.pop('_request_body', None)
         path = unquote(urlsplit(self.path).path)
@@ -1766,6 +1868,12 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 self.validate_origin(self.command == 'POST')
                 key, preview_id, page_number = preview_route.groups()
                 store = self.server.store
+                if self.is_public_request():
+                    with store.lock:
+                        uploaded = not store.require('project', key).get('framework_id')
+                    if uploaded:
+                        # 本机上传的历史模板常嵌有证件、执照图片，原页渲染图只限本机查看。
+                        raise PermissionError('本机上传的模板原页预览仅限本机入口；外网可按目录标题核对位置。')
                 if self.command == 'POST' and not preview_id:
                     body = self.body()
                     with store.lock:
@@ -1805,7 +1913,9 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
 
     def request_error(self, exc):
         self.close_connection = True
-        if isinstance(exc, AuthRequired):
+        if isinstance(exc, LoginLocked):
+            code, message = 429, str(exc)
+        elif isinstance(exc, AuthRequired):
             code, message = 401, str(exc)
         elif isinstance(exc, ConflictError):
             code, message = 409, str(exc)
@@ -1815,6 +1925,9 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             code, message = 404, str(exc)
         elif isinstance(exc, (ValueError, TypeError)):
             code, message = 400, str(exc) if isinstance(exc, ValueError) else '请求字段格式不正确'
+            if not re.search(r'[\u4e00-\u9fff]', message):
+                # Python 内部报错（如 int() 解析失败）不直接返回给页面。
+                message = '请求参数格式不正确，请刷新页面后重试'
         elif isinstance(exc, FileNotFoundError):
             code, message = 404, '本地资料文件缺失，请重新上传'
         else:
@@ -1834,11 +1947,15 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
 
 
 def _attach_server(httpd, *, store, bind_host, public, token, access_mode=None, intranet_port=None,
-                   owns_store=True):
+                   owns_store=True, remote_hosts=None):
     httpd.daemon_threads = True
     httpd.store = store
     httpd.bind_host = bind_host
     httpd.public_host = public
+    httpd.remote_hosts = list(remote_hosts or ([public] if public else []))
+    httpd.login_guard = LoginGuard()
+    httpd.sessions = Sessions()
+    httpd.audit_log = AuditLog(store.root)
     httpd.access_token = token
     httpd.access_mode = access_mode
     httpd.intranet_port = intranet_port
@@ -1848,10 +1965,11 @@ def _attach_server(httpd, *, store, bind_host, public, token, access_mode=None, 
 
 def create_server(port=8766, data_dir=DEFAULT_DATA, seed=None, source_root=SOURCE_ROOT,
                   host='127.0.0.1', public_host=None, access_token=None, access_mode=None,
-                  intranet_port=None, store=None):
+                  intranet_port=None, store=None, lan_hosts=None):
     seed = Path(data_dir).resolve() == DEFAULT_DATA.resolve() if seed is None else seed
     bind_host = normalize_bind_host(host)
-    public = normalize_public_host(public_host) if public_host else None
+    remote_hosts = normalize_remote_hosts([public_host or '', *(lan_hosts or [])])
+    public = remote_hosts[0] if remote_hosts else None
     token = normalize_access_token(access_token) if access_token else None
     if public and not token:
         raise ValueError('启用花生壳公网域名时必须设置访问口令（--access-token）')
@@ -1871,7 +1989,8 @@ def create_server(port=8766, data_dir=DEFAULT_DATA, seed=None, source_root=SOURC
         httpd = ThreadingHTTPServer((bind_host, port), Handler)
         return _attach_server(
             httpd, store=store, bind_host=bind_host, public=public, token=token,
-            access_mode=access_mode, intranet_port=intranet_port, owns_store=owns_store)
+            access_mode=access_mode, intranet_port=intranet_port, owns_store=owns_store,
+            remote_hosts=remote_hosts)
     except Exception:
         if owns_store:
             store.close()
@@ -1879,11 +1998,13 @@ def create_server(port=8766, data_dir=DEFAULT_DATA, seed=None, source_root=SOURC
 
 
 def create_oray_servers(port=8766, intranet_port=None, data_dir=DEFAULT_DATA, seed=None,
-                        source_root=SOURCE_ROOT, host='0.0.0.0', public_host=None, access_token=None):
-    """花生壳模式：映射口（remote）永不下发材料；本机环回口（local）可查看材料。"""
-    public = normalize_public_host(public_host) if public_host else None
-    if not public:
-        raise ValueError('create_oray_servers 需要 public_host')
+                        source_root=SOURCE_ROOT, host='127.0.0.1', public_host=None, access_token=None,
+                        lan_hosts=None):
+    """远程模式：远程口（remote，花生壳/局域网/节点）永不下发材料；本机环回口（local）可查看材料。"""
+    remote_hosts = normalize_remote_hosts([public_host or '', *(lan_hosts or [])])
+    if not remote_hosts:
+        raise ValueError('远程模式需要花生壳域名或局域网/节点访问地址')
+    public, extra = remote_hosts[0], remote_hosts[1:]
     remote_port = int(port)
     requested_local = None if intranet_port in (None, 0) else int(intranet_port)
     if remote_port < 0 or remote_port > 65535:
@@ -1900,7 +2021,7 @@ def create_oray_servers(port=8766, intranet_port=None, data_dir=DEFAULT_DATA, se
         remote = create_server(
             port=remote_port, data_dir=data_dir, seed=seed_flag, source_root=source_root,
             host=host, public_host=public, access_token=access_token, access_mode='remote',
-            intranet_port=None, store=store)
+            intranet_port=None, store=store, lan_hosts=extra)
         remote.owns_store = True
         if requested_local is None:
             local_port = 0 if remote_port == 0 else remote.server_port + 1
@@ -1923,28 +2044,66 @@ def create_oray_servers(port=8766, intranet_port=None, data_dir=DEFAULT_DATA, se
         raise
 
 
+ORAY_ENV_KEYS = {'ORAY_PUBLIC_HOST', 'ORAY_LAN_HOSTS', 'ORAY_ACCESS_TOKEN', 'ORAY_PORT', 'ORAY_INTRANET_PORT'}
+
+
+def load_oray_env(path):
+    """读取 .env.oray（KEY=VALUE，# 开头为注释）；已存在的环境变量优先。"""
+    path = Path(path)
+    if not path.is_file():
+        raise SystemExit(f'未找到 {path.name}。请复制 .env.oray.example 为 .env.oray 并填写访问地址与口令。')
+    for line in path.read_text(encoding='utf-8-sig').splitlines():
+        key, sep, value = line.strip().partition('=')
+        key = key.strip()
+        if sep and key in ORAY_ENV_KEYS and not key.startswith('#'):
+            os.environ.setdefault(key, value.strip().strip('"\''))
+
+
 def main():
     import writing_model
     writing_model.load_local_env(APP_DIR)
     parser = argparse.ArgumentParser(description='标书管理系统（默认仅本机；花生壳模式可远程访问）')
-    parser.add_argument('--port', type=int, default=8766)
+    parser.add_argument('--port', type=int, default=None, help='端口，默认 8766（或 .env.oray 中的 ORAY_PORT）')
+    parser.add_argument('--env-file', type=Path, default=None,
+                        help='读取远程访问配置，例如 .env.oray（Windows 启动脚本使用）')
     parser.add_argument('--intranet-port', type=int, default=0,
                         help='花生壳模式下本机材料入口端口，默认映射口+1')
-    parser.add_argument('--host', default='127.0.0.1', help='监听地址：127.0.0.1（默认）或 0.0.0.0（花生壳）')
+    parser.add_argument('--host', default=None,
+                        help='远程口监听地址：127.0.0.1（默认，仅花生壳客户端可连）或 0.0.0.0（局域网/节点直连）')
     parser.add_argument('--public-host', default='', help='花生壳访问域名，例如 xxx.imwork.net')
-    parser.add_argument('--access-token', default='', help='远程访问口令；启用公网域名时必填')
+    parser.add_argument('--lan-host', action='append', default=[],
+                        help='局域网或节点访问地址（IP:端口或域名:端口），可重复或用逗号分隔；需配合 --host 0.0.0.0')
+    parser.add_argument('--access-token', default='',
+                        help='远程访问口令；建议改用环境变量 ORAY_ACCESS_TOKEN，避免口令出现在进程列表')
     parser.add_argument('--data-dir', type=Path, default=DEFAULT_DATA)
     parser.add_argument('--seed', action='store_true', default=None, help='向自定义数据目录导入交付包材料')
     parser.add_argument('--open', action='store_true', help='启动后打开浏览器')
     args = parser.parse_args()
-    public_host = args.public_host.strip() or None
-    access_token = args.access_token.strip() or None
+    if args.env_file:
+        load_oray_env(args.env_file)
+    env = os.environ.get
+    try:
+        if args.port is None:
+            args.port = int(env('ORAY_PORT', '').strip() or 8766)
+        if not args.intranet_port and env('ORAY_INTRANET_PORT', '').strip() and args.env_file:
+            args.intranet_port = int(env('ORAY_INTRANET_PORT').strip())
+    except ValueError:
+        parser.error('ORAY_PORT / ORAY_INTRANET_PORT 须为数字')
+    public_host = args.public_host.strip() or (env('ORAY_PUBLIC_HOST', '').strip() if args.env_file else '') or None
+    lan_hosts = normalize_remote_hosts(args.lan_host or ([env('ORAY_LAN_HOSTS', '')] if args.env_file else []))
+    access_token = args.access_token.strip() or env('ORAY_ACCESS_TOKEN', '').strip() or None
     intranet_port = args.intranet_port or None
     local_server = None
-    if public_host:
+    if args.host is None:
+        args.host = '0.0.0.0' if lan_hosts else '127.0.0.1'
+    if lan_hosts and args.host != '0.0.0.0':
+        parser.error('配置了 --lan-host 时须同时使用 --host 0.0.0.0，局域网或节点才能连上')
+    if args.env_file and not (public_host or lan_hosts):
+        parser.error('.env.oray 须至少设置 ORAY_PUBLIC_HOST 或 ORAY_LAN_HOSTS')
+    if public_host or lan_hosts:
         server, local_server = create_oray_servers(
             port=args.port, intranet_port=intranet_port, data_dir=args.data_dir, seed=args.seed,
-            host=args.host, public_host=public_host, access_token=access_token)
+            host=args.host, public_host=public_host, access_token=access_token, lan_hosts=lan_hosts)
     else:
         server = create_server(args.port, args.data_dir, args.seed, host=args.host,
                                public_host=public_host, access_token=access_token)
@@ -1956,8 +2115,9 @@ def main():
                 if local_server else f'http://127.0.0.1:{server.server_port}')
     if local_server:
         print(f'本机材料入口：{open_url} （仅 127.0.0.1，勿映射到花生壳）', flush=True)
-        print(f'花生壳映射口：http://127.0.0.1:{server.server_port}/ （外网不可下载材料）', flush=True)
-        print(f'花生壳远程入口：http://{server.public_host}/ （须映射到 127.0.0.1:{server.server_port}）', flush=True)
+        print(f'远程口：{server.bind_host}:{server.server_port} （外网/局域网不可下载材料）', flush=True)
+        for host in server.remote_hosts:
+            print(f'远程访问地址：http://{host}/', flush=True)
         print('外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机材料入口。', flush=True)
         threading.Thread(target=local_server.serve_forever, daemon=True).start()
     else:

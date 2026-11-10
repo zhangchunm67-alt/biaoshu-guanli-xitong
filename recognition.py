@@ -122,7 +122,7 @@ def _matches(text, key):
                     or re.fullmatch(r'(?:\d+[.、])?授权书[：:；;]?', v))
     if key == 'audit_report':
         return bool(re.search(r'审计报告|财务(?:会计)?(?:报告|报表)|资产负债表|现金流量表|利润表', v) and
-                    (_REQUEST.search(v) or re.fullmatch(r'(?:[（(]?\d+[）).、])?(?:近?[一二三\d-]+年(?:度)?)?(?:财务|财务会计)(?:报告|报表)',v)))
+                    (_REQUEST.search(v) or re.fullmatch(r'(?:[（(]?\d+[）).、])?(?:近?[一二三两\d-]+年(?:度)?)?(?:(?:财务|财务会计)(?:审计)?(?:报告|报表)|审计报告)',v)))
     if key == 'tax_social':
         personal = re.search(r'(?:人员|个人|成员|团队|项目负责人|项目经理|员工).{0,65}(?:社保|社会保险)', v)
         corporate = re.search(r'缴纳税收|税收缴纳|依法缴纳税|完税凭证|纳税证明', v)

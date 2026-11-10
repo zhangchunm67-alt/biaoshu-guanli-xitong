@@ -95,6 +95,13 @@ finally:s.server_close();store.close()
     const writingRequests = [];
     page.on('request', request => {if(request.url().startsWith(writingUrl))writingRequests.push(request);});
     page.on('pageerror', error => errors.push(error.message));
+    // 生成前的“外发资料确认”统一接受并记录；其他确认框按 nextDialog 处理（默认取消，与无监听时一致）。
+    let nextDialog=null; const outbound=[];
+    page.on('dialog', dialog => {
+      if(dialog.message().startsWith('生成初稿将把以下资料')){outbound.push(dialog.message());return dialog.accept();}
+      const act=nextDialog; nextDialog=null;
+      return act==='accept'?dialog.accept():dialog.dismiss();
+    });
     const readWriting = async () => {
       const response = await page.request.get(writingUrl);
       assert.ok(response.ok(), await response.text());
@@ -121,6 +128,10 @@ finally:s.server_close();store.close()
     assert.equal(await page.locator('#wf-business-notes-status').isVisible(), true);
     await page.locator('[data-wf=generate-writing]').click();
     await page.locator('.wf-writing-progress').waitFor();
+    assert.equal(outbound.length,1);
+    assert.match(outbound[0],/case-one\.txt/);
+    assert.match(outbound[0],/业务补充信息：\d+ 字/);
+    assert.match(outbound[0],/证件、授权书等正文不发送/);
     assert.equal(await page.locator('.wf-step[data-id="4"]').isEnabled(), true);
     await page.locator('.wf-step[data-id="4"]').click();
     await page.getByRole('heading',{name:'系统填充',exact:true}).waitFor();
@@ -149,10 +160,10 @@ finally:s.server_close();store.close()
     await page.locator('#wf-business-notes').fill(savedNotes);
     assert.equal(await page.locator('#wf-business-notes-status').isVisible(), false);
     assert.match(await page.locator('#wf-body').inputValue(), /MANUAL-BEFORE-GENERATION/);
-    page.once('dialog', dialog => dialog.dismiss());
+    nextDialog='dismiss';
     await page.locator('[data-wf=accept-writing]').click();
     assert.match(await page.locator('#wf-body').inputValue(), /MANUAL-BEFORE-GENERATION/);
-    page.once('dialog', dialog => dialog.accept());
+    nextDialog='accept';
     await page.locator('[data-wf=accept-writing]').click();
     await page.waitForFunction(() => document.querySelector('#wf-body')?.value.includes('WRITING-CANDIDATE-'));
     assert.equal(await page.locator('[data-wf=accept-writing]').isDisabled(), true);
@@ -179,20 +190,20 @@ finally:s.server_close();store.close()
     writing = await readWriting();
     assert.deepEqual(writing.job.stale_chapter_ids,[fixture.first]);
     await page.locator('#wf-business-notes').fill('SIMULATED-FAILURE');
-    page.once('dialog',dialog=>dialog.accept());
+    nextDialog='accept';
     await page.locator('[data-wf=generate-chapter-writing]').click();
     await page.waitForFunction(()=>document.querySelector('#wf-writing-status')?.textContent.includes('模拟写作服务失败'));
     await page.locator('#wf-chapter').selectOption(fixture.second);
     assert.match(await page.locator('.wf-candidate-text').innerText(),/WRITING-CANDIDATE-/);
     assert.equal(await page.locator('[data-wf=accept-writing]').isEnabled(),true);
-    page.once('dialog',dialog=>dialog.accept());
+    nextDialog='accept';
     await page.locator('[data-wf=accept-writing]').click();
     writing = await readWriting();
     assert.ok(writing.job.accepted_chapter_ids.includes(fixture.second));
     await page.locator('#wf-chapter').selectOption(fixture.first);
     assert.match(await page.locator('#wf-body').inputValue(),/MANUAL-LOCAL-EDIT/);
     await page.locator('#wf-business-notes').fill('BUSINESS-NOTES-ALPHA：仅重新编写当前章节。');
-    page.once('dialog',dialog=>dialog.accept());
+    nextDialog='accept';
     await page.locator('[data-wf=generate-chapter-writing]').click();
     await page.locator('.wf-writing-progress').waitFor();
     writing = await waitCompleted();
@@ -200,7 +211,7 @@ finally:s.server_close();store.close()
     assert.deepEqual(writing.job.chapters.find(c=>c.chapter_id===fixture.second),secondCandidate);
     assert.ok(writing.job.accepted_chapter_ids.includes(fixture.second));
     assert.match(await page.locator('#wf-body').inputValue(),/MANUAL-LOCAL-EDIT/);
-    page.once('dialog',dialog=>dialog.accept());
+    nextDialog='accept';
     await page.locator('[data-wf=accept-all-writing]').click();
     await page.waitForFunction(()=>document.querySelector('[data-wf=accept-all-writing]')?.disabled===true);
     assert.ok(writingRequests.some(request=>request.url().includes('?view=status')), 'browser must use the lightweight polling view');
@@ -211,7 +222,7 @@ finally:s.server_close();store.close()
     assert.equal('chapters' in lightweight.job,false);
 
     // A new package invalidates old candidates while preserving adopted prose.
-    page.once('dialog', dialog => dialog.accept());
+    nextDialog='accept';
     await page.locator('#wf-case-upload').setInputFiles(path.join(root,'case-bundle.zip'));
     await page.locator('.wf-case-files').getByText('case-bundle.zip',{exact:true}).waitFor();
     writing = await readWriting();
@@ -232,7 +243,7 @@ finally:s.server_close();store.close()
     assert.match(await page.locator('.wf-candidate-text').innerText(), /CASE-ZIP-EVIDENCE/);
     await page.locator('#wf-writing-candidate .wf-source-evidence > summary').click();
     assert.match(await page.locator('.wf-writing-sources').innerText(), /case-bundle\.zip.*项目说明\.md/);
-    page.once('dialog', dialog => dialog.accept());
+    nextDialog='accept';
     await page.locator('[data-wf=accept-all-writing]').click();
     await page.waitForFunction(() => document.querySelector('#wf-body')?.value.includes('CASE-ZIP-EVIDENCE'));
 

@@ -69,7 +69,10 @@ class SpecialLibrary:
             return query.get(k, [default])[0]
         category, industry, search = arg('category_id'), arg('industry_id'), arg('q').casefold()
         review, archive = arg('review_status'), arg('archived', 'false') == 'true'
-        page, size = max(1, int(arg('page', '1'))), min(50, max(1, int(arg('page_size', '25'))))
+        try:
+            page, size = max(1, int(arg('page', '1'))), min(50, max(1, int(arg('page_size', '25'))))
+        except ValueError:
+            raise ValueError('页码或每页数量必须是数字') from None
         cats = {c['id']: c for c in self.all('category') if c['layer'] == 'special'}
         counts = {cid: 0 for cid in cats}
         rows = []

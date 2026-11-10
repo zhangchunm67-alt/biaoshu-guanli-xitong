@@ -2,7 +2,7 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const {spawn,spawnSync}=require('node:child_process');
 const {chromium}=require('playwright');
-const app=path.resolve(__dirname,'..'),python=path.join(app,'.venv/bin/python');
+const app=path.resolve(__dirname,'..'),python=process.env.BID_TEST_PYTHON||path.join(app,'.venv/bin/python');
 (async()=>{let server,browser;try{
 server=spawn(python,['-B','-u','-c',`import sys,json,signal
 sys.path.insert(0,'tests')
