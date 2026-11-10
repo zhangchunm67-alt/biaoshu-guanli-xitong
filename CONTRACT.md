@@ -127,6 +127,11 @@ POST /api/materials/validate 接收材料表单字段、可选 material_id 与 u
 - POST /api/projects/:id/writing/outbound（请求体同 generate）-> 本次将发给 AI 的资料清单 {model, chapter_count, group_count, requirement_count, procurement_source_count, case_files, materials_with_text, materials_name_only, business_notes_length}，不启动生成。页面在 generate 前展示并须确认。
 - 发给 AI 的材料：法定代表人身份证明、授权委托书、文书模板、营业执照、纳税社保、审计报告只发名称；公司简介、ISO、资质始终发正文；其余栏目仅当本组章节标题、路径或原文与栏目相关时发正文。
 
+## 目录校验
+
+- GET /api/frameworks/:id 返回 `outline_check: {checked, issues:[{code, severity, message, chapter_ids, fixes:[{id, text}]}]}`，由 `skills/bid-response-framework/scripts/outline_check.py` 按当前目录计算。code：sequence（同级原文序号乱序/重复/跳号/不从 1 开始，附重新编号建议）、mixed_auto（原文序号与 Word 自动编号混用，附去掉原文序号建议）、mixed_style、level_style、attachment（只提示）、duplicate_title。
+- POST /api/frameworks/:id/confirm 首次确认时，有校验提示须带 `outline_check_acknowledged: true`，否则 400。
+
 ## 废标红线扫描
 
 - GET /api/projects/:id/redline-scan -> {items:[{id,label,text,status:'risk'|'attention',findings,hints,auto_checked,linked_chapter_ids,material_category_ids,basis,acknowledged,ack_expired}],acknowledged_ids,pending_count,complete,scope}。

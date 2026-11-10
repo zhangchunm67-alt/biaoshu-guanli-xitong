@@ -156,6 +156,10 @@ def main():
             print(f"编制提示（源位置 {message.get('source_index', '未标')}）{message.get('text', '')}")
         else:
             print("编制提示", message)
+    # 目录校验：原文序号乱序、重复、跳号、与自动编号混用等，交付前须人工核对。
+    from outline_check import check_outline, format_report, read_docx_outline
+    entries = read_docx_outline(out)
+    print(format_report(check_outline(entries), entries))
 
 
 if __name__ == "__main__":

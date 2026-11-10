@@ -13,7 +13,7 @@ const tenderFlow = (() => {
     step:1, name:'', record:null, library:[], archive:null, busy:'', error:'',
     editor:null, chapter:'', edits:new Map(), writing:null, writingError:'', businessNotes:'', businessNotesDirty:false, requirements:[], requirementKey:'', requirementCategory:'redline',
     requirementEditing:false, outlineEditing:false, requirementsDirty:false, outlineDraft:[], outlineKey:'', outlineDirty:false, previewLoaded:false, sourceQuery:'', draftSequence:0,
-    notesAcknowledged:false, removedAcknowledged:new Set(), redline:null, redlineError:'',
+    notesAcknowledged:false, removedAcknowledged:new Set(), redline:null, redlineError:'', outlineCheckAck:false,
     librarySelection:null, libraryOpen:false
   });
   let ui = fresh();
@@ -175,13 +175,26 @@ const tenderFlow = (() => {
       <div class="wf-file-actions">${wfButton(selected?'新增同级':'新增章节','outline-add-sibling',{subtle:true})}${selected?wfButton('新增子级','outline-add-child',{subtle:true,disabled:selected.level>=9})+wfButton('删除章节','outline-delete',{subtle:true}):''}</div></div></div>
       <div class="wf-review-heading wf-outline-save"><p class="wf-help" id="wf-outline-status" role="status" ${ui.outlineDirty?'':'hidden'}>${ui.outlineDirty?'有未保存修改；下方预览仍为已保存版本':''}</p><div class="wf-file-actions">${ui.error?wfButton('重新读取','reload-review',{subtle:true}):''}${wfButton('保存目录并更新预览','save-outline',{primary:true,disabled:!ui.outlineDirty})}</div></div></details>`;
   }
+  function outlineIssues() { return ui.record?.outline_check?.issues||[]; }
+  function outlineCheckPanel() {
+    const check=ui.record?.outline_check;
+    if(!check)return '';
+    const issues=check.issues||[];
+    if(!issues.length)return `<section class="wf-section wf-outline-check is-ok" aria-label="目录校验"><p class="wf-help">目录校验通过：${Number(check.checked)||0} 个章节，未发现序号乱序、重复、跳号或编号混用。</p></section>`;
+    const titles=new Map((ui.record.outline||[]).map(row=>[row.id,row.text]));
+    const canEdit=editable();
+    return `<section class="wf-section wf-outline-check" aria-label="目录校验"><h3 class="wf-section-title">目录校验 · ${issues.length} 项需核对</h3>
+      <p class="wf-help">${ui.outlineDirty?'以下为已保存目录的校验结果；保存目录后会重新校验。':'从招标文件拆出的标题常带原文序号，请核对后再进入系统填充。可按建议修正，修正后须保存目录。'}</p>
+      <ol class="wf-outline-issues">${issues.map((issue,i)=>`<li><p>${esc(issue.message)}</p><div class="wf-outline-issue-chapters">${(issue.chapter_ids||[]).slice(0,12).map(id=>canEdit?`<button type="button" class="wf-chip" data-wf="select-outline" data-id="${esc(id)}">${esc(titles.get(id)||id)}</button>`:`<span class="wf-chip">${esc(titles.get(id)||id)}</span>`).join('')}${(issue.chapter_ids||[]).length>12?`<span class="wf-help">等 ${issue.chapter_ids.length} 个章节</span>`:''}</div>${canEdit&&issue.fixes?.length?`<details class="wf-outline-fix"><summary>查看建议修正（${issue.fixes.length} 处）</summary><ul>${issue.fixes.map(fix=>`<li>${esc(titles.get(fix.id)||fix.id)} → <strong>${esc(fix.text)}</strong></li>`).join('')}</ul>${wfButton('按建议修正','outline-fix',{id:String(i),subtle:true})}</details>`:''}</li>`).join('')}</ol>
+      ${ui.outlineDirty?'':`<label class="wf-ack"><input type="checkbox" id="wf-outline-check-ack" ${ui.outlineCheckAck?'checked':''}>已逐项核对目录校验提示，确认无需再修改（例如附件号须与采购原件一致）</label>`}</section>`;
+  }
   function outline() {
     const preview=html(), word=files().find(f=>f.kind==='word');
     if(!preview||!word)return `<p class="wf-error" role="alert">${esc(ui.record.migration_error||'无法读取整本预览。请返回招标文件解读，核对采购原件。')}</p>`;
     const url=preview.url+(preview.url.includes('?')?'&':'?')+'revision='+encodeURIComponent(ui.record.revision||0);
     const books=ui.record.books||[];
     const summary=books.length?`<section class="wf-section" aria-label="分册目录"><h2 class="wf-section-title">分册目录</h2><div class="wf-file-actions">${books.map(book=>wfButton(book.name+'目录 · '+book.chapters.length+' 个章节','select-outline',{id:book.id,subtle:true})).join('')}</div></section>`:'';
-    return summary+outlineEditor()+`<iframe class="wf-preview-frame" title="投标文件目录预览" src="${esc(url)}" sandbox="allow-same-origin"></iframe>
+    return summary+outlineCheckPanel()+outlineEditor()+`<iframe class="wf-preview-frame" title="投标文件目录预览" src="${esc(url)}" sandbox="allow-same-origin"></iframe>
       <p class="wf-help wf-preview-state" role="status">正在读取目录预览…</p>
       <div class="wf-actions">${wfButton('上一步','step',{id:2})}${wfButton('确认目录，进入系统填充','confirm',{primary:true,disabled:!ui.previewLoaded||ui.outlineDirty||ui.record.requirements_confirmed===false})}</div>`;
   }
@@ -369,7 +382,7 @@ const tenderFlow = (() => {
     ui.requirementKey=ui.requirements.find(item=>item._key===previousRequirement&&item.category===ui.requirementCategory)?previousRequirement:ui.requirements.find(item=>item.category===ui.requirementCategory)?._key||'';
     ui.outlineDraft=clone(record.outline||[]).map(item=>({...item,_key:item.id||newKey(),level:Number(item.level)||1}));
     ui.outlineKey=ui.outlineDraft.some(item=>item._key===previousOutline)?previousOutline:ui.outlineDraft[0]?._key||'';
-    ui.requirementsDirty=false;ui.outlineDirty=false;ui.previewLoaded=false;ui.sourceQuery='';
+    ui.requirementsDirty=false;ui.outlineDirty=false;ui.previewLoaded=false;ui.sourceQuery='';ui.outlineCheckAck=false;
     ui.notesAcknowledged=false;ui.removedAcknowledged=new Set();
     if(state.project?.framework_id===record.id&&record.projects?.word!==state.project.id){state.project=null;state.dirty=false;}
   }
@@ -847,8 +860,11 @@ const tenderFlow = (() => {
       if(ui.outlineDirty)throw new Error('请先保存目录并核对更新后的预览。');
       if(ui.record.requirements_confirmed===false)throw new Error('请先确认采购要求。');
       if(!ui.previewLoaded)throw new Error('请等待整本预览加载完成。');
+      if(outlineIssues().length&&!ui.outlineCheckAck&&!ui.record.projects?.word){
+        guideWorkflowCompletion(3,`目录校验有 ${outlineIssues().length} 项需核对：请按建议修正后保存目录，或逐项核对后勾选确认。`,'#wf-outline-check-ack');return;
+      }
       if(state.dirty)await saveProject(false);
-      const project=await api(base(ui.record.id)+'/confirm',{method:'POST',body:{artifact_id:'word',revision:ui.record.revision}});
+      const project=await api(base(ui.record.id)+'/confirm',{method:'POST',body:{artifact_id:'word',revision:ui.record.revision,outline_check_acknowledged:!!ui.outlineCheckAck}});
       if(project.framework_id!==ui.record.id||project.framework_artifact_id!=='word')throw new Error('未能取得此框架的整本项目。');
       state.project=project;state.dirty=false;
       state.data.projects=[project,...state.data.projects.filter(p=>p.id!==project.id)];
@@ -880,6 +896,19 @@ const tenderFlow = (() => {
     if(action==='save-requirements'){await saveRequirements(false);return;}
     if(action==='confirm-requirements'){await saveRequirements(true);return;}
     if(action==='select-outline'){ui.outlineEditing=true;ui.outlineKey=id;paint();return;}
+    if(action==='outline-fix'){
+      const issue=outlineIssues()[Number(id)];
+      if(!issue)return;
+      let applied=0;
+      for(const fix of issue.fixes||[]){
+        const row=ui.outlineDraft.find(item=>item.id===fix.id);
+        if(row&&row.text!==fix.text){row.text=fix.text;applied++;}
+      }
+      if(!applied){toast('这些章节已按建议修改，或已在目录编辑中调整。');return;}
+      ui.outlineDirty=true;ui.outlineEditing=true;ui.outlineCheckAck=false;paint();
+      toast(`已按建议修改 ${applied} 个章节名称，请核对后点“保存目录并更新预览”。`);
+      document.querySelector('[data-wf="save-outline"]')?.scrollIntoView({block:'center'});return;
+    }
     if(action.startsWith('outline-')){editOutline(action);return;}
     if(action==='save-outline'){await saveOutline();return;}
     if(action==='reload-review'){
@@ -983,6 +1012,7 @@ const tenderFlow = (() => {
       if(el.id==='wf-chapter'){ui.chapter=el.value;paint();}
       if(el.id==='wf-requirement-category'&&requirement()){requirement().category=el.value;ui.requirementCategory=el.value;ui.requirementsDirty=true;paint();}
       if(el.id==='wf-notes-ack'){ui.notesAcknowledged=el.checked;return;}
+      if(el.id==='wf-outline-check-ack'){ui.outlineCheckAck=el.checked;return;}
       if(el.matches?.('[data-wf="ack-removed"]')){
         if(el.checked)ui.removedAcknowledged.add(el.dataset.id);else ui.removedAcknowledged.delete(el.dataset.id);
         return;
