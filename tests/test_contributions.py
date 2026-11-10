@@ -146,6 +146,26 @@ class ContributionStoreTests(unittest.TestCase):
             name='公司简介（2026）', category_id='company_profile', mode='text', content='腾宝科技成立于 2010 年。')})
         self.assertEqual('腾宝科技成立于 2010 年。', self.store.require('material', result['material']['id'])['content'])
 
+    def test_remote_listing_hides_content_and_reviewer_note(self):
+        self.contributions.submit({'kind': 'material', 'contributor': '王五', 'note': '内含联系人电话', 'files': [],
+                                   'material': {'name': '公司简介', 'mode': 'text', 'content': '机密正文',
+                                                'description': '内部说明'}}, remote=True)
+        self.contributions.submit(case_body(), remote=True)
+        remote = json.dumps(self.contributions.list({'status': ['all']}, remote=True), ensure_ascii=False)
+        for secret in ['机密正文', '内含联系人电话', '内部说明', '某银行"']:
+            self.assertNotIn(secret, remote)
+        self.assertIn('公司简介', remote)
+        local = json.dumps(self.contributions.list({'status': ['all']}, remote=False), ensure_ascii=False)
+        self.assertIn('机密正文', local)
+        self.assertIn('内含联系人电话', local)
+
+    def test_image_submission_cannot_be_accepted_as_text(self):
+        submitted = self.contributions.submit(material_body(), remote=True)
+        with self.assertRaisesRegex(ValueError, '含图片'):
+            self.contributions.accept(submitted['id'], {'revision': 1, 'material': self.review_fields(
+                mode='text', content='误选文字排版')})
+        self.assertEqual('pending', self.contributions.describe(submitted['id'], remote=False)['status'])
+
     def test_pending_queue_is_bounded(self):
         with patch('contributions.MAX_PENDING', 1):
             self.contributions.submit(material_body(), remote=True)

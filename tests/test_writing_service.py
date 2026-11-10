@@ -2,6 +2,7 @@
 import base64
 import copy
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -147,6 +148,32 @@ class WritingServiceTests(unittest.TestCase):
         self.assertEqual(['req-BidSection1', 'req-BidSection2'], [r['id'] for r in context['requirements']])
         self.assertEqual(['material-project-a'], [m['id'] for m in context['materials']])
         self.assertTrue(any('授权委托书' in note and '采购方自带登记表' in note and '响应参数表' in note for note in job['notes']))
+
+    def test_sensitive_and_unrelated_material_text_is_not_sent(self):
+        self.upload()
+        extra = [dict(id='m-auth', name='授权委托书模板', category_id='authorization', mode='text',
+                      content='被授权人张三，身份证号 110101199001011234', revision=1, archived=False),
+                 dict(id='m-people', name='项目经理简历', category_id='people', mode='text',
+                      content='李四，联系电话 13800000000', revision=1, archived=False)]
+        project = self.store.require('project', 'project-a')
+        for row in extra:
+            self.store.put('material', row)
+            project['mappings'].append(dict(id='mapping-' + row['id'], category_id=row['category_id'], action='fill',
+                                            status='ready', confirmed=True, material_ids=[row['id']]))
+        self.store.put('project', project)
+        self.store.db.commit()
+        preview = self.store.writing.outbound('project-a', self.request(business_notes='交付日期待确认。'))
+        self.assertEqual(['公司简介'], preview['materials_with_text'])
+        self.assertEqual({'授权委托书模板', '项目经理简历'}, set(preview['materials_name_only']))
+        self.assertEqual(['项目案例.txt'], preview['case_files'])
+        self.assertEqual(2, preview['chapter_count'])
+        self.assertIsNone(self.store.require('project', 'project-a').get('writing_job_id'))
+        job, model = self.generate()
+        sent = json.dumps(model.call_args.args[0], ensure_ascii=False)
+        self.assertNotIn('110101199001011234', sent)
+        self.assertNotIn('13800000000', sent)
+        self.assertIn('公司具备项目现场支持经验。', sent)
+        self.assertIn('授权委托书模板', sent)
 
     def test_partial_adoption_preserves_other_chapters_and_allows_second_adoption(self):
         uploaded = self.upload()

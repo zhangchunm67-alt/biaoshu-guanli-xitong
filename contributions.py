@@ -198,6 +198,11 @@ class Contributions:
             value['summary']['warning_count'] = len(summary.get('warnings', []))
             value['files'] = []
             value['files_intranet_only'] = True
+            # 外网只看名称、状态与退回原因；正文和给审核人的说明只在本机审核时显示。
+            value.pop('note', None)
+            for kind, keep in (('material', {'name', 'category_id', 'mode'}), ('case', {'name'})):
+                if isinstance(value.get(kind), dict):
+                    value[kind] = {k: v for k, v in value[kind].items() if k in keep}
             return value
         value['files'] = []
         for item in files:
@@ -254,6 +259,9 @@ class Contributions:
             if not isinstance(fields, dict):
                 raise ValueError('请核对材料信息后再入库')
             material = {name: value for name, value in fields.items() if name in MATERIAL_FIELDS}
+            if material.get('mode') == 'text' and record['files']:
+                # 改成文字排版会丢弃投稿图片；图片投稿必须保留图片排版。
+                raise ValueError('该投稿含图片，入库时请选择“每张独立一页”或“双图并排”，文字排版会丢弃图片')
             if material.get('mode', 'page') != 'text':
                 if not record['files']:
                     raise ValueError('该投稿没有图片，请选择文字内容排版并填写正文')

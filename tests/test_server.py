@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from unittest.mock import patch
@@ -507,7 +508,9 @@ class OrayRemoteAccessTests(unittest.TestCase):
             data=f'token={self.token}'.encode())
         self.assertEqual(303, status)
         cookie = headers.get('Set-Cookie') or headers.get('set-cookie')
-        self.assertIn('bid_access=', cookie)
+        self.assertIn('bid_session=', cookie)
+        self.assertNotIn(self.token, cookie)
+        self.assertIn('Max-Age=', cookie)
         self.assertNotIn('Secure', cookie)
         state, _, status = self.call(
             'GET', '/api/bootstrap', host=self.public,
@@ -524,8 +527,106 @@ class OrayRemoteAccessTests(unittest.TestCase):
             data=f'token={self.token}'.encode())
         self.assertEqual(303, status)
         cookie = headers.get('Set-Cookie') or headers.get('set-cookie')
-        self.assertIn('bid_access=', cookie)
+        self.assertIn('bid_session=', cookie)
         self.assertIn('Secure', cookie)
+
+    def login(self, token, host=None):
+        return self.call('POST', '/login', host=host or self.public, origin=f'http://{host or self.public}',
+                         content_type='application/x-www-form-urlencoded',
+                         data=('token=' + urllib.parse.quote(token)).encode())
+
+    def test_forged_or_raw_token_cookie_is_rejected(self):
+        for value in ['bid_session=' + self.token, 'bid_session=forged', 'bid_access=' + self.token]:
+            _, _, status = self.call('GET', '/api/bootstrap', host=self.public, headers={'Cookie': value})
+            self.assertEqual(401, status)
+
+    def test_login_failures_lock_the_source(self):
+        page, _, status = self.login('wrong-token-000')
+        self.assertEqual(401, status)
+        self.assertIn('还可尝试 4 次'.encode(), page)
+        self.assertIn('联系本机管理员'.encode(), page)
+        for _ in range(4):
+            page, _, status = self.login('wrong-token-000')
+        self.assertEqual(429, status)
+        # 锁定期间正确口令也不能登录，避免继续试探。
+        page, _, status = self.login(self.token)
+        self.assertEqual(429, status)
+        self.assertIn('分钟后再试'.encode(), page)
+        _, _, status = self.call('GET', '/api/bootstrap', host=self.public,
+                                 headers={'Authorization': 'Bearer ' + self.token})
+        self.assertEqual(429, status)
+        # 本机入口有独立计数，管理员仍可登录。
+        _, _, status = self.call('POST', '/login', base=self.intranet_base, origin=self.intranet_base,
+                                 content_type='application/x-www-form-urlencoded',
+                                 data=f'token={self.token}'.encode())
+        self.assertEqual(303, status)
+        log = (Path(self.tmp.name) / 'logs' / 'access.log').read_text(encoding='utf-8')
+        self.assertIn('"result": "failed"', log)
+        self.assertIn('"result": "locked"', log)
+        self.assertNotIn(self.token, log)
+        self.assertNotIn('wrong-token-000', log)
+
+    def test_global_failure_limit_locks_remote_entry(self):
+        guard = self.httpd.login_guard
+        for n in range(30):
+            guard.failure(f'10.0.0.{n}')
+        _, _, status = self.login(self.token)
+        self.assertEqual(429, status)
+
+    def test_remote_entry_cannot_change_material_library(self):
+        material, _, _ = self.seed_material_and_export()
+        auth = {'Authorization': f'Bearer {self.token}'}
+        attempts = [
+            ('PATCH', '/api/materials/' + material['id'], {'name': '改名', 'revision': 0}),
+            ('POST', '/api/materials', {'name': '新材料', 'category_id': 'company_profile', 'mode': 'text', 'content': 'x'}),
+            ('POST', '/api/materials/' + material['id'] + '/files', {'files': [], 'revision': 0}),
+            ('POST', '/api/categories', {'name': '新栏目'}),
+            ('PATCH', '/api/categories/business_license', {'enabled': False}),
+            ('POST', '/api/industries', {'name': '保险'}),
+            ('POST', '/api/credit-automation/check', {'subject': server.SUBJECT}),
+        ]
+        for method, path, payload in attempts:
+            body, _, status = self.call(method, path, host=self.public, origin=self.public_origin,
+                                        headers=auth, payload=payload)
+            self.assertEqual(403, status, (path, body))
+            self.assertIn('本机', body['error'])
+        self.assertEqual('营业执照', self.httpd.store.require('material', material['id'])['name'])
+        log = (Path(self.tmp.name) / 'logs' / 'access.log').read_text(encoding='utf-8')
+        self.assertIn('"path": "/api/materials/material_oray"', log)
+        self.assertIn('"status": 403', log)
+        self.assertNotIn('改名', log)
+        # 本机入口仍可维护材料库。
+        body, _, status = self.call('POST', '/api/industries', base=self.intranet_base,
+                                    origin=self.intranet_base, headers=auth, payload={'name': '本机新增行业'})
+        self.assertEqual(201, status, body)
+
+    def test_uploaded_template_preview_is_local_only(self):
+        store = self.httpd.store
+        store.put('project', {'id': 'project_upload', 'name': '上传模板', 'template_hash': 'a' * 64})
+        store.put('project', {'id': 'project_frame', 'name': '框架', 'template_hash': 'b' * 64,
+                              'framework_id': 'framework_x'})
+        store.db.commit()
+        auth = {'Authorization': f'Bearer {self.token}'}
+        body, _, status = self.call('GET', '/api/projects/project_upload/location-preview/' + 'a' * 64 + '/pages/1',
+                                    host=self.public, headers=auth)
+        self.assertEqual(403, status)
+        self.assertIn('仅限本机', body['error'])
+        body, _, status = self.call('POST', '/api/projects/project_upload/location-preview', host=self.public,
+                                    origin=self.public_origin, headers=auth, payload={})
+        self.assertEqual(403, status)
+        _, _, status = self.call('GET', '/api/projects/project_frame/location-preview/' + 'c' * 64 + '/pages/1',
+                                 host=self.public, headers=auth)
+        self.assertNotEqual(403, status)
+        _, _, status = self.call('GET', '/api/projects/project_upload/location-preview/' + 'c' * 64 + '/pages/1',
+                                 base=self.intranet_base, headers=auth)
+        self.assertNotEqual(403, status)
+
+    def test_bad_page_parameter_returns_chinese_message(self):
+        auth = {'Authorization': f'Bearer {self.token}'}
+        body, _, status = self.call('GET', '/api/materials?page=abc', host=self.public, headers=auth)
+        self.assertEqual(400, status)
+        self.assertNotIn('invalid literal', body['error'])
+        self.assertIn('页码', body['error'])
 
     def test_mobile_webview_login_origin_variants(self):
         for origin in ['null', f'http://{self.public}:80']:
@@ -657,3 +758,58 @@ class DocumentValidationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AccessTokenRules(unittest.TestCase):
+    def test_token_rules(self):
+        with self.assertRaisesRegex(ValueError, '12'):
+            server.normalize_access_token('short-pass1')
+        with self.assertRaisesRegex(ValueError, '示例'):
+            server.normalize_access_token('请改成足够长的口令')
+        self.assertEqual('腾宝标书系统访问口令2026', server.normalize_access_token('腾宝标书系统访问口令2026'))
+
+
+class ChineseTokenAndLanHosts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='bid-lan-test-')
+        self.token = '腾宝标书系统访问口令2026'
+        self.remote, self.local = server.create_oray_servers(
+            port=0, data_dir=self.tmp.name, seed=False, host='127.0.0.1',
+            access_token=self.token, lan_hosts=['192.168.8.20:8766', 'bid.node.example:8766'])
+        self.threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (self.remote, self.local)]
+        for t in self.threads:
+            t.start()
+
+    def tearDown(self):
+        for s in (self.remote, self.local):
+            s.shutdown()
+            s.server_close()
+        self.remote.store.close()
+        self.tmp.cleanup()
+
+    def request(self, method, path, host, data=None, headers=None):
+        values = {'Host': host, **(headers or {})}
+        if data is not None:
+            values.update({'Origin': 'http://' + host, 'Content-Type': 'application/x-www-form-urlencoded'})
+        req = urllib.request.Request(f'http://127.0.0.1:{self.remote.server_port}{path}', data=data,
+                                     method=method, headers=values)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        try:
+            with opener.open(req, timeout=10) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers or {}), error.read()
+
+    def test_chinese_token_logs_in_on_every_remote_host(self):
+        for host in ['192.168.8.20:8766', 'bid.node.example:8766']:
+            status, headers, _ = self.request('POST', '/login', host,
+                                              data=('token=' + urllib.parse.quote(self.token)).encode())
+            self.assertEqual(303, status)
+            cookie = headers['Set-Cookie'].split(';', 1)[0]
+            status, _, raw = self.request('GET', '/api/bootstrap', host, headers={'Cookie': cookie})
+            self.assertEqual(200, status)
+            self.assertTrue(json.loads(raw)['remote_access']['materials_intranet_only'])
+
+    def test_unknown_host_rejected(self):
+        status, _, _ = self.request('GET', '/login', '192.168.8.99:8766')
+        self.assertEqual(403, status)
