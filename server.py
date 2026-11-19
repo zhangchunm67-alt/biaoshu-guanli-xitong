@@ -9,6 +9,7 @@ import copy
 import hashlib
 import html
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -37,9 +38,10 @@ from contributions import Contributions
 from credit_service import CreditService, MANAGED_IDS
 from errors import ConflictError
 from special import SpecialLibrary
-from export_jobs import ExportJobs
+from export_jobs import ExportJobs, snapshot_revision
 from word_import import normalize_word
 from location_preview import LocationPreview
+import writing_visuals
 import chapter_drafts
 import framework_service
 
@@ -239,7 +241,32 @@ class Store(SpecialLibrary):
     def __init__(self, data_dir, seed=False, source_root=SOURCE_ROOT):
         self.root = Path(data_dir).resolve()
         self.source_root = Path(source_root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self._directory_lock = self._lock_directory()
+        try:
+            self._initialize(seed)
+        except BaseException:
+            if hasattr(self, 'db'):
+                self.db.close()
+            self._directory_lock.close()
+            raise
+
+    def _lock_directory(self):
+        fd = os.open(self.root / '.store.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.fdopen(fd, 'r+b')
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise ValueError('此数据目录已由另一实例使用，请关闭该实例或更换目录。') from None
+        return handle
+
+    def _initialize(self, seed):
         for directory in ['materials', 'templates', 'exports']:
             (self.root / directory).mkdir(exist_ok=True)
         self.lock = threading.RLock()
@@ -273,14 +300,18 @@ class Store(SpecialLibrary):
             self.export_jobs = ExportJobs(self)
             from writing_service import WritingService
             self.writing = WritingService(self)
+            from outline_workflow import OutlineJobs
+            self.outline_jobs = OutlineJobs(self)
 
     def close(self):
+        self.outline_jobs.close()
         self.writing.close()
         self.export_jobs.close()
         with self.lock:
             self.credit.close()
             self.location_preview.close()
             self.db.close()
+            self._directory_lock.close()
 
     def get(self, kind, key):
         row = self.db.execute('SELECT payload FROM objects WHERE kind=? AND id=?', (kind, key)).fetchone()
@@ -411,6 +442,8 @@ class Store(SpecialLibrary):
             if candidates:
                 matches_changed |= row.get('action') != 'fill' or row.get('material_ids') != ids
                 row.update(action='fill', material_ids=ids)
+                if ids and row.get('note') == '存在重叠版本或需按截止日核对缴费期限，请人工选择材料。':
+                    row['note'] = ''
         if matches_changed:
             rows = engine.validate_mappings(rows, materials, project['headings'], categories, context=context,
                                             preserve_forms=bool(project.get('framework_id')))
@@ -440,19 +473,22 @@ class Store(SpecialLibrary):
             self.sync_material_matches(project)
             self.put('project', project)
 
-    def refresh_location_rows(self, project, scanned, layer):
+    def refresh_location_rows(self, project, scanned, layer, category_ids=None):
         """Upgrade automatic locations and invalidate proven directory targets."""
         excluded = set(scanned.get('excluded_locator_ids', []))
         proposals = {}
         for row in scanned['mappings']:
             if row.get('layer', 'common') == layer and row.get('locator_id') not in excluded:
                 proposals.setdefault(row['category_id'], []).append(row)
-        requirements = scanned.get('requirements', {})
+        requirements = {key: value for key, value in scanned.get('requirements', {}).items()
+                        if category_ids is None or key in category_ids}
         project.setdefault('requirements', {}).update(requirements)
         occupied = {r.get('locator_id'): r['id'] for r in project['mappings'] if r.get('locator_id')}
+        preserved_slots = set()
         for row in project['mappings']:
-            if row.get('layer', 'common') != layer:
+            if row.get('layer', 'common') != layer or (category_ids is not None and row['category_id'] not in category_ids):
                 continue
+            previous_requirement = row.get('requirement', {})
             row['requirement'] = copy.deepcopy(requirements.get(row['category_id'], {}))
             old_locator = row.get('locator_id', '')
             match_status = row.get('location_match', {}).get('status')
@@ -461,6 +497,9 @@ class Store(SpecialLibrary):
             preserve_choice = (manual or row.get('action') == 'skip' or
                 (row.get('action') == 'missing' and (directory or (layer == 'common' and row.get('auto_match') is False))))
             choices = proposals.get(row['category_id'], [])
+            body_choices = [r for r in choices if r.get('location_match', {}).get('status') == 'matched']
+            move_automatic_appendix = (category_ids is not None and match_status == 'appendix'
+                                       and old_locator.startswith('ca:') and len(body_choices) == 1)
             if directory and preserve_choice:
                 row.update(locator_id='', confirmed=False, location_match={
                     'status': 'ambiguous', 'reason': '原位置属于目录，不能插入材料；请核对正文位置',
@@ -468,18 +507,40 @@ class Store(SpecialLibrary):
                 if occupied.get(old_locator) == row['id']:
                     occupied.pop(old_locator)
                 continue
-            if preserve_choice:
+            if preserve_choice and not move_automatic_appendix:
+                if category_ids is not None and len(body_choices) == 1:
+                    preserved_slots.add((row['category_id'], body_choices[0]['locator_id']))
                 continue
             same = [r for r in choices if r.get('locator_id') == old_locator and old_locator]
-            proposal = same[0] if same else choices[0] if len(choices) == 1 else None
+            appendix_remap = False
+            if not same and old_locator:
+                from location_preview import appendix_category
+                old_appendix = appendix_category(old_locator)
+                if old_appendix:
+                    same = [r for r in choices
+                            if appendix_category(r.get('locator_id')) == old_appendix]
+                    appendix_remap = bool(same)
+            proposal = (body_choices[0] if move_automatic_appendix else same[0] if same
+                        else choices[0] if len(choices) == 1 else None)
             if proposal:
                 locator = proposal.get('locator_id', '')
                 match = copy.deepcopy(proposal.get('location_match', {}))
                 if locator and occupied.get(locator, row['id']) != row['id']:
                     locator = ''
                     match.update(status='ambiguous', reason=('原位置属于目录，正文位置已被其他核对项使用，请核对' if directory else '新识别位置已被其他核对项使用，请核对'), candidates=[])
-                row.update(locator_id=locator, title=proposal['title'], confirmed=False,
+                    appendix_remap = False
+                # Digest-only appendix id churn is the same slot; keep核对状态.
+                keep_confirmed = bool(locator and row.get('confirmed') and
+                    (appendix_remap or (move_automatic_appendix and row.get('action') == 'skip')
+                     or (locator == old_locator and previous_requirement == row['requirement'])))
+                row.update(locator_id=locator, title=proposal['title'],
+                           confirmed=bool(keep_confirmed),
                            existing_content=proposal['existing_content'], location_match=match)
+                if move_automatic_appendix and locator != old_locator:
+                    row.pop('existing_handling', None)
+                if (category_ids is not None and proposal.get('material_ids')
+                        and row.get('note') == '存在重叠版本或需按截止日核对缴费期限，请人工选择材料。'):
+                    row['note'] = ''
                 if old_locator and occupied.get(old_locator) == row['id']:
                     occupied.pop(old_locator)
                 if locator:
@@ -495,10 +556,11 @@ class Store(SpecialLibrary):
         # Shared tax/social and text-template categories can acquire distinct
         # body slots under the new rules. Keep existing decisions and surface
         # newly discovered slots instead of silently dropping them.
-        represented = {(r['category_id'], r.get('locator_id')) for r in project['mappings']}
+        represented = preserved_slots | {(r['category_id'], r.get('locator_id')) for r in project['mappings']}
         existing_ids = {r['id'] for r in project['mappings']}
         for fresh in scanned['mappings']:
             if (fresh.get('layer', 'common') == layer
+                    and (category_ids is None or fresh['category_id'] in category_ids)
                     and fresh['category_id'] in {'tax_social', 'text_template'}
                     and fresh.get('locator_id')
                     and (fresh['category_id'], fresh['locator_id']) not in represented
@@ -526,21 +588,58 @@ class Store(SpecialLibrary):
         self.put('project', project)
         return project
 
-    def sync_common_locations(self, project):
+    def sync_common_locations(self, project, scanned=None):
         """Upgrade unresolved automatic common matches without replacing user choices."""
         import engine
-        if self.archived_project(project) or project.get('common_locator_version') == engine.COMMON_LOCATOR_VERSION:
+        if self.archived_project(project):
             return project
-        financial_only = project.get('common_locator_version') == 11 and engine.COMMON_LOCATOR_VERSION == 12
+        if project.get('common_locator_version') == engine.COMMON_LOCATOR_VERSION:
+            if not project.get('financial_review_migrated'):
+                legacy_confirmed = [row for row in project['mappings'] if row['category_id'] == 'audit_report'
+                                    and row.get('confirmed')]
+                if legacy_confirmed:
+                    for row in legacy_confirmed:
+                        row['confirmed'] = False
+                    project['status'] = '待确认'
+                project['financial_review_migrated'] = True
+                self.put('project', project)
+            return project
+        financial_only = project.get('common_locator_version') == 11
+        previous_version = project.get('common_locator_version')
+        targeted_migration = previous_version in {12, 13, 14, 15}
         financial_rows = [row for row in project['mappings'] if row['category_id'] == 'audit_report']
-        if financial_only and not financial_rows:
+        missing_steps = {'tax_social', 'business_license', 'audit_report'}
+        affected = {r['category_id'] for r in project['mappings'] if r.get('locator_id')}
+        affected.update(cid for h in project['headings'] for cid in h.get('category_ids', []))
+        if financial_only and not financial_rows and not affected.intersection(missing_steps):
             project['common_locator_version'] = engine.COMMON_LOCATOR_VERSION
+            project['financial_review_migrated'] = True
             self.put('project', project)
             return project
         source = self.path(project['template_storage'])
         if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != project['template_hash']:
             return project
-        scanned = self.scan_project_template(project)
+        scanned = scanned or self.scan_project_template(project)
+        if targeted_migration:
+            categories = {'tax_social'}
+            if previous_version < 15:
+                categories.update({'business_license', 'audit_report'})
+            if previous_version == 12:
+                categories.update(row['category_id'] for row in project['mappings']
+                                  if str(row.get('locator_id') or '').startswith('ca:'))
+            self.refresh_location_rows(project, scanned, 'common', categories)
+            fresh = {h['id']: h for h in scanned['headings'] if categories.intersection(h['category_ids'])}
+            selected = {r.get('locator_id') for r in project['mappings']}
+            headings = {h['id']: h for h in project['headings'] if not (
+                h.get('kind') == 'common_appendix' and categories.intersection(h['category_ids'])
+                and h['id'] not in selected)}
+            headings.update(fresh)
+            project.update(headings=list(headings.values()), common_locator_version=engine.COMMON_LOCATOR_VERSION,
+                           financial_review_migrated=True)
+            if scanned.get('procurement_audit') is not None:
+                project['procurement_audit'] = scanned['procurement_audit']
+            self.put('project', project)
+            return project
         if financial_only:
             # Version 12 changes financial requirement scopes, not insertion
             # locations. Do not invalidate unrelated, already reviewed materials.
@@ -570,12 +669,16 @@ class Store(SpecialLibrary):
                     changed = True
             if changed:
                 project['status'] = '待确认'
-            project['common_locator_version'] = engine.COMMON_LOCATOR_VERSION
+            project['common_locator_version'] = 12
             self.put('project', project)
-            return project
+            return self.sync_common_locations(project, scanned)
         self.refresh_location_rows(project, scanned, 'common')
+        project['procurement_audit'] = scanned.get('procurement_audit')
         excluded = set(scanned.get('excluded_locator_ids', []))
-        headings = {h['id']: h for h in project['headings'] if h['id'] not in excluded}
+        # Synthetic appendix headings churned under the old digest id scheme.
+        # Always prefer the live scan and drop stale ca:… entries.
+        headings = {h['id']: h for h in project['headings']
+                    if h['id'] not in excluded and h.get('kind') != 'common_appendix'}
         headings.update({h['id']: h for h in scanned['headings'] if h['id'] not in excluded})
         project['headings'] = list(headings.values())
         fresh_authorization = {h['id'] for h in scanned['headings'] if 'authorization' in h.get('category_ids', [])}
@@ -585,6 +688,7 @@ class Store(SpecialLibrary):
                 heading['authorization_body_present'] = False
                 heading['authorization_text'] = ''
         project['common_locator_version'] = engine.COMMON_LOCATOR_VERSION
+        project['financial_review_migrated'] = True
         self.put('project', project)
         return project
 
@@ -611,9 +715,13 @@ class Store(SpecialLibrary):
         self.db.commit()
         value = copy.deepcopy(project)
         value['mapping_revision'] = self.mapping_revision(project)
+        if project.get('material_conflicts'):
+            value['written_chapter_ids'] = sorted((project.get('chapter_texts') or {}).keys())
         value.pop('template_storage', None)
         value.pop('template_source_storage', None)
         value.pop('chapter_texts', None)
+        value.pop('chapter_visuals', None)
+        value.pop('chapter_image_origins', None)
         if project.get('template_import_kind') == 'converted_doc':
             value['warnings'] = ['此模板已从旧版 .doc 转换；导出后请在 Word 中核对表格、分页和目录。', *value.get('warnings', [])]
         value.setdefault('special_category_ids', [])
@@ -645,7 +753,7 @@ class Store(SpecialLibrary):
             'id', 'name', 'template_name', 'status', 'created_at', 'updated_at',
             'framework_id', 'framework_artifact_id') if key in project}
 
-    def create_files(self, material_id, files, seed=False):
+    def create_files(self, material_id, files, seed=False, created_paths=None):
         if not isinstance(files, list) or len(files) > 100:
             raise ValueError('每次最多添加 100 张图片')
         prepared = []
@@ -660,7 +768,12 @@ class Store(SpecialLibrary):
         for metadata, raw in prepared:
             destination = self.path(metadata['storage'])
             destination.parent.mkdir(exist_ok=True, parents=True)
-            destination.write_bytes(raw)
+            if created_paths is None:
+                destination.write_bytes(raw)
+            else:
+                with destination.open('xb') as handle:
+                    created_paths.append(destination)
+                    handle.write(raw)
             self.put('file', metadata)
         return [entry[0]['id'] for entry in prepared]
 
@@ -691,7 +804,11 @@ class Store(SpecialLibrary):
                     values[col] = raw or ''
                 rows.append(values)
         association = {'ZZ-001': 'business_license', 'SF-001': 'legal_identity', 'SF-002': 'authorization', 'CW-2023': 'audit_report', 'CW-2024': 'audit_report'}
-        count = 0
+        expected = {'ZZ-001': 1, 'SF-001': 2, 'SF-002': 2, 'CW-2023': 26, 'CW-2024': 24}
+        source_ids = [row.get('A') for row in rows[1:] if row.get('A') in association]
+        if len(source_ids) != len(expected) or set(source_ids) != set(expected):
+            raise ValueError('原始材料台账缺少预期分组或存在重复分组')
+        packages = []
         for row in rows[1:]:
             source_id = row.get('A', '')
             if source_id not in association:
@@ -719,14 +836,27 @@ class Store(SpecialLibrary):
                         seen.add(relative)
                         rotation = 270 if '左90' in row.get('G', '') else 90 if '右90' in row.get('G', '') else 180 if '180' in row.get('G', '') else 0
                         assets.append({'id': 'seedfile_' + hashlib.sha256((source_id + relative).encode()).hexdigest()[:24], 'name': path.name, 'raw': path.read_bytes(), 'source': '材料/' + relative, 'rotation': rotation})
-            if not assets:
-                raise ValueError('原始材料台账中的文件缺失')
+            if len(assets) != expected[source_id]:
+                raise ValueError(f'原始材料组 {source_id} 应有 {expected[source_id]} 张图片，实际发现 {len(assets)} 张')
             category = association[source_id]
-            material = {'id': mid, 'category_id': category, 'name': row['B'], 'subject': SUBJECT, 'version': row.get('H', ''), 'years': [int(source_id[-4:])] if source_id.startswith('CW-') else [], 'valid_until': row.get('I', ''), 'mode': 'side_by_side' if row.get('F') == '并排' else 'page', 'content': '', 'description': '证件附件，需核对模板证明或授权正文' if source_id.startswith('SF-') else '由交付包材料台账导入；请核对适用年度及有效性', 'revision': 1, 'created_at': now(), 'updated_at': now(), 'source': {'ledger': '标书自动填充/示例/材料台账.xlsx', 'material_id': source_id}, 'file_ids': self.create_files(mid, assets, seed=True)}
-            count += len(material['file_ids'])
-            self.put('material', material)
+            material = {'id': mid, 'category_id': category, 'name': row['B'], 'subject': SUBJECT, 'version': row.get('H', ''), 'years': [int(source_id[-4:])] if source_id.startswith('CW-') else [], 'valid_until': row.get('I', ''), 'mode': 'side_by_side' if row.get('F') == '并排' else 'page', 'content': '', 'description': '证件附件，需核对模板证明或授权正文' if source_id.startswith('SF-') else '由交付包材料台账导入；请核对适用年度及有效性', 'revision': 1, 'created_at': now(), 'updated_at': now(), 'source': {'ledger': '标书自动填充/示例/材料台账.xlsx', 'material_id': source_id}, }
+            packages.append((material, assets))
+        created_paths = []
+        try:
+            for material, assets in packages:
+                material['file_ids'] = self.create_files(material['id'], assets, seed=True, created_paths=created_paths)
+                self.put('material', material)
+            self.finish_seed(association)
+        except BaseException:
+            self.db.rollback()
+            for path in reversed(created_paths):
+                path.unlink(missing_ok=True)
+            raise
+
+    def finish_seed(self, association):
+        seeded = [m for m in self.all('material') if (m.get('source') or {}).get('material_id') in association]
         self.put('meta', {'id': 'seed', 'created_at': now()})
-        self.put('meta', {'id': 'source_status', 'state': 'imported', 'message': '已复制交付包材料，原文件保持不变', 'material_count': len(association), 'file_count': sum(len(m['file_ids']) for m in self.all('material') if m['id'].startswith('seed_')), 'updated_at': now()})
+        self.put('meta', {'id': 'source_status', 'state': 'imported', 'message': '已复制交付包材料，原文件保持不变', 'material_count': len(seeded), 'file_count': sum(len(m['file_ids']) for m in seeded), 'updated_at': now()})
         self.db.commit()
 
     def invalidate(self, material_id=None, category_id=None):
@@ -896,9 +1026,15 @@ class Store(SpecialLibrary):
         import engine
         categories = self.matching_categories(project)
         materials = self.internal_materials(include_special=True, project=project)
+        framework = self.get('framework', project.get('framework_id', ''))
+        procurement_audit = framework_service.procurement_audit_requirement(framework)
         results = engine.scan_document(self.path(project['template_storage']), categories, materials,
                                        project.get('special_category_ids', []),
-                                       preserve_forms=bool(project.get('framework_id')))
+                                       preserve_forms=bool(project.get('framework_id')),
+                                       procurement_audit=procurement_audit)
+        if procurement_audit:
+            results['procurement_audit'] = procurement_audit
+        rows = results['mappings']
         if project.get('framework_id'):
             # A procurement-defined part may be a standalone quotation with no evidence slots.
             # Unmatched library defaults must not become additional submission requirements.
@@ -908,18 +1044,68 @@ class Store(SpecialLibrary):
             for row in rows:
                 if row.get('layer') == 'special' and row['action'] == 'fill' and not row['material_ids']:
                     row['action'] = 'missing'
+        if project.get('not_applicable_chapters'):
+            skipped = set(project['not_applicable_chapters'])
+            inactive = {h['id'] for h in results['headings'] if h.get('chapter_id') in skipped}
+            rows = [row for row in rows if row.get('locator_id') not in inactive]
+            results['headings'] = [heading for heading in results['headings'] if heading['id'] not in inactive]
+        if project.get('material_conflicts'):
+            for row in rows:
+                row['conflict_review'] = True
+        if project.get('framework_id') or project.get('material_conflicts'):
             results['mappings'] = engine.validate_mappings(rows, materials, results['headings'], categories,
-                                                         preserve_forms=True)
+                                                         preserve_forms=bool(project.get('framework_id')))
         return results
+
+    def restore_material_decisions(self, project, previous):
+        """Restore decisions only at a uniquely identified surviving chapter location."""
+        import engine
+
+        def match_keys(data):
+            headings = {h['id']: h for h in data['headings']}
+            for row in data['mappings']:
+                heading = headings.get(row.get('locator_id'), {})
+                chapter = heading.get('chapter_id')
+                if chapter:
+                    yield (chapter, row['category_id'], heading.get('kind'), heading.get('title')), row
+                elif data.get('template_hash') == project.get('template_hash'):
+                    yield (data['template_hash'], row['category_id'], row.get('locator_id')), row
+
+        saved = {}
+        for key, row in match_keys(previous):
+            saved.setdefault(key, []).append(row)
+        same_template = previous.get('template_hash') == project.get('template_hash')
+        saved_ids = {row['id']: row for row in previous['mappings']} if same_template else {}
+        locators = {heading['id'] for heading in project['headings']}
+        for key, row in match_keys(project):
+            matches = saved.get(key, [])
+            old = saved_ids.get(row['id']) or (matches[0] if len(matches) == 1 else None)
+            if not old:
+                continue
+            if (same_template and old.get('location_match', {}).get('status') == 'manual'
+                    and old.get('locator_id') in locators):
+                row['locator_id'] = old['locator_id']
+                row['location_match'] = copy.deepcopy(old['location_match'])
+            for field in ('action', 'material_ids', 'note', 'existing_handling', 'auto_match'):
+                if field in old:
+                    row[field] = copy.deepcopy(old[field])
+            row['confirmed'] = bool(old.get('confirmed') and old.get('action') == 'skip')
+        project['mappings'] = engine.validate_mappings(project['mappings'],
+            self.internal_materials(include_special=True, project=project),
+            project['headings'], self.matching_categories(project), preserve_forms=bool(project.get('framework_id')))
 
     def scan(self, project):
         import engine
+        previous = copy.deepcopy(project) if project.get('material_conflicts') and project.get('mappings') else None
         result = self.scan_project_template(project)
         project.update(result)
         project['special_locator_version'] = engine.SPECIAL_LOCATOR_VERSION
         project['common_locator_version'] = engine.COMMON_LOCATOR_VERSION
+        project['financial_review_migrated'] = True
         for row in project['mappings']:
             row['confirmed'] = False
+        if previous:
+            self.restore_material_decisions(project, previous)
         project['updated_at'] = now()
         project['status'] = '待确认'
         return project
@@ -1003,12 +1189,22 @@ class Store(SpecialLibrary):
     def preview_snapshot(self, key, body):
         """Read current UI choices without saving or clearing confirmations."""
         import authorization
+        from location_preview import appendix_category
         project = self.sync_authorization_targets(self.require('project', key))
         row = next((m for m in project['mappings'] if m['id'] == body.get('mapping_id')), None)
         if row is None:
             raise ValueError('核对项不存在，请重新打开项目。')
         locator = body.get('locator_id', row.get('locator_id'))
-        if not isinstance(locator, str) or (locator and not any(h['id'] == locator for h in project['headings'])):
+        heading = next((h for h in project['headings'] if h['id'] == locator), None) if isinstance(locator, str) else None
+        if heading is None and isinstance(locator, str):
+            cid = appendix_category(locator)
+            if cid:
+                heading = next((h for h in project['headings']
+                                if h.get('kind') == 'common_appendix'
+                                and (h['id'] == f'ca:{cid}' or cid in h.get('category_ids', []))), None)
+                if heading is not None:
+                    locator = heading['id']
+        if not isinstance(locator, str) or (locator and heading is None):
             raise ValueError('请先选择本项目中的模板插入位置。')
         ids = body.get('material_ids', row.get('material_ids', []))
         if (not isinstance(ids, list) or len(ids) > 100 or
@@ -1017,7 +1213,6 @@ class Store(SpecialLibrary):
         action = body.get('action', row.get('action', 'fill'))
         if action not in {'fill', 'missing', 'skip'}:
             raise ValueError('预览处理方式不正确。')
-        heading = next((h for h in project['headings'] if h['id'] == locator), None)
         retained_form = bool(project.get('framework_id') and row['category_id'] == 'text_template'
                              and authorization.preserves_form(heading))
         preserve_original = bool(retained_form or (row['category_id'] == 'text_template' and heading
@@ -1078,6 +1273,8 @@ class Store(SpecialLibrary):
         destination = self.path(storage)
         project = {'id': key, 'name': name, 'template_name': filename, 'template_storage': storage, 'template_hash': hashlib.sha256(raw).hexdigest(), 'created_at': now(), 'updated_at': now(), 'status': '待确认', 'mappings': [], 'headings': [], 'warnings': []}
         project['template_import_kind'] = import_kind
+        if body.get('material_conflicts') is True and body.get('use_sample') is not True:
+            project['material_conflicts'] = True
         project['template_source_hash'] = hashlib.sha256(source_raw).hexdigest()
         original = self.path(f'templates/{key}.original.doc') if import_kind != 'docx' else None
         try:
@@ -1110,6 +1307,10 @@ class Store(SpecialLibrary):
         if not isinstance(updates, list) or len(updates) > 1000:
             raise ValueError('栏目确认格式不正确')
         by_id = {v['id']: v for v in project['mappings']}
+        review_ids = body.get('review_ids', [])
+        if (not isinstance(review_ids, list) or any(not isinstance(i, str) or i not in by_id for i in review_ids)
+                or len(review_ids) > 1000):
+            raise ValueError('材料核对范围无效。')
         locator_ids = {v['id'] for v in project['headings']}
         seen = set()
         for update in updates:
@@ -1119,12 +1320,18 @@ class Store(SpecialLibrary):
             current = by_id[update['id']]
             if 'locator_id' in update and update['locator_id'] != current.get('locator_id'):
                 current['location_match'] = {'status': 'manual', 'reason': '位置已由人工调整', 'candidates': []}
+                current.pop('existing_handling', None)
             if any(field in update and update[field] != current.get(field) for field in ('action', 'material_ids')):
                 current['auto_match'] = False
             # Ignore retired authorization fields from cached browser clients.
             for field in ['locator_id', 'material_ids', 'action', 'confirmed', 'note']:
                 if field in update:
                     current[field] = copy.deepcopy(update[field])
+            if 'existing_handling' in update:
+                handling = update['existing_handling']
+                if handling not in ('', 'keep', 'replace', 'append'):
+                    raise ValueError('材料冲突处理方式无效。')
+                current['existing_handling'] = handling
             if current.get('locator_id') and current['locator_id'] not in locator_ids:
                 raise ValueError('所选插入位置不属于当前模板')
             ids = current.get('material_ids', [])
@@ -1145,7 +1352,9 @@ class Store(SpecialLibrary):
                                              project['headings'], self.matching_categories(project),
                                              preserve_forms=bool(project.get('framework_id')))
         prospective = dict(project, mappings=validated)
-        if not self.common_reviewed(prospective):
+        text_independent = project.get('material_conflicts') and project.get('material_flow') == 'text-first'
+        common_reviewed = self.common_reviewed(prospective)
+        if not (common_reviewed or text_independent):
             for row in validated:
                 if row.get('layer') == 'special':
                     row['confirmed'] = False
@@ -1153,6 +1362,8 @@ class Store(SpecialLibrary):
         for row in validated:
             if requested.get(row['id']) and row.get('status') == 'blocked':
                 raise ValueError('该栏目尚不能确认：' + '；'.join(row.get('issues', [])))
+            if row['id'] in review_ids and row['status'] in {'ready', 'skipped'}:
+                row['confirmed'] = row.get('layer') != 'special' or common_reviewed or text_independent
         project['mappings'] = validated
         if project.get('material_flow') == 'text-first':
             project['text_review_confirmed'] = all(r['status'] != 'blocked' for r in validated if r.get('layer') == 'special')
@@ -1166,17 +1377,35 @@ class Store(SpecialLibrary):
         import engine
         context = engine.ValidationContext()
         mode = body.get('mode', 'draft')
+        if mode == 'stage':
+            return self.stage_snapshot(key, body)
         if mode not in {'draft', 'reviewed'}:
             raise ValueError('导出方式不正确')
-        project = self.sync_material_matches(self.require('project', key), context=context)
+        project = self.require('project', key)
+        if self.archived_project(project):
+            raise ValueError('目录已更新，请从当前整本项目导出。')
+        framework = self.get('framework', project.get('framework_id', ''))
+        if framework and framework.get('review_version') and not framework.get('requirements_confirmed'):
+            raise ValueError('招标要求尚未重新确认，请返回招标解读核对。')
+        project = self.sync_common_locations(project)
+        project = self.sync_material_matches(project, context=context)
         self.db.commit()
+        if body.get('mapping_revision') is not None:
+            self.require_mapping_revision(project, body)
+        if (mode == 'reviewed' and project.get('framework_id') and
+                any(re.search(r'【待(?:补|编|确认)', text) for text in project.get('chapter_texts', {}).values())):
+            raise ValueError('正文仍含待补、待编或待确认标记，请更新正文后再导出已核对版。')
+        if mode == 'reviewed' and project.get('common_locator_version') != engine.COMMON_LOCATOR_VERSION:
+            raise ValueError('旧项目无法完成核对迁移，请检查原模板后重新扫描。')
         if not project.get('special_selection_confirmed'):
             raise ValueError('请先进入文字材料核对，再导出标书。')
         if project.get('material_flow') == 'text-first' and not project.get('text_review_confirmed'):
             raise ValueError('请先保存文字材料核对，再导出标书。')
+        redline_export = None
         if project.get('framework_id'):
             import redline_scan
-            redline_scan.require_complete(self, project)
+            # 初稿与已核对版本均要求红线全部过关（含 AI 自动确认）；未过关硬拦导出。
+            redline_export = redline_scan.require_complete(self, project, enforce=True)
         materials = self.internal_materials(include_special=True, project=project)
         categories = self.matching_categories(project)
         mappings = engine.validate_mappings(project['mappings'], materials, project['headings'], categories, context=context,
@@ -1192,7 +1421,67 @@ class Store(SpecialLibrary):
         template = self.path(project['template_storage'])
         if hashlib.sha256(template.read_bytes()).hexdigest() != project['template_hash']:
             raise ValueError('保存的模板发生变化，请重新上传模板')
-        return copy.deepcopy((project, materials, categories, mappings, mode))
+        snapshot = copy.deepcopy((project, materials, categories, mappings, mode))
+        snapshot[0]['export_mapping_revision'] = self.mapping_revision(project)
+        snapshot[0]['export_framework_revision'] = (framework or {}).get('revision')
+        if redline_export is not None:
+            snapshot[0]['redline_export'] = copy.deepcopy(redline_export)
+        return snapshot
+
+    def stage_snapshot(self, key, body=None):
+        """Pin the same checked state used by the preview and actual download."""
+        import engine
+        import redline_scan
+
+        project, framework = redline_scan._context(self, key)
+        token = self.mapping_revision(project)
+        stage_revision = hashlib.sha256(json.dumps([token, framework['revision'],
+            project.get('redline_review'), project.get('redline_ai')],
+            ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        if body is not None and (body.get('mapping_revision') != token
+                                 or body.get('stage_revision') != stage_revision):
+            raise ValueError('项目内容已更新，请重新打开阶段预览后下载。')
+        template = self.path(project['template_storage'])
+        if hashlib.sha256(template.read_bytes()).hexdigest() != project['template_hash']:
+            raise ValueError('保存的模板发生变化，请重新核对目录。')
+        materials = self.internal_materials(include_special=True, project=project)
+        categories = self.matching_categories(project)
+        mappings = engine.validate_mappings(project['mappings'], materials, project['headings'],
+                                            categories, preserve_forms=True)
+        selected = [r for r in mappings if r['status'] == 'ready' and (
+                    r.get('preserve_original') or
+                    (r.get('confirmed') and r['action'] == 'fill' and not r.get('retains_content')))]
+        by_chapter = {}
+        for row in mappings:
+            by_chapter.setdefault(row.get('chapter_id'), []).append(row)
+        framework_service.metric_module()
+        from outline_check import decimal_headings
+        chapters = []
+        for row, (number, title) in zip(framework['outline'], decimal_headings(framework['outline'])):
+            associated = by_chapter.get(row['id'], [])
+            text = str(project.get('chapter_texts', {}).get(row['id'], '') or '').strip()
+            if row.get('not_applicable') or (associated and all(r.get('confirmed') and r['status'] == 'skipped'
+                                                               for r in associated)):
+                status = 'skipped'
+            elif (not row.get('locked_format') and
+                  all(r.get('confirmed') and r['status'] == 'ready' for r in associated) and
+                  ((text and not re.search(r'【待(?:补|编|确认)', text))
+                   or (associated and not re.search(r'技术方案|报价|业绩|服务经验', row['text'])))):
+                status = 'completed'
+            else:
+                status = 'pending'
+            chapters.append({**row, 'text': f'{number} {title}', 'status': status})
+        validation = redline_scan.evaluate(dict(project, mappings=mappings), framework,
+                                           redline_scan.material_versions(self))
+        redlines = [{'id': r['id'], 'label': r['label']} for r in validation['items']
+                    if not r.get('acknowledged') or r.get('status') == 'risk']
+        overview = {'mapping_revision': token, 'stage_revision': stage_revision, 'outline_revision': framework['revision'],
+                    'chapters': chapters, 'redlines': redlines,
+                    'missing_original_forms': [row['text'] for row in framework.get('outline_missing', [])],
+                    'filled_material_count': sum(not r.get('preserve_original') for r in selected),
+                    'other_pending_materials': [r['title'] for r in by_chapter.get('', [])
+                                                if not r.get('confirmed') or r['status'] == 'blocked']}
+        return copy.deepcopy((dict(project, stage_overview=overview, export_mapping_revision=token), materials, categories, selected, 'stage'))
 
     def export(self, key, body, snapshot=None, progress=None):
         import engine
@@ -1206,11 +1495,20 @@ class Store(SpecialLibrary):
         report_file = self.path(f'exports/{key_export}.json')
         try:
             result = engine.export_document(str(template), str(output), mappings, materials, mode=mode, categories=categories, progress=progress,
-                                            framework_drafts=project.get('chapter_texts', {}) if project.get('framework_id') else None)
+                                            framework_drafts=project.get('chapter_texts', {}) if project.get('framework_id') else None,
+                                            procurement_audit=project.get('procurement_audit'),
+                                            chapter_visuals=project.get('chapter_visuals'),
+                                            resolve_image=lambda ident: writing_visuals.image_path(self, key, ident))
+            redline_summary = project.get('redline_export')
+            if redline_summary and not redline_summary.get('complete'):
+                result.setdefault('warnings', []).append(
+                    f'废标红线尚有 {redline_summary.get("pending_count", 0)} 条未确认通过；'
+                    '本次导出为仅供内部核对的半成品/初稿，递交前须完成红线核对。')
             if project.get('template_import_kind') == 'converted_doc':
                 result.setdefault('warnings', []).append('此模板已从旧版 .doc 转换；请在 Word 中核对表格、分页和目录。')
             safe_name = re.sub(r'[^\w\-\u4e00-\u9fff]+', '_', project['name'])[:80]
-            value = {'id': key_export, 'project_id': key, 'project_name': project['name'], 'filename': safe_name + ('_待补草稿' if mode == 'draft' else '_已核对') + '.docx', 'mode': mode, 'created_at': now(), 'filled_count': result.get('filled_count', 0), 'missing_count': result.get('missing_count', 0), 'skipped_count': result.get('skipped_count', 0), 'download_url': f'/api/exports/{key_export}/download', 'report_url': f'/api/exports/{key_export}/report', 'warnings': result.get('warnings', [])}
+            suffix = {'stage': '_内部阶段预览', 'draft': '_待补草稿', 'reviewed': '_已核对'}[mode]
+            value = {'id': key_export, 'project_id': key, 'project_name': project['name'], 'filename': safe_name + suffix + '.docx', 'mode': mode, 'created_at': now(), 'filled_count': result.get('filled_count', 0), 'missing_count': result.get('missing_count', 0), 'skipped_count': result.get('skipped_count', 0), 'download_url': f'/api/exports/{key_export}/download', 'report_url': f'/api/exports/{key_export}/report', 'warnings': result.get('warnings', [])}
             selected = {mid for m in mappings for mid in m.get('material_ids', [])}
             sources = [{'id': m['id'], 'name': m['name'], 'subject': m['subject'], 'revision': m['revision'], 'years': m['years'], 'files': [{'id': f['id'], 'name': f['name'], 'rotation': f['rotation'], 'sha256': f['sha256']} for f in m['files']]} for m in materials if m['id'] in selected]
             evidence = {m['id']: m['credit_evidence'] for m in materials if m.get('credit_evidence')}
@@ -1221,11 +1519,17 @@ class Store(SpecialLibrary):
                       'source_sha256': project.get('template_source_hash', project['template_hash']),
                       'import_kind': project.get('template_import_kind', 'docx')},
                       'special_category_ids': project.get('special_category_ids', []),
-                      'special_selection_confirmed': True, 'mappings': mappings, 'materials': sources,
+                      'special_selection_confirmed': bool(project.get('special_selection_confirmed')), 'mappings': mappings, 'materials': sources,
                       'results': result.get('results', []), 'warnings': result.get('warnings', [])}
+            report['snapshot_revision'] = project.get('export_snapshot_revision') or snapshot_revision(project, mode)
+            report['mapping_revision'] = project.get('export_mapping_revision')
             if project.get('framework_id'):
                 report['chapter_revision'] = project.get('chapter_revision', 0)
                 report['written_chapters'] = list(project.get('chapter_texts', {}))
+                if project.get('redline_export'):
+                    report['redline'] = project['redline_export']
+                if mode == 'stage':
+                    report['stage_overview'] = project['stage_overview']
             # Engine reports are data. Do not expose private filesystem locations even on failure paths.
             sanitized = json.dumps(report, ensure_ascii=False, indent=2).replace(str(self.root), '[本地资料]')
             report_file.write_text(sanitized, encoding='utf-8')
@@ -1233,8 +1537,11 @@ class Store(SpecialLibrary):
                 self.put('export', value)
                 current = self.require('project', key)
                 # A background export must not overwrite edits made after submission.
-                if (current['mappings'] == project['mappings'] and current.get('special_category_ids') == project.get('special_category_ids')
-                        and current.get('chapter_revision') == project.get('chapter_revision')):
+                if (mode != 'stage'
+                        and self.mapping_revision(current) == project.get('export_mapping_revision')
+                        and current.get('redline_review') == project.get('redline_review')
+                        and current.get('redline_ai') == project.get('redline_ai')
+                        and not self.archived_project(current)):
                     current['status'] = '已导出'
                     current['updated_at'] = now()
                     self.put('project', current)
@@ -1313,7 +1620,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.local_hosts()
         return self.local_hosts() | set(self.remote_hosts())
 
-    def origin_key(self, value):
+    @staticmethod
+    def origin_key(value):
         try:
             parsed = urlsplit(value)
         except ValueError:
@@ -1328,7 +1636,15 @@ class Handler(BaseHTTPRequestHandler):
             port = 443 if parsed.scheme == 'https' else 80
         return parsed.scheme, parsed.hostname.lower().rstrip('.'), port
 
+    def behind_proxy(self):
+        return bool(getattr(self.server, 'behind_proxy', False))
+
+    def remote_user(self):
+        return getattr(self, '_portal_user', '')
+
     def allowed_origin_keys(self):
+        if self.behind_proxy():
+            return self.server.proxy_origins
         mode = self.access_mode()
         if mode == 'remote':
             keys = set()
@@ -1365,14 +1681,12 @@ class Handler(BaseHTTPRequestHandler):
     def is_public_request(self):
         # 花生壳映射口与本机环回口拆开：不靠 Host 判断，避免穿透流量伪造 Host 绕过材料门禁。
         mode = self.access_mode()
-        if mode == 'remote':
-            return True
-        if mode == 'local':
-            return False
-        return self.request_host() in self.remote_hosts()
+        if self.behind_proxy():
+            return self.remote_user() not in self.server.proxy_admins
+        return mode == 'remote' or self.client_source() != '127.0.0.1'
 
     def require_intranet_files(self):
-        """身份证、营业执照等材料原件仅允许本机环回入口读取，花生壳映射口不可下载。"""
+        """材料原件仅供本机入口和授权门户管理员读取。"""
         if self.is_public_request():
             raise PermissionError('营业执照、身份证等材料原件仅限内网查看；花生壳外网不可下载或导出含材料文件。')
 
@@ -1409,10 +1723,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self.is_public_request() or not isinstance(value, dict):
             return value
         payload = copy.deepcopy(value)
-        for key in ('materials', 'selected_special_materials', 'items'):
-            for material in payload.get(key) or []:
-                self._redact_material_files(material)
-        self._redact_material_files(payload)
+        def redact(node):
+            if isinstance(node, list):
+                for row in node:
+                    redact(row)
+            elif isinstance(node, dict):
+                if 'category_id' in node and ('files' in node or 'mode' in node):
+                    self._redact_material_files(node)
+                    for key in ('content', 'description', 'credit_evidence'):
+                        node.pop(key, None)
+                for key, row in list(node.items()):
+                    if isinstance(row, str) and (row.startswith(('/api/files/', '/api/exports/'))
+                                                 or re.match(r'/api/projects/[^/]+/writing/(?:images|download)/', row)):
+                        node.pop(key)
+                    else:
+                        redact(row)
+
+        redact(payload)
         intranet_port = getattr(self.server, 'intranet_port', None)
         local_hint = (f'http://127.0.0.1:{intranet_port}/'
                       if intranet_port else '本机环回入口')
@@ -1425,7 +1752,7 @@ class Handler(BaseHTTPRequestHandler):
         return payload
 
     def client_source(self):
-        return self.client_address[0] if self.client_address else ''
+        return self.client_address[0] if getattr(self, 'client_address', None) else ''
 
     def token_matches(self, candidate):
         expected = getattr(self.server, 'access_token', None)
@@ -1460,7 +1787,9 @@ class Handler(BaseHTTPRequestHandler):
     def audit(self, action, **fields):
         log = getattr(self.server, 'audit_log', None)
         if log:
-            log.write(action=action, entry=self.access_mode() or 'single',
+            if self.remote_user():
+                fields['portal'] = {'user': self.remote_user()}
+            log.write(action=action, entry='proxy' if self.behind_proxy() else self.access_mode() or 'single',
                       source=self.client_source(), **fields)
 
     def login_page(self, message='', status=401):
@@ -1548,6 +1877,17 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                         extra_headers=self.set_access_cookie(self.server.sessions.create()) + [('Location', '/')])
 
     def require_access(self):
+        if self.behind_proxy():
+            keys = self.headers.get_all('X-Bid-Proxy-Key') or []
+            users = self.headers.get_all('X-Remote-User') or []
+            if (len(keys) != 1 or not secrets.compare_digest(keys[0].encode(), self.server.proxy_secret.encode())
+                    or len(users) != 1 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', users[0])
+                    or '..' in users[0]):
+                raise AuthRequired('请从受信商机入口登录')
+            self._portal_user = users[0]
+            return
+        if self.access_mode() != 'remote' and self.client_source() != '127.0.0.1':
+            raise PermissionError('本机入口仅接受环回连接')
         if not getattr(self.server, 'access_token', None):
             return
         if self.access_authenticated():
@@ -1559,7 +1899,12 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
 
     def validate_origin(self, mutation=False):
         host = self.request_host()
-        if host not in self.allowed_hosts():
+        if len(self.headers.get_all('Host') or []) != 1 or not self.path.startswith('/') or self.path.startswith('//'):
+            raise PermissionError('请求地址不正确')
+        if self.behind_proxy():
+            if host not in self.server.proxy_hosts:
+                raise PermissionError('请求地址不正确')
+        elif host not in self.allowed_hosts():
             raise PermissionError('请通过本机入口或已配置的花生壳域名访问系统')
         if mutation:
             origin = (self.headers.get('Origin') or '').strip()
@@ -1620,13 +1965,37 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
         bits = path.strip('/').split('/')
         method = 'GET' if self.command == 'HEAD' else self.command
         store = self.server.store
+        if (method == 'GET' and len(bits) == 6 and bits[:2] == ['api', 'projects']
+                and bits[3:5] == ['writing', 'images']):
+            self.require_intranet_files()
+            file = writing_visuals.image_path(store, bits[2], bits[5])
+            return self.send_bytes(file.read_bytes(), 'image/png' if file.suffix == '.png' else 'image/jpeg')
+        if (method == 'GET' and len(bits) == 7 and bits[:2] == ['api', 'projects']
+                and bits[3:5] == ['writing', 'download']):
+            self.require_intranet_files()
+            from writing_chat import ARTIFACT_NAMES
+            job = store.require('writing_job', bits[5])
+            kind = bits[6]
+            if (not job.get('chat') or job['project_id'] != bits[2] or job['status'] != 'completed'
+                    or kind not in ARTIFACT_NAMES):
+                raise ValueError('本轮 Word 文件尚未生成或不属于当前项目。')
+            project = store.require('project', bits[2])
+            name = re.sub(r'[^\w\-]+', '_', project['name'])[:80]
+            return self.send_bytes(store.path(f"exports/{job['id']}/{kind}.docx").read_bytes(),
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                filename=f'{name}_{ARTIFACT_NAMES[kind]}.docx')
         if method == 'GET' and len(bits) == 4 and bits[:2] == ['api', 'projects'] and bits[3] == 'writing':
-            return self.json_response(store.writing.describe(bits[2], view=parse_qs(url.query).get('view', ['full'])[0]))
+            query = parse_qs(url.query)
+            edition = query.get('edition', [None])[0]
+            return self.json_response(self.redact_public_payload(store.writing.describe(
+                bits[2], view=query.get('view', ['full'])[0], edition_id=edition)))
         if method == 'GET' and path == '/api/frameworks':
             return self.json_response(framework_service.list_frameworks(store))
         if method == 'GET' and bits[:2] == ['api', 'frameworks'] and len(bits) >= 3:
             if len(bits) == 3:
                 return self.json_response(framework_service.describe(store, bits[2]))
+            if len(bits) == 4 and bits[3] in {'automatic', 'calibration'}:
+                return self.json_response(store.outline_jobs.describe(bits[2], bits[3]))
             if (len(bits) == 4 and bits[3] == 'source') or (len(bits) == 5 and bits[3] == 'artifacts'):
                 file, mime, name = framework_service.asset(store, bits[2], bits[-1])
                 preview = mime.startswith('text/html') and url.query != 'download=1'
@@ -1636,16 +2005,23 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
         if method == 'GET' and len(bits) == 4 and bits[:2] == ['api', 'projects'] and bits[3] == 'redline-scan':
             import redline_scan
             return self.json_response(redline_scan.describe(store, bits[2]))
+        if method == 'GET' and len(bits) == 4 and bits[:2] == ['api', 'projects'] and bits[3] == 'stage-preview':
+            self.require_intranet_files()
+            return self.json_response(store.stage_snapshot(bits[2])[0]['stage_overview'])
         if method == 'GET' and path == '/api/export-jobs':
-            return self.json_response(store.export_jobs.list())
+            jobs = store.export_jobs.list()
+            return self.json_response(self.redact_public_payload({'items': jobs})['items'])
         if method == 'GET' and path == '/api/bootstrap':
-            return self.json_response(self.redact_public_payload(store.bootstrap()))
+            payload = dict(self.redact_public_payload(store.bootstrap()))
+            if self.behind_proxy():
+                payload['portal'] = {'href': self.server.portal_link, 'user': self.remote_user()}
+            return self.json_response(payload)
         if method == 'GET' and path == '/api/materials':
             return self.json_response(self.redact_public_payload(store.special_list(parse_qs(url.query))))
         if method == 'GET' and len(bits) == 3 and bits[:2] == ['api', 'materials']:
             return self.json_response(self.redact_public_payload(store.public_material(store.require('material', bits[2]))))
         if method == 'GET' and path == '/api/credit-automation':
-            return self.json_response(store.credit.status())
+            return self.json_response(self.redact_public_payload(store.credit.status()))
         if method == 'GET' and len(bits) == 3 and bits[:2] == ['api', 'projects']:
             return self.json_response(self.redact_public_payload(store.public_project(store.require('project', bits[2]))))
         if method == 'GET' and len(bits) == 3 and bits[:2] == ['api', 'files']:
@@ -1669,6 +2045,7 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             meta, raw = store.contributions.case_file(bits[2], bits[4])
             return self.send_bytes(raw, 'application/octet-stream', filename=PurePosixPath(meta['name']).name)
         if method == 'GET' and len(bits) == 4 and bits[:2] == ['api', 'exports']:
+            self.require_intranet_files()
             item = store.require('export', bits[2])
             if bits[3] == 'download':
                 self.require_intranet_files()
@@ -1678,6 +2055,8 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 return self.send_bytes(store.path(f'exports/{item["id"]}.json').read_bytes(), 'application/json; charset=utf-8', filename=item['filename'].replace('.docx', '_核对报告.json'))
         if method in {'POST', 'PATCH'}:
             body = self.body()
+            if len(bits) == 4 and bits[:2] == ['api', 'projects'] and bits[3] == 'export-jobs':
+                self.require_intranet_files()
             if len(bits) >= 3 and bits[:2] == ['api', 'projects']:
                 project = store.require('project', bits[2])
                 framework = store.get('framework', project.get('framework_id', ''))
@@ -1685,8 +2064,11 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                     raise ValueError('目录已更新，此工作稿已归档；请重新打开当前整本项目后修改')
                 if framework and framework.get('review_version') and not framework.get('requirements_confirmed'):
                     raise ValueError('招标要求尚未重新确认，请返回招标解读核对')
+                if len(bits) == 4 and bits[3] in {'mappings', 'export-jobs'}:
+                    project = store.sync_common_locations(project)
+                    store.db.commit()
                 if len(bits) == 4 and bits[3] in {'mappings', 'special-categories', 'text-materials',
-                                                'scan', 'export-jobs', 'export', 'chapter-drafts',
+                                                'scan', 'export-jobs', 'chapter-drafts',
                                                 'redline-scan'}:
                     store.require_mapping_revision(project, body)
             if len(bits) >= 3 and bits[:2] == ['api', 'materials'] and (
@@ -1719,6 +2101,7 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 store.db.commit()
                 return self.json_response(value, 201)
             if method == 'POST' and path == '/api/materials/validate':
+                self.require_local_admin()
                 return self.json_response(store.validate_material_form(body))
             if method == 'POST' and path == '/api/materials':
                 self.require_local_admin()
@@ -1761,9 +2144,6 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 if method == 'POST' and bits[3] == 'export-jobs':
                     self.require_intranet_files()
                     return self.json_response(store.export_jobs.start(bits[2], body), 202)
-                if method == 'POST' and bits[3] == 'export':
-                    self.require_intranet_files()
-                    return self.json_response(store.export(bits[2], body), 201)
         if method == 'GET' and not path.startswith('/api/'):
             allowed = {'/': ('index.html', 'text/html; charset=utf-8'), '/index.html': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8'), '/workflow.js': ('workflow.js', 'text/javascript; charset=utf-8'), '/workflow.css': ('workflow.css', 'text/css; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8')}
             target = allowed.get(path)
@@ -1790,7 +2170,10 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             return  # 登录结果已单独记录
         if self.command in {'POST', 'PATCH'}:
             action = 'change'
-        elif self.command == 'GET' and re.fullmatch(r'/api/exports/[^/]+/(?:download|report)', path):
+        elif self._status in {401, 403}:
+            action = 'access-denied'
+        elif self.command in {'GET', 'HEAD'} and (re.fullmatch(r'/api/exports/[^/]+/(?:download|report)', path)
+                                        or re.fullmatch(r'/api/projects/[^/]+/writing/download/[^/]+/[^/]+', path)):
             action = 'download'
         else:
             return
@@ -1800,15 +2183,16 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
     def _run_request(self):
         # A keep-alive handler serves multiple requests. Never reuse a prior body.
         self.__dict__.pop('_request_body', None)
+        self._portal_user = ''
         path = unquote(urlsplit(self.path).path)
         try:
-            if path == LOGIN_PATH:
+            if path == LOGIN_PATH and not self.behind_proxy():
                 self.validate_origin(self.command == 'POST')
                 return self.handle_login()
             self.validate_origin(False)
             self.require_access()
         except AuthRequired as exc:
-            if path.startswith('/api/'):
+            if path.startswith('/api/') or self.behind_proxy():
                 return self.request_error(exc)
             return self.login_page(str(exc), 401)
         except (BrokenPipeError, ConnectionResetError):
@@ -1836,7 +2220,15 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
         case_route = re.fullmatch(r'/api/projects/([^/]+)/writing/cases', urlsplit(self.path).path)
         if case_route and self.command == 'POST':
             try:
-                return self.json_response(self.server.store.writing.upload(case_route[1], self.body()))
+                return self.json_response(self.server.store.writing.upload(
+                    case_route[1], self.body(), remote=self.is_public_request()))
+            except Exception as exc:
+                return self.request_error(exc)
+        outline_job = re.fullmatch(r'/api/frameworks/([^/]+)/(automatic|calibration)', path)
+        if outline_job and self.command == 'POST':
+            try:
+                return self.json_response(self.server.store.outline_jobs.start(
+                    outline_job[1], outline_job[2]), 202)
             except Exception as exc:
                 return self.request_error(exc)
         review_route = re.fullmatch(r'/api/frameworks/([^/]+)/(requirements|outline)',
@@ -1902,6 +2294,35 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                 return
             except Exception as exc:
                 return self.request_error(exc)
+        ai_review_route = re.fullmatch(
+            r'/api/projects/([^/]+)/redline-scan/ai-review', urlsplit(self.path).path)
+        if ai_review_route and self.command == 'POST':
+            # The model call may take minutes; never hold the shared DB lock across it.
+            try:
+                self.validate_origin(True)
+                import redline_ai
+                return self.json_response(redline_ai.review(self.server.store, ai_review_route[1]))
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:
+                self.server.store.db.rollback()
+                return self.request_error(exc)
+        export_route = re.fullmatch(r'/api/projects/([^/]+)/export', path)
+        if export_route and self.command == 'POST':
+            try:
+                self.require_intranet_files()
+                body = self.body()
+                store = self.server.store
+                with store.lock:
+                    project = store.sync_common_locations(store.require('project', export_route[1]))
+                    store.db.commit()
+                    store.require_mapping_revision(project, body)
+                    snapshot = store.prepare_export(export_route[1], body)
+                return self.json_response(store.export(export_route[1], body, snapshot=snapshot), 201)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:
+                return self.request_error(exc)
         with self.server.store.lock:
             try:
                 self.dispatch()
@@ -1923,7 +2344,7 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             code, message = 403, str(exc)
         elif isinstance(exc, LookupError):
             code, message = 404, str(exc)
-        elif isinstance(exc, (ValueError, TypeError)):
+        elif isinstance(exc, (ValueError, TypeError, RecursionError)):
             code, message = 400, str(exc) if isinstance(exc, ValueError) else '请求字段格式不正确'
             if not re.search(r'[\u4e00-\u9fff]', message):
                 # Python 内部报错（如 int() 解析失败）不直接返回给页面。
@@ -1947,7 +2368,7 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
 
 
 def _attach_server(httpd, *, store, bind_host, public, token, access_mode=None, intranet_port=None,
-                   owns_store=True, remote_hosts=None):
+                   owns_store=True, remote_hosts=None, behind_proxy=False, portal_link='/portal/'):
     httpd.daemon_threads = True
     httpd.store = store
     httpd.bind_host = bind_host
@@ -1960,20 +2381,51 @@ def _attach_server(httpd, *, store, bind_host, public, token, access_mode=None, 
     httpd.access_mode = access_mode
     httpd.intranet_port = intranet_port
     httpd.owns_store = owns_store
+    httpd.behind_proxy = behind_proxy
+    httpd.portal_link = portal_link
     return httpd
 
 
 def create_server(port=8766, data_dir=DEFAULT_DATA, seed=None, source_root=SOURCE_ROOT,
                   host='127.0.0.1', public_host=None, access_token=None, access_mode=None,
-                  intranet_port=None, store=None, lan_hosts=None):
+                  intranet_port=None, store=None, lan_hosts=None, behind_proxy=False,
+                  portal_link='/portal/', proxy_secret=None, proxy_origins=(), proxy_admins=()):
     seed = Path(data_dir).resolve() == DEFAULT_DATA.resolve() if seed is None else seed
-    bind_host = normalize_bind_host(host)
+    if behind_proxy:
+        try:
+            address = ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
+            raise ValueError('代理监听地址须为 IPv4 地址。') from None
+        if not address.is_private or address.is_unspecified:
+            raise ValueError('代理监听地址须为私网地址。')
+        bind_host = str(address)
+    else:
+        bind_host = normalize_bind_host(host)
     remote_hosts = normalize_remote_hosts([public_host or '', *(lan_hosts or [])])
     public = remote_hosts[0] if remote_hosts else None
     token = normalize_access_token(access_token) if access_token else None
+    if behind_proxy and (public or token):
+        raise ValueError('商机系统反向代理模式由门户统一登录，不能同时设置花生壳域名或访问口令')
+    if behind_proxy and access_mode:
+        raise ValueError('商机系统反向代理模式不能同时指定 access_mode')
+    if behind_proxy and (not re.fullmatch(r'/(?!/)[A-Za-z0-9_./-]*', portal_link or '')
+                         or any(part in {'.', '..'} for part in portal_link.split('/'))):
+        raise ValueError('商机系统入口须为本站路径，例如 /portal/')
     if public and not token:
         raise ValueError('启用花生壳公网域名时必须设置访问口令（--access-token）')
-    if token and not public and bind_host == '0.0.0.0':
+    origins, hosts = set(), set()
+    if behind_proxy:
+        if not proxy_secret or not re.fullmatch(r'[A-Za-z0-9_-]{32,}', proxy_secret) or not proxy_origins:
+            raise ValueError('代理模式须配置独立网关密钥与允许的门户来源')
+        for value in proxy_origins:
+            parsed = urlsplit(value)
+            origin = Handler.origin_key(value)
+            if (not origin or parsed.path or parsed.query or parsed.fragment
+                    or parsed.username is not None or not re.fullmatch(r'[a-zA-Z0-9.:-]+', parsed.netloc)):
+                raise ValueError('门户来源须为完整协议与主机地址')
+            origins.add(origin)
+            hosts.add(parsed.netloc.lower())
+    if not behind_proxy and not (public and token) and bind_host == '0.0.0.0':
         raise ValueError('绑定 0.0.0.0 时请同时配置 --public-host 与 --access-token')
     if public and access_mode is None:
         access_mode = 'remote'
@@ -1987,10 +2439,13 @@ def create_server(port=8766, data_dir=DEFAULT_DATA, seed=None, source_root=SOURC
     store = store or Store(data_dir, seed=seed, source_root=source_root)
     try:
         httpd = ThreadingHTTPServer((bind_host, port), Handler)
+        httpd.proxy_secret = proxy_secret
+        httpd.proxy_origins, httpd.proxy_hosts = origins, hosts
+        httpd.proxy_admins = frozenset(proxy_admins)
         return _attach_server(
             httpd, store=store, bind_host=bind_host, public=public, token=token,
             access_mode=access_mode, intranet_port=intranet_port, owns_store=owns_store,
-            remote_hosts=remote_hosts)
+            remote_hosts=remote_hosts, behind_proxy=behind_proxy, portal_link=portal_link)
     except Exception:
         if owns_store:
             store.close()
@@ -2005,6 +2460,9 @@ def create_oray_servers(port=8766, intranet_port=None, data_dir=DEFAULT_DATA, se
     if not remote_hosts:
         raise ValueError('远程模式需要花生壳域名或局域网/节点访问地址')
     public, extra = remote_hosts[0], remote_hosts[1:]
+    if not access_token:
+        raise ValueError('远程入口必须设置访问口令。')
+    normalize_access_token(access_token)
     remote_port = int(port)
     requested_local = None if intranet_port in (None, 0) else int(intranet_port)
     if remote_port < 0 or remote_port > 65535:
@@ -2060,6 +2518,7 @@ def load_oray_env(path):
 
 
 def main():
+    os.umask(0o077)
     import writing_model
     writing_model.load_local_env(APP_DIR)
     parser = argparse.ArgumentParser(description='标书管理系统（默认仅本机；花生壳模式可远程访问）')
@@ -2078,6 +2537,9 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=DEFAULT_DATA)
     parser.add_argument('--seed', action='store_true', default=None, help='向自定义数据目录导入交付包材料')
     parser.add_argument('--open', action='store_true', help='启动后打开浏览器')
+    parser.add_argument('--behind-proxy', action='store_true',
+                        help='部署在受信商机网关之后，需配置网关密钥和门户来源')
+    parser.add_argument('--portal-link', default='/portal/', help='返回商机系统的本站路径（反向代理模式）')
     args = parser.parse_args()
     if args.env_file:
         load_oray_env(args.env_file)
@@ -2092,6 +2554,8 @@ def main():
     public_host = args.public_host.strip() or (env('ORAY_PUBLIC_HOST', '').strip() if args.env_file else '') or None
     lan_hosts = normalize_remote_hosts(args.lan_host or ([env('ORAY_LAN_HOSTS', '')] if args.env_file else []))
     access_token = args.access_token.strip() or env('ORAY_ACCESS_TOKEN', '').strip() or None
+    if args.behind_proxy and (public_host or lan_hosts or access_token):
+        parser.error('反向代理模式由门户统一登录，不能同时配置花生壳域名、局域网地址或访问口令')
     intranet_port = args.intranet_port or None
     local_server = None
     if args.host is None:
@@ -2106,7 +2570,11 @@ def main():
             host=args.host, public_host=public_host, access_token=access_token, lan_hosts=lan_hosts)
     else:
         server = create_server(args.port, args.data_dir, args.seed, host=args.host,
-                               public_host=public_host, access_token=access_token)
+                               public_host=public_host, access_token=access_token,
+                               behind_proxy=args.behind_proxy, portal_link=args.portal_link,
+                               proxy_secret=env('BID_PROXY_SECRET', ''),
+                               proxy_origins=env('BID_PROXY_ORIGINS', '').split(),
+                               proxy_admins=env('BID_PROXY_ADMINS', '').split())
 
     def stop_service(signum, frame):
         raise KeyboardInterrupt
@@ -2120,6 +2588,9 @@ def main():
             print(f'远程访问地址：http://{host}/', flush=True)
         print('外网可编制标书；营业执照、身份证等材料原件与含材料导出仅限本机材料入口。', flush=True)
         threading.Thread(target=local_server.serve_forever, daemon=True).start()
+    elif server.behind_proxy:
+        open_url = env('BID_PROXY_ORIGINS', '').split()[0]
+        print(f'受信网关后端：{server.bind_host}:{server.server_port}，门户入口：{open_url}', flush=True)
     else:
         print(f'标书管理系统已启动：{open_url}', flush=True)
     if args.open:

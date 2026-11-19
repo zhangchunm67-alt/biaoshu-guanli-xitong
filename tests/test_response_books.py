@@ -1,6 +1,7 @@
 """Source-preserving book partition and the real review-to-outline transition."""
 import copy
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -119,7 +120,9 @@ class BookPartitionTests(unittest.TestCase):
                 self.assertEqual(['commercial', 'technical'], [b['role'] for b in again['books']])
                 page = html.parse(str(service.asset(store, first['id'], 'html')[0]))
                 commercial = page.xpath('//section[@data-book-role="commercial"]//li/text()')
-                self.assertEqual('营业执照', commercial[commercial.index('公司介绍') - 1])
+                self.assertTrue(all(re.match(r'^\d+(?:\.\d+)*\s', t) for t in commercial))
+                company = next(i for i, title in enumerate(commercial) if title.endswith('公司介绍'))
+                self.assertTrue(commercial[company - 1].endswith('营业执照'))
                 self.assertTrue(page.xpath('//section[@data-book-role="technical"]//li'))
                 built = Document(service.asset(store, first['id'], 'word')[0])
                 titles = [p.text for p in built.paragraphs if p._p.xpath('.//w:bookmarkStart')]

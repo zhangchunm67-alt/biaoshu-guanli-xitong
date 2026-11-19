@@ -45,7 +45,7 @@ if(fixture.status!==0)throw Error(fixture.stderr);
 const ids=JSON.parse(fixture.stdout);
 async function stop(server){if(!server||server.exitCode!==null)return;server.kill('SIGTERM');await new Promise(resolve=>server.once('exit',resolve));}
 async function start(){
- const child=spawn(python,['-B','-u','-c','from server import create_server\nimport sys\ns=create_server(0,sys.argv[1],seed=False);print(s.server_port,flush=True)\ntry:s.serve_forever()\nfinally:s.server_close();s.store.close()',path.join(root,'data')],{cwd:app,env,stdio:['ignore','pipe','pipe']});
+ const child=spawn(python,['-B','-u','-c','from server import create_server\nimport sys, writing_model\nwriting_model.complete_json=lambda rules, context, schema: {"items":[dict(id=row["id"],verdict="unclear",reason="请人工核对",evidence="",chapter_ids=[],suggestion="") for row in context["redlines"]]}\ns=create_server(0,sys.argv[1],seed=False);print(s.server_port,flush=True)\ntry:s.serve_forever()\nfinally:s.server_close();s.store.close()',path.join(root,'data')],{cwd:app,env,stdio:['ignore','pipe','pipe']});
  child.stderr.on('data',data=>fs.appendFileSync(path.join(root,'server-test.log'),data));
  const port=await new Promise((resolve,reject)=>{child.stdout.once('data',b=>resolve(Number(b.toString().trim())));child.once('exit',code=>reject(Error('server exit '+code)));});
  return {child,base:'http://127.0.0.1:'+port};
@@ -55,29 +55,36 @@ async function start(){
  try{
   let running=await start();server=running.child;let base=running.base;
   browser=await pw.chromium.launch({headless:true});page=await browser.newPage({viewport:{width:1440,height:1100}});
-  page.setDefaultTimeout(20000);const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  page.setDefaultTimeout(20000);page.on('dialog',dialog=>dialog.accept());const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(base);await page.locator('#wf-name').fill('一期全链路验收（测试数据）');
   await page.locator('#wf-upload').setInputFiles(path.join(root,'source.docx'));
   await page.locator('.wf-requirement-reading').waitFor({timeout:90000});
-  assert.equal(await page.locator('.wf-metric').count(),5);
+  assert.equal(await page.locator('.wf-metric').count(),1);
+  assert.equal(await page.locator('[data-wf=metric][data-id=redline]').count(),1);
   const fwId=new URL(page.url()).searchParams.get('workflow');
   let fw=await (await page.request.get(base+'/api/frameworks/'+fwId)).json();
   for(const key of ['redline','qualification','score','spec','format'])assert.ok(fw.requirements.some(r=>r.category===key),'missing requirement group '+key);
-  // The rule extractor can repeat a qualification proof in a broad requirements
-  // section. Exercise the supported human correction before confirming the list.
+  // Spec/qualification stay in the payload for outline; step-1 UI only edits redlines.
   const duplicate=fw.requirements.find(r=>r.category==='spec'&&r.text.includes('营业执照'));
   if(duplicate){
-   await page.locator('[data-wf=metric][data-id=spec]').click();
-   await page.locator('[data-wf=select-requirement][data-id="'+duplicate.id+'"]').click();
-   await page.locator('.wf-requirement-edit > summary').click();
-   page.once('dialog',d=>d.accept());await page.locator('[data-wf=delete-requirement]').click();
-   await page.locator('[data-wf=metric][data-id=redline]').click();
+   const patch=await page.request.patch(base+'/api/frameworks/'+fwId+'/requirements',{data:{
+     revision:fw.revision,
+     items:fw.requirements.filter(r=>r.id!==duplicate.id).map(({id,category,label,text,scope,references,note})=>({id,category,label,text,scope,references,note})),
+     confirmed:false,notes_acknowledged:false,acknowledged_removed_ids:[]
+   }});
+   assert.equal(patch.ok(),true,await patch.text());
+   await page.reload();
+   await page.locator('.wf-requirement-reading').waitFor({timeout:90000});
+   fw=await (await page.request.get(base+'/api/frameworks/'+fwId)).json();
   }
   await page.locator('.wf-requirement-edit > summary').click();
   await page.locator('#wf-requirement-note').fill('CHAIN-REVIEW-ALPHA：人工核对测试备注');
   if(await page.locator('#wf-notes-ack').count())await page.locator('#wf-notes-ack').check();
   for(const box of await page.locator('[data-wf=ack-removed]').all())await box.check();
-  await page.locator('[data-wf=confirm-requirements]').click();await page.locator('[data-wf=confirm]:enabled').waitFor();
+  await page.locator('[data-wf=confirm-requirements]').click();
+  await page.locator('#wf-outline-text').fill('1. 附件1 投标函\n2. 附件2 营业执照\n3. 附件3 保险项目业绩与案例\n4. 附件4 分项报价表\n5. 实施计划');
+  await page.locator('[data-wf=use-pasted-outline]').click();
+  await page.locator('[data-wf=confirm]:enabled').waitFor();
   await page.locator('.wf-outline-editor > summary').click();
   const count=await page.locator('.wf-outline-choice').count();
   await page.locator('.wf-outline-choice').last().click();await page.locator('[data-wf=outline-add-sibling]').click();
@@ -85,7 +92,7 @@ async function start(){
   await page.locator('[data-wf=outline-indent]').click();assert.match(await page.locator('.wf-outline-properties').innerText(),/第 2 级/);
   await page.locator('[data-wf=outline-outdent]').click();
   await page.locator('[data-wf=outline-add-child]').click();await page.locator('#wf-outline-title').fill('应删除的测试子节');
-  page.once('dialog',d=>d.accept());await page.locator('[data-wf=outline-delete]').click();
+  await page.locator('[data-wf=outline-delete]').click();
   await page.locator('[data-wf=save-outline]').click();await page.locator('[data-wf=confirm]:enabled').waitFor();
   await page.reload();await page.locator('[data-wf=confirm]:enabled').waitFor();
   assert.equal(await page.locator('.wf-outline-choice').count(),count+1);
@@ -96,26 +103,48 @@ async function start(){
   await special.locator('input[data-map-material][value="'+ids.case+'"]').check();
   // Human review can select a precise original chapter when no automatic match is claimed.
   const location=special.locator('select[data-map-field=locator_id]');
-  const target=await location.locator('option').filter({hasText:'附件3 保险项目业绩与案例'}).getAttribute('value');
+  const target=await location.locator('option').filter({hasText:/^附件3 保险项目业绩与案例$/}).getAttribute('value');
   await location.selectOption(target);
+  await page.getByRole('button',{name:'保存核对',exact:true}).first().click();
+  const duplicateHandling=special.locator('select[data-map-field=existing_handling]');
+  await duplicateHandling.waitFor();
+  await duplicateHandling.selectOption('append');
   await page.getByRole('button',{name:'保存核对',exact:true}).first().click();
   await page.screenshot({path:path.join(root,'filled.png'),fullPage:true});
   await page.getByRole('button',{name:'下一步：核对图片材料',exact:true}).click();
   await page.getByRole('heading',{name:'核对图片材料',exact:true}).waitFor();
   const license=page.locator('.mapping-card').filter({has:page.locator('input[data-map-material][value="'+ids.license+'"]')});
   await license.locator('input[data-map-material][value="'+ids.license+'"]').check();
+  const licenseHandling=license.locator('select[data-map-field=existing_handling]');
+  if(await licenseHandling.count())await licenseHandling.selectOption('append');
   await license.locator('textarea[data-map-field=note]').fill('CHAIN-IMAGE-REVIEW：测试证照已核对');
   await page.getByRole('button',{name:'保存核对',exact:true}).first().click();
-  await page.getByRole('button',{name:'下一步：编写投标文件',exact:true}).click();await page.locator('#wf-chapter').waitFor();
-  const option=page.locator('#wf-chapter option').filter({hasText:'验收测试补充响应'});const section=await option.getAttribute('value');
-  await page.locator('#wf-chapter').selectOption(section);await page.locator('#wf-body').fill('CHAIN-MANUAL-BETA：人工输入的验收正文；未启用 Skill 2。待提供的事实：【待补】。');
-  await page.locator('[data-wf=save]').click();await page.waitForFunction(()=>document.querySelector('#wf-save-status')?.textContent==='已保存');
-  await page.locator('#wf-redline-scan').waitFor();
-  const redlines=page.locator('[data-wf=ack-redline]');
-  for(let i=0;i<await redlines.count();i++)await redlines.nth(i).check();
-  if(await redlines.count()){await page.locator('[data-wf=save-redline]').click();await page.waitForFunction(()=>/全部红线已勾选|未识别到废标红线/.test(document.querySelector('#wf-redline-scan')?.innerText||''));}
-  await page.locator('[data-wf=export]').click();await page.getByRole('link',{name:'Word 文件',exact:true}).first().waitFor({timeout:90000});
-  const href=await page.getByRole('link',{name:'Word 文件',exact:true}).first().getAttribute('href');
+  await page.getByRole('button',{name:'下一步：编写投标文件',exact:true}).click();
+  const scan=page.locator('#wf-redline-scan');
+  await scan.waitFor();
+  const savedButton=page.locator('[data-wf=edit-saved-chapters]');
+  await savedButton.click();
+  let editor=page.locator('#active-modal form');
+  const section=await editor.locator('select option').filter({hasText:'验收测试补充响应'}).getAttribute('value');
+  await editor.locator('select').selectOption(section);
+  await editor.locator('textarea').fill('CHAIN-MANUAL-BETA：人工输入的验收正文，待提供的事实：【待补】。');
+  await editor.getByRole('button',{name:'保存正文'}).click();
+  await editor.waitFor({state:'detached'});
+  const draft=page.locator('[data-wf=formal-export][data-id=draft]');
+  await draft.click();
+  await page.locator('.toast').filter({hasText:/废标红线|AI 逐条核对/}).first().waitFor();
+  const ai=scan.locator('[data-wf=ai-redline]');
+  if(await ai.count()){
+   await ai.click();
+   await scan.getByText(/AI 核对：/).waitFor();
+   const redlines=scan.locator('[data-wf=ack-redline]');
+   for(const field of await redlines.all())await field.check();
+   if(await redlines.count())await scan.locator('[data-wf=save-redline]').click();
+  }
+  const exportRequest=page.waitForRequest(req=>req.url().endsWith('/export-jobs')&&req.postDataJSON()?.mode==='draft');
+  await draft.click();await exportRequest;
+  await page.locator('section[aria-label="正式导出"] a[download]').first().waitFor({timeout:30000});
+  const href=await page.locator('section[aria-label="正式导出"] a[download]').first().getAttribute('href');
   const response=await page.request.get(base+href);assert.ok(response.ok());fs.writeFileSync(path.join(root,'chain-export.docx'),await response.body());
   await page.screenshot({path:path.join(root,'export.png'),fullPage:true});
   fw=await (await page.request.get(base+'/api/frameworks/'+fwId)).json();
@@ -127,18 +156,36 @@ async function start(){
   assert.equal(report.export.filled_count,2);
   // Restart the actual server and reopen the persisted chain, then export again.
   await stop(server);running=await start();server=running.child;base=running.base;
-  await page.goto(base+'/?workflow='+fwId+'&step=5');await page.locator('#wf-chapter').waitFor();
-  await page.locator('#wf-chapter').selectOption(section);assert.match(await page.locator('#wf-body').inputValue(),/CHAIN-MANUAL-BETA/);
-  await page.locator('#wf-redline-scan').waitFor();
-  const again=page.locator('[data-wf=ack-redline]');
-  for(let i=0;i<await again.count();i++)await again.nth(i).check();
-  if(await again.count()){await page.locator('[data-wf=save-redline]').click();await page.waitForFunction(()=>/全部红线已勾选|未识别到废标红线/.test(document.querySelector('#wf-redline-scan')?.innerText||''));}
-  await page.locator('[data-wf=export]').click();await page.getByRole('link',{name:'Word 文件',exact:true}).first().waitFor();
-  await page.waitForFunction(()=>document.querySelectorAll('a').length>0);
+  await page.goto(base+'/?workflow='+fwId+'&step=5');
+  await page.locator('[data-wf=edit-saved-chapters]').click();
+  editor=page.locator('#active-modal form');
+  await editor.locator('select').selectOption(section);
+  assert.match(await editor.locator('textarea').inputValue(),/CHAIN-MANUAL-BETA/);
+  await editor.getByRole('button',{name:'取消'}).click();
+  await page.locator('[data-wf=formal-export][data-id=draft]').click();
+  await page.locator('section[aria-label="正式导出"] a[download]').first().waitFor();
   let after;
   for(let i=0;i<100;i++){after=await (await page.request.get(base+'/api/projects/'+project.id)).json();if(after.exports.length===2)break;await new Promise(r=>setTimeout(r,100));}
   assert.equal(after.exports.length,2);
   const second=await page.request.get(base+after.exports[0].download_url);assert.ok(second.ok());fs.writeFileSync(path.join(root,'chain-repeat.docx'),await second.body());
+  if(await page.locator('#export-task-modal[open]').count())await page.locator('#export-background').click();
+  const reviewed=page.locator('[data-wf=formal-export][data-id=reviewed]');
+  await reviewed.click();
+  await page.locator('.toast').filter({hasText:'正文仍含待补'}).first().waitFor();
+  await page.locator('[data-wf=edit-saved-chapters]').click();
+  editor=page.locator('#active-modal form');
+  await editor.locator('select').selectOption(section);
+  await editor.locator('textarea').fill('CHAIN-MANUAL-BETA：人工输入的验收正文，响应采购要求。');
+  await editor.getByRole('button',{name:'保存正文'}).click();
+  await editor.waitFor({state:'detached'});
+  await page.locator('#wf-redline-scan [data-wf=ai-redline]').click();
+  await page.locator('#wf-redline-scan').getByText(/AI 核对：/).waitFor();
+  await reviewed.click();
+  const checked=page.locator('section[aria-label="正式导出"] a[download]').filter({hasText:'已核对.docx'});
+  await checked.waitFor();
+  const reviewedWord=await page.request.get(base+await checked.getAttribute('href'));
+  assert.ok(reviewedWord.ok());
+  fs.writeFileSync(path.join(root,'chain-reviewed.docx'),await reviewedWord.body());
   assert.deepEqual(errors,[]);
   const validation=spawnSync(python,['-B','-c',String.raw`
 import json,sys
@@ -149,10 +196,11 @@ from lxml import etree
 root=Path(sys.argv[1]);source=Document(root/'source.docx')
 def sig(t):return [[c.text for c in r.cells] for r in t.rows]
 quote=sig(source.tables[-1]);counts=[]
-for file in ['chain-export.docx','chain-repeat.docx']:
+for file in ['chain-export.docx','chain-repeat.docx','chain-reviewed.docx']:
     d=Document(root/file);text='\n'.join(p.text for p in d.paragraphs)
     assert text.count('PHASE1-TEXT-ALPHA')==1,text
     assert text.count('CHAIN-MANUAL-BETA')==1,text
+    assert ('【待补】' in text) == (file != 'chain-reviewed.docx'), text
     assert text.count('FIXED-BUYER-ALPHA')==1,text
     assert text.count('QUOTE-NOTE-ALPHA')==1,text
     assert quote in [sig(t) for t in d.tables]
@@ -169,6 +217,6 @@ print(json.dumps(counts))
   assert.equal(validation.status,0,validation.stderr);
   const result={result:'passed',flow:'DOCX → requirement edit/confirmation → directory edit/confirmation → image and text fill → manual response → Word → restart/reexport',procurement:'local extraction and manual confirmation',writing:'manual response path; AI writing covered separately',manualReview:{removedCrossCategoryDuplicate:!!duplicate,textMaterialLocation:'selected original attachment 3'},requirements:fw.metrics,outlineChapters:fw.outline.length,materialMappings:2,filledCount:2,word:JSON.parse(validation.stdout),browserErrors:errors};
   fs.writeFileSync(path.join(root,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result));
- }catch(error){if(page)await page.screenshot({path:path.join(root,'failure.png'),fullPage:true}).catch(()=>{});throw error;}
+ }catch(error){if(page)console.error((await page.locator('main').innerText().catch(()=>'' )).slice(0,3500));if(page)await page.screenshot({path:path.join(root,'failure.png'),fullPage:true}).catch(()=>{});throw error;}
  finally{if(browser)await browser.close();await stop(server);if(!process.env.BID_CHAIN_QA_DIR)fs.rmSync(root,{recursive:true,force:true});}
 })().catch(error=>{console.error(error);process.exitCode=1;});

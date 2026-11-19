@@ -75,8 +75,64 @@ class CommonLocationTests(unittest.TestCase):
         doc.add_paragraph('投标人应提供营业执照复印件。')
         scanned = self.scan(doc, [self.material('business_license')])
         row = next(r for r in scanned['mappings'] if r['category_id'] == 'business_license')
-        self.assertTrue(row['locator_id'].startswith('ca:'))
+        self.assertEqual('ca:business_license', row['locator_id'])
         self.assertEqual('appendix', row['location_match']['status'])
+
+    def test_legacy_appendix_digest_locator_still_previews(self):
+        # Scoring-section request has no reliable body slot → synthetic appendix.
+        doc = Document()
+        doc.add_heading('第三章 评标办法', 1)
+        doc.add_heading('近三年财务审计报告', 2)
+        doc.add_paragraph('投标人应提供近三年财务审计报告。')
+        scanned = self.scan(doc)
+        row = next(r for r in scanned['mappings'] if r['category_id'] == 'audit_report')
+        self.assertEqual('ca:audit_report', row['locator_id'])
+        preview = LocationPreview()
+        try:
+            with patch.object(preview, '_build', return_value={'preview_id': 'test', 'page_count': 2}):
+                result = preview.describe({
+                    'template': self.source,
+                    'template_hash': hashlib.sha256(self.source.read_bytes()).hexdigest(),
+                    'template_name': 'source.docx',
+                    'locator_id': 'ca:audit_report:deadbeefdeadbeef',
+                    'action': 'fill', 'materials': [], 'categories': self.categories,
+                })
+            self.assertIn('文末另起一页新增材料区', result['description'])
+            self.assertEqual([], result['markers'])
+        finally:
+            preview.close()
+
+    def test_sync_remaps_legacy_appendix_digest_locator(self):
+        store = Store(self.root / 'data', seed=False)
+        try:
+            doc = Document()
+            doc.add_heading('第三章 评标办法', 1)
+            doc.add_heading('近三年财务审计报告', 2)
+            doc.add_paragraph('投标人应提供近三年财务审计报告。')
+            path = store.root / 'templates/template.docx'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            doc.save(path)
+            scanned = engine.scan_document(path, store.all('category'), [])
+            row = next(r for r in scanned['mappings'] if r['category_id'] == 'audit_report')
+            self.assertEqual('ca:audit_report', row['locator_id'])
+            stale = 'ca:audit_report:1f7a840bb564a086'
+            row.update(locator_id=stale, confirmed=True, location_match={
+                'status': 'appendix', 'reason': 'legacy', 'candidates': []})
+            project = dict(
+                id='legacy-appendix', template_storage='templates/template.docx',
+                template_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+                mappings=[row],
+                headings=[{'id': stale, 'title': '文末新增材料区 · 近三年财务审计报告',
+                           'kind': 'common_appendix', 'category_ids': ['audit_report']}],
+                special_category_ids=[], common_locator_version=12)
+            upgraded = store.sync_common_locations(project)
+            self.assertEqual('ca:audit_report', upgraded['mappings'][0]['locator_id'])
+            self.assertTrue(upgraded['mappings'][0]['confirmed'])
+            self.assertTrue(any(h['id'] == 'ca:audit_report' for h in upgraded['headings']))
+            self.assertFalse(any(h['id'] == stale for h in upgraded['headings']))
+            self.assertEqual(engine.COMMON_LOCATOR_VERSION, upgraded['common_locator_version'])
+        finally:
+            store.close()
 
     def test_real_response_form_preferred_over_scoring_section(self):
         doc = Document()
@@ -89,6 +145,41 @@ class CommonLocationTests(unittest.TestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual('营业执照副本（加盖公章）', rows[0]['title'])
         self.assertTrue(rows[0]['locator_id'].startswith('p:'))
+
+    def test_tax_locator_upgrade_preserves_materials_and_manual_locations(self):
+        store = Store(self.root / 'upgrade', seed=False)
+        self.addCleanup(store.close)
+        path = store.root / 'templates/legacy.docx'
+        doc = Document()
+        doc.add_heading('4.4企业税收及社保缴纳凭证', 2)
+        doc.add_paragraph('提供开标日前6个月任意一个月的税收和社会保障资金缴纳凭证。')
+        doc.add_heading('候选位置', 2)
+        doc.save(path)
+        project = dict(id='legacy-tax', template_storage='templates/legacy.docx',
+                       template_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+                       special_category_ids=[], common_locator_version=15, mappings=[])
+        scanned = store.scan_project_template(project)
+        target = next(r for r in scanned['mappings'] if r['category_id'] == 'tax_social')
+        self.assertEqual('matched', target['location_match']['status'])
+        manual = next(h['id'] for h in scanned['headings'] if h['title'] == '候选位置')
+        fallback = {'id': 'ca:tax_social', 'kind': 'common_appendix', 'category_ids': ['tax_social']}
+        saved = {**target, 'id': 'saved-tax', 'locator_id': fallback['id'],
+                 'location_match': {'status': 'appendix'}, 'action': 'fill',
+                 'material_ids': ['selected-proof'], 'note': '已人工选材料', 'confirmed': True}
+        audit = next(r for r in scanned['mappings'] if r['category_id'] == 'audit_report')
+        project.update(headings=[*scanned['headings'], fallback], mappings=[saved, audit])
+        manual_project = copy.deepcopy(project)
+        upgraded = store.sync_common_locations(project)
+        row = next(r for r in upgraded['mappings'] if r['category_id'] == 'tax_social')
+        self.assertEqual((target['locator_id'], ['selected-proof'], '已人工选材料', False),
+                         (row['locator_id'], row['material_ids'], row['note'], row['confirmed']))
+        self.assertEqual(audit, next(r for r in upgraded['mappings'] if r['category_id'] == 'audit_report'))
+        self.assertNotIn(fallback['id'], {h['id'] for h in upgraded['headings']})
+        manual_project['mappings'][0].update(locator_id=manual, location_match={'status': 'manual'})
+        upgraded = store.sync_common_locations(manual_project)
+        row, = [r for r in upgraded['mappings'] if r['category_id'] == 'tax_social']
+        self.assertEqual((manual, ['selected-proof'], True),
+                         (row['locator_id'], row['material_ids'], row['confirmed']))
 
     def test_negative_request_and_auditor_license_do_not_select_bidder_license(self):
         doc = Document()
@@ -106,7 +197,7 @@ class CommonLocationTests(unittest.TestCase):
         table.cell(1,0).text='须提供营业执照复印件'
         scanned = self.scan(doc, [self.material('business_license')])
         row = next(r for r in scanned['mappings'] if r['category_id'] == 'business_license')
-        self.assertTrue(row['locator_id'].startswith('ca:'))
+        self.assertEqual('ca:business_license', row['locator_id'])
 
     def test_project_managers_id_does_not_select_legal_representatives_id(self):
         doc = Document()

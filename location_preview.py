@@ -26,6 +26,31 @@ _RENDER_LOCK = threading.RLock()
 VERSION = 'page-preview-v1'
 
 
+def appendix_category(locator_id):
+    """Return category id for ca:{cid} or legacy ca:{cid}:{digest} locators."""
+    if not isinstance(locator_id, str) or not locator_id.startswith('ca:'):
+        return None
+    parts = locator_id.split(':')
+    return parts[1] if len(parts) >= 2 and parts[1] else None
+
+
+def resolve_appendix_record(records, locator_id):
+    """Map stored appendix locators onto the live scan, including legacy digests."""
+    record = records.get(locator_id)
+    if record is not None:
+        return record
+    cid = appendix_category(locator_id)
+    if not cid:
+        return None
+    stable = records.get(f'ca:{cid}')
+    if stable is not None:
+        return stable
+    for candidate in records.values():
+        if candidate.get('kind') == 'common_appendix' and cid in candidate.get('category_ids', []):
+            return candidate
+    return None
+
+
 def _bookmark(paragraph, index, bookmark_id, edge):
     name = f'BidPreview{index}{edge}'
     start = OxmlElement('w:bookmarkStart')
@@ -213,7 +238,9 @@ class LocationPreview:
                         'description': '尚未选择插入位置。可先翻页查看原文，再从上方选择位置查看标记。',
                         'template_name': snapshot['template_name']}
         document, records = self._recognize(raw, template_hash, snapshot['categories'])
-        record = records.get(snapshot['locator_id'])
+        record = resolve_appendix_record(records, snapshot['locator_id'])
+        if record is None:
+            record = records.get(snapshot['locator_id'])
         if record is None:
             raise ValueError('所选插入位置已失效，请重新扫描后再选择。')
         if record['kind'] == 'common_appendix':

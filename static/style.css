@@ -72,14 +72,14 @@
 .project-stepper .step.active strong{color:#4056df}
 .project-stepper .step:focus-visible{outline:2px solid #4056df;outline-offset:4px;border-radius:6px}
 .review-stage-heading{padding:0 0 16px;border:0}
-.project-next{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:25px 0 36px}
+.project-next{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:25px 0 36px}.project-next-actions{display:flex;align-items:center;gap:12px;margin-left:auto;flex-wrap:wrap}
 .project-picker-search{display:flex;flex-direction:column;gap:7px;margin-bottom:9px}
 .project-picker-pagination{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}
 .project-material-option{display:flex;align-items:center;gap:8px}
 .project-material-option .material-option{flex:1;min-width:0}
 .project-material-option>.text-button{flex:0 0 auto;margin-right:8px}
 @media(max-width:1100px){.project-stepper{grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.project-next{flex-wrap:wrap}}
-@media(max-width:600px){.project-stepper{grid-template-columns:repeat(2,minmax(0,1fr));padding:16px}.project-stepper .step{gap:9px;align-items:center}.project-next>.btn{width:100%;justify-content:center}.project-picker-pagination{flex-wrap:wrap}}
+@media(max-width:600px){.project-stepper{grid-template-columns:repeat(2,minmax(0,1fr));padding:16px}.project-stepper .step{gap:9px;align-items:center}.project-next>.btn,.project-next-actions>.btn{width:100%;justify-content:center}.project-next-actions{width:100%}.project-picker-pagination{flex-wrap:wrap}}
 
 /* The page image stays unmodified; insertion markers are a toggleable overlay. */
 .location-preview-entry{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
@@ -178,3 +178,4 @@
 @media(max-width:800px){.remote-banner{margin:12px 16px 0;font-size:12px}}
 .mapping-card-collapsed .mapping-conclusion{margin:0 0 6px;font-weight:600;color:#24334c}.mapping-card-collapsed .mapping-manual{margin-top:12px}.mapping-card-collapsed .mapping-manual summary{cursor:pointer;color:var(--primary);font-size:13px}.mapping-card-collapsed .mapping-manual[open] .mapping-main{margin-top:12px}
 .mode-tabs{display:inline-flex;gap:4px;padding:3px;border:1px solid var(--line);border-radius:999px;background:#fff}.mode-tab{border:0;background:transparent;padding:5px 12px;border-radius:999px;font:inherit;font-size:12px;color:var(--muted);cursor:pointer}.mode-tab.active{background:#eef1fd;color:var(--primary);font-weight:600}
+.sidebar-bottom .portal-link{margin:0 -10px 10px;width:calc(100% + 20px)}

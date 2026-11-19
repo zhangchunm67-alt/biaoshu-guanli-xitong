@@ -10,8 +10,8 @@ const {chromium} = require('playwright');
 const app = path.resolve(__dirname, '..');
 const root = process.env.BID_QA_DIR || fs.mkdtempSync(path.join(os.tmpdir(), 'bid-flow-'));
 fs.mkdirSync(root, {recursive:true});
-const python = process.env.BID_TEST_PYTHON || 'python3';
-const fixture = spawnSync(python, ['-c', `
+const python = process.env.BID_TEST_PYTHON || path.join(app, '.venv/bin/python');
+const fixture = spawnSync(python, ['-B', '-c', `
 import io,json,base64,sys
 from pathlib import Path
 from docx import Document
@@ -179,7 +179,7 @@ finally:s.server_close();s.store.close()
     assert.equal(project.mappings.find(m=>m.category_id==='company_profile').locator_id.startsWith('at:'),true);
     assert.deepEqual(project.special_industry_ids,['insurance','bank']);
     assert.deepEqual(project.special_category_ids,['I01','I02','I03','I04','B01','B02','B03','B04']);
-    assert.equal(project.mappings.every(m=>!m.confirmed&&m.status==='ready'),true);
+    assert.equal(project.mappings.every(m=>m.status==='ready'&&(m.layer==='special'?m.confirmed:!m.confirmed)),true);
     assert.equal(project.exports[0].mode,'draft');
     const report=await (await page.request.get(base+project.exports[0].report_url)).json();
     assert.equal(report.materials.length,10);

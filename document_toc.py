@@ -21,6 +21,7 @@ def _text_after(paragraph, marker):
 def excluded_paragraphs(document):
     import engine
     import recognition
+    from chapter_drafts import _sections
 
     body = document.element.body
     excluded = {p for p in body.iter(qn('w:p')) if engine._is_toc(p, Paragraph(p, document._body))}
@@ -197,7 +198,10 @@ def excluded_paragraphs(document):
                         if not row.get('region') and not re.search(r'(?:部分|篇)$', row['key']):
                             excluded.add(row['element'])
         start = end
-    return excluded - body_after_field
+    # Generated headings have stable insertion bookmarks. A manual TOC
+    # heuristic must not discard them when the buyer repeats its form title.
+    generated_headings = {paragraph._p for _, _, paragraph in _sections(document)}
+    return excluded - body_after_field - generated_headings
 
 
 def excluded_locator_ids(document, paragraphs, categories):

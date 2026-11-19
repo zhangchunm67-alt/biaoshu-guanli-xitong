@@ -40,7 +40,7 @@ for item in sockets:item.bind(('127.0.0.1',0))
 port,local_port=[item.getsockname()[1] for item in sockets]
 for item in sockets:item.close()
 remote,local=create_oray_servers(port=port,intranet_port=local_port,data_dir=root/'data',seed=False,host='127.0.0.1',
-    public_host=f'demo.test:{port}',access_token='contribution-test-token')
+    public_host=f'127.0.0.1:{port}',access_token='contribution-test-token')
 store=remote.store
 for category in store.all('category'):
     if category.get('layer')=='common':category['enabled']=False;store.put('category',category)
@@ -84,8 +84,8 @@ finally:
       });
       server.once('exit', code => { clearTimeout(timer); reject(Error('Fixture exited '+code+': '+serverLog)); });
     });
-    const remoteBase = `http://demo.test:${fixture.port}`, localBase = `http://127.0.0.1:${fixture.local}`;
-    browser = await playwright.chromium.launch({headless:true, args:['--host-resolver-rules=MAP demo.test 127.0.0.1','--no-proxy-server']});
+    const remoteBase = `http://127.0.0.1:${fixture.port}`, localBase = `http://127.0.0.1:${fixture.local}`;
+    browser = await playwright.chromium.launch({headless:true, args:['--no-proxy-server']});
     const errors = [];
     const open = async base => {
       const context = await browser.newContext({viewport:{width:1366,height:1000}});
@@ -97,7 +97,7 @@ finally:
       await page.locator('button[type=submit]').click();
       await page.waitForURL(base+'/');
       await page.locator('.nav-button[data-view="materials"]').first().click();
-      await page.locator('.material-subnav').waitFor();
+      await page.locator('.material-subnav[aria-label="材料库分类"]').waitFor();
       return page;
     };
     const shot = (page, name) => page.screenshot({path:path.join(root,name), fullPage:true});
@@ -199,14 +199,13 @@ finally:
 
     // Step 4 builds its case package from the library through the normal upload path.
     await reviewer.goto(localBase+'/?workflow='+fixture.framework+'&step=5');
-    await reviewer.locator('#wf-case-upload').waitFor({state:'attached'});
+    await reviewer.locator('#wf-chat-upload').waitFor({state:'attached'});
     const picker = reviewer.locator('details.wf-library-cases');
-    assert.match(await picker.locator('summary').textContent(), /1 个可用/);
+    await picker.locator('summary').filter({hasText:'1 个可用'}).waitFor();
     await picker.locator('summary').click();
     await picker.locator('input[name="wf-library-case"]').check();
     await picker.locator('[data-wf="use-library-cases"]').click();
-    await reviewer.locator('.wf-case-files').getByText('案例库/某银行运维服务案例/运维服务方案.docx').waitFor();
-    assert.equal(await reviewer.locator('.wf-case-files .wf-status').first().textContent(), '案例库');
+    await reviewer.locator('.wf-chat-files').getByText('案例库/某银行运维服务案例/运维服务方案.docx').waitFor();
     const writing = await (await reviewer.request.get(localBase+'/api/projects/'+fixture.project+'/writing')).json();
     assert.ok(writing.case_sources.some(source => source.text.includes('CASE-LIBRARY-EVIDENCE')));
     await shot(reviewer, '6-step4-library-case.png');

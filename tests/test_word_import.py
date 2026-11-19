@@ -81,6 +81,30 @@ class WordImportTests(unittest.TestCase):
         self.assertEqual([], self.store.all('project'))
         self.assertEqual([], list((self.store.root / 'templates').iterdir()))
 
+    def test_legacy_encryption_macros_and_invalid_fib_stop_before_conversion(self):
+        from unittest.mock import MagicMock
+
+        magic = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
+        cases = [
+            ([], True, b'', '加密'),
+            ([['ObjectPool']], False, b'', '嵌入文件'),
+            ([['Macros']], False, b'', '包含宏'),
+            ([], False, bytes(32), '格式不受支持'),
+            ([], False, b'\xec\xa5' + bytes(8) + b'\x00\x01' + bytes(20), '加密'),
+        ]
+        for paths, encrypted, fib, error in cases:
+            with self.subTest(error=error):
+                ole = MagicMock()
+                opened = ole.__enter__.return_value
+                opened.listdir.return_value = paths
+                opened.exists.side_effect = lambda name: name == 'WordDocument' or encrypted
+                opened.openstream.return_value = io.BytesIO(fib)
+                with patch('olefile.OleFileIO', return_value=ole), patch.object(
+                        word_import, 'find_converter', side_effect=AssertionError):
+                    with self.assertRaisesRegex(ValueError, error):
+                        self.upload('旧版.doc', magic)
+        self.assertEqual([], self.store.all('project'))
+
     def test_failed_scan_cleans_source_and_normalized_template(self):
         with patch.object(self.store, 'scan', side_effect=ValueError('扫描失败')):
             with self.assertRaisesRegex(ValueError, '扫描失败'):

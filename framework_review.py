@@ -10,6 +10,11 @@ COLUMN_CATEGORIES = ('qualification', 'format')
 COLUMN_LABELS = {'qualification': '强制资格要求', 'format': '指定格式'}
 GROUP_TITLES = {'qualification': '资格证明与准入响应', 'score': '评分要求响应',
                 'spec': '商务技术要求响应', 'format': '指定格式与待补附件'}
+CONSEQUENCE_TAIL = re.compile(r'^(?:否则|则|并?将|可被|可以被|则视为|将被视为|视为)')
+WEAK_REDLINE_LABEL = re.compile(
+    r'^(?:否决响应|否决投标|废标|无效(?:投标|响应|标书)?|(?:废标|否决)(?:情形|情况|条件|条款))[。；;]?$')
+CHECKLIST_FALSE_POSITIVE = re.compile(
+    r'^(?:供应商|投标人|响应人|报价人)?是否存在.{0,40}(?:无效响应情况|否决(?:响应|投标)?情形|废标情形)')
 
 
 def text(value, name, limit, required=False):
@@ -22,25 +27,89 @@ def text(value, name, limit, required=False):
     return value
 
 
+def _compact(value):
+    return re.sub(r'\s+', '', value or '')
+
+
+def expand_redline_text(text_value, references):
+    """用出处原文把「否则…无效」并回前句条件，修复历史空壳红线。"""
+    raw = (text_value or '').strip()
+    if not raw or not CONSEQUENCE_TAIL.match(raw.lstrip(' （(')):
+        return raw
+    needle = raw.rstrip('。；;！？')
+    for ref in references or []:
+        src = (ref.get('original_text') or ref.get('text') or '').strip()
+        if not src:
+            continue
+        pos = src.find(raw)
+        if pos < 0:
+            pos = src.find(needle)
+        if pos < 0:
+            sentences = re.split(r'(?<=[。！？])', src)
+            for index, sentence in enumerate(sentences):
+                if needle in sentence or raw in sentence or _compact(needle) in _compact(sentence):
+                    if index and CONSEQUENCE_TAIL.match(sentence.lstrip()):
+                        return (sentences[index - 1] + sentence).strip()
+                    break
+            continue
+        end = pos + len(raw)
+        if src[pos:end] != raw:
+            end = pos + len(needle)
+            if end < len(src) and src[end] in '。；;！？':
+                end += 1
+        # pos 前一个句号属于前句结尾；要从前句起点开始截，不能只从该句号之后截。
+        head = src[:pos].rstrip()
+        if head and head[-1] in '。！？；':
+            head = head[:-1]
+        break_at = max(head.rfind('。'), head.rfind('！'), head.rfind('？'), head.rfind('；'))
+        pipe = max(head.rfind('｜'), head.rfind('|'))
+        start = max(break_at, pipe) + 1 if max(break_at, pipe) >= 0 else 0
+        merged = src[start:end].strip(' ｜|')
+        if merged and len(_compact(merged)) > len(_compact(raw)):
+            return merged
+    return raw
+
+
+def polish_requirement(row):
+    """Normalize redline wording for display and persistence."""
+    row = copy.deepcopy(row)
+    row.setdefault('note', '')
+    row.setdefault('origin', row.get('origin') or 'rule')
+    if row.get('category') != 'redline':
+        return row
+    label = (row.get('label') or '').strip()
+    if label and WEAK_REDLINE_LABEL.fullmatch(_compact(label)):
+        row['label'] = ''
+    row['text'] = expand_redline_text(row.get('text') or '', row.get('references') or [])
+    return row
+
+
 def normalize_sources(payload):
     for source in payload['sources']:
         source['source_id'] = source['id']
     sources = {s['id']: s for s in payload['sources']}
+    requirements = []
     for row in payload['requirements']:
+        row = copy.deepcopy(row)
         row['references'] = [copy.deepcopy(sources.get(r.get('id', r.get('source_id')), r))
                              for r in row['references']]
         for ref in row['references']:
             ref['source_id'] = ref.get('id', ref.get('source_id'))
-        row.setdefault('note', '')
-        row.setdefault('origin', 'rule')
+        polished = polish_requirement(row)
+        if polished.get('category') == 'redline' and CHECKLIST_FALSE_POSITIVE.match((polished.get('text') or '').strip()):
+            continue
+        requirements.append(polished)
+    payload = dict(payload)
+    payload['requirements'] = requirements
     return payload
 
 
 def expand_requirements(items, sources):
     """Read both historical embedded references and the canonical ID-only form."""
     registry = {s['id']: s for s in sources}
-    result = copy.deepcopy(items)
-    for row in result:
+    result = []
+    for row in items:
+        row = copy.deepcopy(row)
         row.setdefault('note', '')
         row.setdefault('origin', 'rule')
         references = []
@@ -50,6 +119,10 @@ def expand_requirements(items, sources):
                 raise ValueError('要求引用的采购原文不存在，请核对已存框架')
             references.append(dict(copy.deepcopy(registry[ident]), source_id=ident))
         row['references'] = references
+        polished = polish_requirement(row)
+        if polished.get('category') == 'redline' and CHECKLIST_FALSE_POSITIVE.match((polished.get('text') or '').strip()):
+            continue
+        result.append(polished)
     return result
 
 
@@ -157,7 +230,9 @@ def assign_bookmarks(plan):
 def outline(plan):
     return [{'id': b['bookmark'], 'text': b['text'], 'level': b.get('level', 1),
              'requirement_ids': b.get('requirement_ids', []),
-             'locked_format': bool(b.get('locked_format')), 'part': ''}
+             'locked_format': bool(b.get('locked_format')), 'part': '',
+             **({'not_applicable': True} if b.get('not_applicable') else {}),
+             **({'source_index': b['source_index']} if plan.get('preserve_outline') and b.get('source_index') is not None else {})}
             for b in plan['blocks'] if b['kind'] == 'heading']
 
 

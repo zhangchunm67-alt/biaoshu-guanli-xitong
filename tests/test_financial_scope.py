@@ -6,6 +6,8 @@ import tempfile
 import unittest
 
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from PIL import Image
 
@@ -46,6 +48,46 @@ class FinancialScopeTests(unittest.TestCase):
             document.add_paragraph('请在此附对应财务证明材料。')
         document.save(self.source)
         return engine.scan_document(self.source, self.categories, self.materials)
+
+    def test_generated_qualification_uses_the_buyers_explicit_year_and_body_slots(self):
+        document = Document()
+        for level in (1, 2):
+            document.styles.add_style(f'BFHeading{level}', WD_STYLE_TYPE.PARAGRAPH)
+
+        def heading(title, level, ident):
+            paragraph = document.add_paragraph(title, f'BFHeading{level}')
+            outline = OxmlElement('w:outlineLvl')
+            outline.set(qn('w:val'), str(level - 1))
+            paragraph._p.get_or_add_pPr().append(outline)
+            mark = OxmlElement('w:bookmarkStart')
+            mark.set(qn('w:name'), f'BidSection{ident}')
+            mark.set(qn('w:id'), str(ident))
+            paragraph._p.append(mark)
+
+        heading('4. 资格证明文件', 1, 1)
+        heading('4.1 投标人基本情况信息表', 2, 2)
+        document.add_paragraph('投标人基本情况信息表')
+        document.add_table(rows=1, cols=1).cell(0, 0).text = '营业执照号'
+        document.add_paragraph('注：提供最新营业执照，电子版提供原件扫描件。')
+        heading('4.3 财务审计报告或银行资信证明', 2, 3)
+        document.add_paragraph('提供202X年度财务审计报告，或开标日前6个月内开具的银行资信证明。')
+        document.save(self.source)
+        categories = [c for c in engine.DEFAULT_CATEGORIES if c['id'] in {'audit_report', 'business_license'}]
+        evidence = {'required_years': [2025], 'bank_credit_months': 6, 'source': {'locator': '公告3.3'}}
+        result = engine.scan_document(self.source, categories, self.materials, preserve_forms=True,
+                                      procurement_audit=evidence)
+        mappings = {row['category_id']: row for row in result['mappings']}
+        license_row, audit = mappings['business_license'], mappings['audit_report']
+        self.assertTrue(license_row['locator_id'].startswith('at:business_license:'))
+        self.assertEqual('BidSection2', license_row['chapter_id'])
+        self.assertEqual('BidSection3', audit['chapter_id'])
+        self.assertEqual([2025], audit['required_years'])
+        self.assertEqual(['2025'], audit['material_ids'])
+        self.assertFalse(audit['existing_content'])
+        self.assertEqual(6, audit['requirement']['bank_credit_months'])
+        wrong = {**audit, 'material_ids': ['2024']}
+        self.assertEqual('blocked', engine.validate_mappings(
+            [wrong], self.materials, result['headings'], categories, preserve_forms=True)[0]['status'])
 
     def test_distinct_lot_years_preselect_only_their_own_images_and_export_in_place(self):
         scanned = self.fixture()

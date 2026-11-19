@@ -44,11 +44,20 @@ class WritingModelTests(unittest.TestCase):
              'requirement_ids': ['req2'], 'source_refs': ['src1'], 'material_refs': [],
              'missing_items': [], 'conflicts': []}], 'notes': ['候选正文需业务核对。']}
 
+        for chapter in self.payload['chapters']:
+            chapter['visuals'] = []
+
     def response(self, payload=None, **updates):
         value = {'id': 'resp_synthetic', 'status': 'completed', 'output': [
             {'type': 'reasoning', 'summary': []},
             {'type': 'message', 'content': [{'type': 'output_text',
                 'text': json.dumps(self.payload if payload is None else payload, ensure_ascii=False)}]}]}
+        value.update(updates)
+        return io.BytesIO(json.dumps(value, ensure_ascii=False).encode('utf-8'))
+
+    def chat_response(self, payload=None, **updates):
+        content = json.dumps(self.payload if payload is None else payload, ensure_ascii=False)
+        value = {'id': 'chat_synthetic', 'choices': [{'message': {'role': 'assistant', 'content': content}}]}
         value.update(updates)
         return io.BytesIO(json.dumps(value, ensure_ascii=False).encode('utf-8'))
 
@@ -73,7 +82,7 @@ class WritingModelTests(unittest.TestCase):
         request = call.call_args.args[0]
         body = json.loads(request.data)
         self.assertEqual('https://api.openai.com/v1/responses', request.full_url)
-        self.assertEqual(120, call.call_args.kwargs['timeout'])
+        self.assertEqual(writing_model.TIMEOUT_SECONDS, call.call_args.kwargs['timeout'])
         self.assertEqual('gpt-5.6-terra', body['model'])
         self.assertEqual({'effort': 'medium'}, body['reasoning'])
         self.assertEqual(16000, body['max_output_tokens'])
@@ -89,6 +98,17 @@ class WritingModelTests(unittest.TestCase):
         self.assertIn('固定表', body['instructions'])
         self.assertNotIn(self.key, request.data.decode())
         self.assertEqual(self.context, json.loads(body['input']))
+
+    def test_visuals_require_real_case_images_and_consistent_rows_and_anchors(self):
+        for block in [dict(kind='image', after=1, caption='历史样张', image_id='case1'),
+                      dict(kind='flow', after=7, caption='流程', steps=['提交','复核']),
+                      dict(kind='table', after=1, caption='交付', headers=['阶段','内容'], rows=[['初稿']])]:
+            with self.subTest(block=block):
+                payload = copy.deepcopy(self.payload)
+                payload['chapters'][0]['visuals'] = [block]
+                with patch('writing_model.urllib.request.urlopen', return_value=self.response(payload)):
+                    with self.assertRaises(ValueError):
+                        writing_model.generate(self.context)
 
     def test_identical_titles_are_ordered_by_id_not_title(self):
         payload = copy.deepcopy(self.payload)
@@ -109,8 +129,153 @@ class WritingModelTests(unittest.TestCase):
         with patch.dict(os.environ, {'BID_WRITING_MODEL': 'writing-override', 'BID_OPENAI_MODEL': 'general'}):
             self.assertEqual('writing-override', writing_model.configuration()['model'])
 
+    def test_available_models_and_resolve_model_allowlist(self):
+        with patch.dict(os.environ, {
+            'OPENAI_API_KEY': self.key,
+            'BID_OPENAI_MODEL': 'deepseek/deepseek-v4.1-flash-1017',
+            'BID_OPENAI_MODELS': 'moonshotai/kimi-k3.1-pro,qwen/qwen3.8-max-0902,z-ai/glm-5.3',
+        }, clear=True):
+            config = writing_model.configuration()
+            ids = [row['id'] for row in config['models']]
+            self.assertEqual([
+                'deepseek/deepseek-v4.1-flash-1017',
+                'moonshotai/kimi-k3.1-pro',
+                'qwen/qwen3.8-max-0902',
+                'z-ai/glm-5.3',
+            ], ids)
+            self.assertEqual('DeepSeek · 日常跑量', config['models'][0]['label'])
+            self.assertEqual('deepseek/deepseek-v4.1-flash-1017', writing_model.resolve_model(None))
+            self.assertEqual('moonshotai/kimi-k3.1-pro',
+                             writing_model.resolve_model('moonshotai/kimi-k3.1-pro'))
+            with self.assertRaisesRegex(ValueError, '允许名单'):
+                writing_model.resolve_model('openai/gpt-5.2')
+            with patch('writing_model.urllib.request.urlopen', return_value=self.response()) as call:
+                writing_model.generate(self.context, model='qwen/qwen3.8-max-0902')
+            self.assertEqual('qwen/qwen3.8-max-0902',
+                             json.loads(call.call_args.args[0].data)['model'])
+
+    def test_deepseek_uses_chat_completions_endpoint(self):
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://api.deepseek.com',
+                                     'BID_OPENAI_MODEL': 'deepseek-flash',
+                                     'BID_REASONING_EFFORT': 'high'}, clear=True):
+            self.assertEqual('deepseek-flash', writing_model.configuration()['model'])
+            with patch('writing_model.urllib.request.urlopen', return_value=self.chat_response()) as call:
+                result = writing_model.generate(self.context)
+        self.assertEqual(self.payload, result)
+        request = call.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual('https://api.deepseek.com/chat/completions', request.full_url)
+        self.assertEqual('deepseek-flash', body['model'])
+        self.assertEqual('high', body['reasoning_effort'])
+        self.assertEqual({'type': 'enabled'}, body['thinking'])
+        self.assertEqual({'type': 'json_object'}, body['response_format'])
+        self.assertEqual(writing_model.CHAT_MAX_OUTPUT_TOKENS, body['max_tokens'])
+        self.assertIs(False, body['stream'])
+        self.assertEqual(2, len(body['messages']))
+        self.assertEqual('system', body['messages'][0]['role'])
+        self.assertIn(writing_model.SKILL_PATH.read_text(encoding='utf-8'), body['messages'][0]['content'])
+        self.assertEqual(self.context, json.loads(body['messages'][1]['content']))
+        self.assertNotIn('store', body)
+        self.assertNotIn(self.key, request.data.decode())
+
+    def test_openrouter_uses_chat_completions_endpoint(self):
+        model = 'deepseek/deepseek-v4.1-flash-1017'
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://openrouter.ai/api/v1',
+                                     'BID_OPENAI_MODEL': model,
+                                     'BID_REASONING_EFFORT': 'medium'}, clear=True):
+            self.assertEqual(model, writing_model.configuration()['model'])
+            with patch('writing_model.urllib.request.urlopen', return_value=self.chat_response()) as call:
+                result = writing_model.generate(self.context)
+        self.assertEqual(self.payload, result)
+        request = call.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual('https://openrouter.ai/api/v1/chat/completions', request.full_url)
+        self.assertEqual(model, body['model'])
+        self.assertEqual({'effort': 'medium'}, body['reasoning'])
+        self.assertNotIn('thinking', body)
+        self.assertNotIn('reasoning_effort', body)
+        self.assertEqual('Bearer ' + self.key, request.get_header('Authorization'))
+        self.assertEqual('https://localhost', request.get_header('Http-referer')
+                         or request.headers.get('HTTP-Referer'))
+        self.assertEqual('Tengbao Bid System',
+                         request.get_header('X-openrouter-title')
+                         or request.headers.get('X-OpenRouter-Title'))
+        self.assertEqual('close', request.get_header('Connection')
+                         or request.headers.get('Connection'))
+
+    def test_openrouter_chat_incomplete_body_retries_instead_of_parsing_partial(self):
+        model = 'moonshotai/kimi-k3.1-pro'
+        class InterruptedResponse(io.BytesIO):
+            def read(self, size=-1):
+                raise http.client.IncompleteRead(super().read(size), 100)
+        broken = InterruptedResponse(b'{"choices":[{"message":{"content":"partial"')
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://openrouter.ai/api/v1',
+                                     'BID_OPENAI_MODEL': model}, clear=True):
+            with patch('writing_model.urllib.request.urlopen',
+                       side_effect=[broken, self.chat_response()]) as call:
+                result = writing_model.generate(self.context)
+        self.assertEqual(self.payload, result)
+        self.assertEqual(2, call.call_count)
+
+    def test_chat_empty_content_with_length_finish_is_treated_as_truncation(self):
+        raw = self.chat_response(choices=[{
+            'finish_reason': 'length',
+            'message': {'role': 'assistant', 'content': None},
+        }])
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://api.deepseek.com'}, clear=True):
+            with patch('writing_model.urllib.request.urlopen', return_value=raw):
+                with self.assertRaisesRegex(ValueError, '单章正文被截断|长度上限'):
+                    writing_model.generate({**self.context, 'chapters': self.context['chapters'][:1]})
+
+    def test_deepseek_accepts_fenced_json_content(self):
+        fenced = '```json\n' + json.dumps(self.payload, ensure_ascii=False) + '\n```'
+        raw = self.chat_response(choices=[{'message': {'content': fenced}}])
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://api.deepseek.com'}, clear=True):
+            with patch('writing_model.urllib.request.urlopen', return_value=raw):
+                self.assertEqual(self.payload, writing_model.generate(self.context))
+
+    def test_deepseek_accepts_json_surrounded_by_explanation(self):
+        content = '以下是候选正文：\n' + json.dumps(self.payload, ensure_ascii=False) + '\n请业务核对。'
+        raw = self.chat_response(choices=[{'message': {'content': content}}])
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://api.deepseek.com'}, clear=True):
+            with patch('writing_model.urllib.request.urlopen', return_value=raw):
+                self.assertEqual(self.payload, writing_model.generate(self.context))
+
+    def test_deepseek_truncation_splits_the_group_and_keeps_book_order(self):
+        cut = io.BytesIO(json.dumps({'choices': [{'finish_reason': 'length',
+            'message': {'role': 'assistant', 'content': '{"chapters":[{"chapter_id":"BidS'}}]},
+            ensure_ascii=False).encode('utf-8'))
+        first = {'chapters': [self.payload['chapters'][0]], 'notes': ['第一半需核对。']}
+        second = {'chapters': [self.payload['chapters'][1]], 'notes': ['第二半需核对。']}
+        responses = [cut, self.chat_response(first), self.chat_response(second)]
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://api.deepseek.com'}, clear=True):
+            with patch('writing_model.urllib.request.urlopen', side_effect=responses) as call:
+                result = writing_model.generate(self.context)
+        self.assertEqual(self.payload['chapters'], result['chapters'])
+        self.assertEqual(['第一半需核对。', '第二半需核对。'], result['notes'])
+        self.assertEqual(3, call.call_count)
+
+    def test_deepseek_truncation_of_a_single_chapter_reports_a_precise_error(self):
+        context = copy.deepcopy(self.context)
+        context['chapters'] = context['chapters'][:1]
+        cut = io.BytesIO(json.dumps({'choices': [{'finish_reason': 'length',
+            'message': {'role': 'assistant', 'content': '{"chapters":['}}]},
+            ensure_ascii=False).encode('utf-8'))
+        with patch.dict(os.environ, {'OPENAI_API_KEY': self.key,
+                                     'OPENAI_BASE_URL': 'https://api.deepseek.com'}, clear=True):
+            with patch('writing_model.urllib.request.urlopen', return_value=cut):
+                with self.assertRaisesRegex(ValueError, '单章正文被截断'):
+                    writing_model.generate(context)
+
     def test_configuration_is_safe_and_key_disabled_states_do_not_call(self):
-        self.assertEqual({'ready', 'model', 'reasoning', 'status', 'message'},
+        self.assertEqual({'ready', 'model', 'models', 'reasoning', 'status', 'message'},
                          set(writing_model.configuration()))
         self.assertNotIn(self.key, json.dumps(writing_model.configuration()))
         for env, expected in [({}, 'unconfigured'),
@@ -270,7 +435,7 @@ class WritingModelTests(unittest.TestCase):
         with patch('writing_model.urllib.request.urlopen', side_effect=lambda *a, **k: io.BytesIO(b'{')) as call:
             with self.assertRaisesRegex(ValueError, '自动重试后仍失败'):
                 writing_model.generate(self.context)
-        self.assertEqual(2, call.call_count)
+        self.assertEqual(3, call.call_count)
 
     def test_stream_uses_completed_response_and_ignores_deltas(self):
         terminal = {'type': 'response.completed', 'response': json.loads(self.response().getvalue())}

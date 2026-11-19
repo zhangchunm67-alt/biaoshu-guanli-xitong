@@ -46,7 +46,8 @@ record.sources.push(...Array.from({length:100},(_,i)=>({...source,id:'extra'+i,t
   });
   await page.goto(base+'/?workflow=ui-review&step=2');
   await page.locator('.wf-requirement-reading').waitFor();
-  assert.equal(await page.locator('.wf-step').count(),4);
+  assert.equal(await page.locator('.wf-step').count(),5);
+  assert.deepEqual(await page.locator('.wf-fork .wf-number').allTextContents(),['A','B']);
   assert.equal(await page.locator('#wf-requirement-label').isVisible(),false);
   assert.equal(await page.locator('.wf-source-evidence').isVisible(),true);
   assert.equal(await page.locator('.wf-note').filter({hasText:'核对附件'}).count(),1);
@@ -57,7 +58,8 @@ record.sources.push(...Array.from({length:100},(_,i)=>({...source,id:'extra'+i,t
   await page.locator('#wf-source-query').fill('独立');
   assert.equal(await page.locator('#wf-source-count').isVisible(),false);
   assert.equal(await page.locator('#wf-requirement-source option').count(),2);
-  assert.equal(await page.locator('.wf-metric').count(),5);
+  assert.equal(await page.locator('.wf-metric').count(),1);
+  assert.equal(await page.locator('[data-wf=metric][data-id=redline]').count(),1);
   assert.equal(await page.locator('.wf-model-status,[data-wf=retry-model]').count(),0);
   assert.doesNotMatch(await page.locator('main').innerText(),/模型复核|重新复核|gpt-5.6-terra|旧复核说明/);
   if(process.env.BID_REVIEW_QA_DIR){fs.mkdirSync(process.env.BID_REVIEW_QA_DIR,{recursive:true});await page.screenshot({path:path.join(process.env.BID_REVIEW_QA_DIR,'requirements.png'),fullPage:true});}
@@ -72,23 +74,23 @@ record.sources.push(...Array.from({length:100},(_,i)=>({...source,id:'extra'+i,t
   assert.equal(await page.locator('#wf-requirement-label').evaluate(el=>{el.focus();return document.activeElement===el;}),false);
   while(!releaseSave)await new Promise(resolve=>setTimeout(resolve,10));
   holdSave=false;releaseSave();releaseSave=null;
-  await page.waitForFunction(()=>document.querySelector('#wf-requirements-status')?.textContent==='要求待确认');
+  await page.waitForFunction(()=>document.querySelector('#wf-requirements-status')?.textContent?.includes('要求待确认'));
   await page.waitForFunction(()=>document.querySelector('.wf-workspace')?.inert===false);
   assert.equal(record.requirements[0].label,'已核实的要求');
   assert.equal(record.requirements_confirmed,false);
   assert.equal(requests.at(-1).body.items.some(r=>'_key' in r),false);
-  await page.locator('[data-wf=metric][data-id=qualification]').click();
   await page.locator('[data-wf=add-requirement]').click();
   await page.locator('#wf-source-query').fill('独立');
   await page.locator('#wf-requirement-source').selectOption('src1');
   await page.locator('[data-wf=add-reference]').click();
   assert.equal(await page.locator('#wf-requirement-text').inputValue(),source.text);
-  await page.locator('#wf-requirement-label').fill('补充资格');
+  await page.locator('#wf-requirement-label').fill('补充红线');
   assert.equal(await page.locator('.wf-confirm-gate #wf-notes-ack').count(),1);
   await page.locator('.wf-confirm-gate #wf-notes-ack').check();
   await page.locator('[data-wf=confirm-requirements]').click();
   await page.locator('[data-wf=confirm]:enabled').waitFor();
   assert.equal(record.requirements.length,6);
+  assert.equal(record.requirements.filter(r=>r.category==='redline').length,2);
   assert.equal(record.requirements_confirmed,true);
   assert.equal(requests.at(-1).body.notes_acknowledged,true);
   assert.deepEqual(requests.at(-1).body.acknowledged_removed_ids,[]);

@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from PIL import Image
 
@@ -135,7 +137,7 @@ class MaterialRuleTests(unittest.TestCase):
         right = self.material('2025年1-6月完税证明')
         lines = ['第一章 投标人须知', '供应商须提供2025年1月至6月的纳税证明。']
         row = self.tax_rows(self.scan_lines(lines, [wrong_tax, social]))[0]
-        self.assertTrue(row['locator_id'].startswith('ca:tax_social:'))
+        self.assertEqual('ca:tax_social', row['locator_id'])
         self.assertFalse(row['material_ids'])
         scanned = self.scan_lines(lines, [wrong_tax, social, right])
         row = self.tax_rows(scanned)[0]
@@ -259,6 +261,42 @@ class MaterialRuleTests(unittest.TestCase):
             self.assertEqual(1, len(pictures))
             self.assertEqual(Path(material['files'][0]['path']).read_bytes(), result.part.related_parts[pictures[0].get(qn('r:embed'))].blob)
         self.assertEqual(original, self.path.read_bytes())
+
+    def test_bookmarked_tax_heading_owns_the_evidence_after_its_instructions(self):
+        doc = Document()
+        toc_style = doc.styles.add_style('TOC 2', WD_STYLE_TYPE.PARAGRAPH)
+        title = '4.4 企业税收及社保缴纳凭证'
+        note = '提供开标日前6个月任意一个月的税收和社会保障资金缴纳凭证。'
+        doc.add_paragraph(title, toc_style)
+        doc.add_table(rows=1, cols=1).cell(0, 0).text = '税收及社保缴纳凭证'
+        for ident, text, level in ((1, '4. 资格证明文件', 1), (2, title, 2)):
+            paragraph = doc.add_heading(text, level)
+            mark = OxmlElement('w:bookmarkStart')
+            mark.set(qn('w:name'), f'BidSection{ident}')
+            mark.set(qn('w:id'), str(ident))
+            paragraph._p.append(mark)
+        doc.add_paragraph(note)
+        doc.add_heading('4.5 无违法违规记录查询截图', 2)
+        doc.save(self.path)
+        mats = [self.material('2026年8月完税证明'), self.material('2026年8月社保缴费凭证')]
+        scanned = engine.scan_document(self.path, self.categories, mats, preserve_forms=True)
+        row, = self.tax_rows(scanned)
+        self.assertEqual((title, 'BidSection2', 'matched', False),
+                         (row['title'], row['chapter_id'], row['location_match']['status'], row['existing_content']))
+        self.assertFalse(row['material_ids'])
+        row.update(action='fill', material_ids=[m['id'] for m in mats], conflict_review=True)
+        row, = engine.validate_mappings([row], mats, scanned['headings'], self.categories, preserve_forms=True)
+        self.assertEqual('ready', row['status'], row['issues'])
+        output = self.root / 'result.docx'
+        engine.export_document(self.path, output, [row], mats, categories=self.categories, framework_drafts=[])
+        exported = Document(output)
+        nodes = list(exported.element.body)
+        begin = next(i for i, node in enumerate(nodes) if engine._text(node) == note)
+        end = next(i for i, node in enumerate(nodes) if engine._text(node).startswith('4.5 '))
+        blobs = [exported.part.related_parts[b.get(qn('r:embed'))].blob
+                 for node in nodes[begin + 1:end] for b in node.iter(qn('a:blip'))]
+        self.assertEqual([Path(m['files'][0]['path']).read_bytes() for m in mats], blobs)
+        self.assertEqual(2, len(list(exported.element.body.iter(qn('a:blip')))))
 
     def test_text_templates_keep_each_body_slot_and_reject_wrong_type(self):
         scanned = self.scan(['投标函', '授权书', '承诺函'], [])

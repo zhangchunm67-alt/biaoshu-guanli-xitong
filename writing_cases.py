@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import io
 import ntpath
+import posixpath
 import re
 import stat
 import unicodedata
@@ -13,6 +14,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import PurePosixPath
 
+from PIL import Image, ImageOps
 from pypdf import PdfReader
 
 
@@ -55,7 +57,10 @@ def _digest_id(prefix: str, *parts: str) -> str:
 
 
 class _Batch:
-    def __init__(self):
+    def __init__(self, images=None, images_only=False):
+        self.images = images
+        self.images_only = images_only
+        self.image_bytes = 0
         self.files = []
         self.sources = []
         self.warnings = []
@@ -70,6 +75,50 @@ class _Batch:
         if text not in self.warnings:
             self.warnings.append(text)
 
+    def add_image(self, name, digest, location, load, hint='', original_bytes=None):
+        if self.images is None:
+            return
+        if len(self.images) >= 180 or self.image_bytes >= MAX_EXPANDED_BYTES:
+            self.warn(f'{name}：已到案例配图容量，其余图片请按需单独上传')
+            return
+        try:
+            with load() as original:
+                if original.width * original.height > 48_000_000:
+                    raise ValueError()
+                if (original_bytes is not None and original.format in {'JPEG', 'PNG'}
+                        and original.getexif().get(274, 1) == 1):
+                    # Preserve original resolution and colors of submitted artwork.
+                    original.load()
+                    data = original_bytes()
+                else:
+                    im = ImageOps.exif_transpose(original)
+                    im.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
+                    if 'A' in im.getbands() or 'transparency' in im.info:
+                        rgba = im.convert('RGBA')
+                        im = Image.new('RGB', rgba.size, 'white')
+                        im.paste(rgba, mask=rgba.getchannel('A'))
+                    output = io.BytesIO()
+                    im.convert('RGB').save(output, 'JPEG', quality=90)
+                    data = output.getvalue()
+        except _UnsafeUpload:
+            raise
+        except (OSError, ValueError, RuntimeError, Image.DecompressionBombError):
+            self.warn(f'{name} · {location}：图片无法用于排版，请核对原件')
+            return
+        if self.image_bytes + len(data) > MAX_EXPANDED_BYTES:
+            self.warn(f'{name}：案例配图超过容量，请将所需图片单独上传')
+            return
+        source_id = _digest_id('case-source-', name, digest, location)
+        if source_id in self.source_ids:
+            raise _UnsafeUpload('案例包出现重复来源标识，请移除重复文件后上传')
+        self.source_ids.add(source_id)
+        source = dict(id=source_id, file_name=name, location=location, text='', image_id=source_id)
+        if hint:
+            source['caption_hint'] = hint[:200]
+        self.sources.append(source)
+        self.images[source_id] = data
+        self.image_bytes += len(self.images[source['id']])
+
     def add_source(self, file_name, file_hash, location, text):
         text = text.replace('\r\n', '\n').replace('\r', '\n').strip()
         if not text:
@@ -82,6 +131,12 @@ class _Batch:
             raise _UnsafeUpload('案例包出现重复来源标识，请移除重复文件后上传')
         self.source_ids.add(source_id)
         self.sources.append(dict(id=source_id, file_name=file_name, location=location, text=text))
+
+
+def readable_source(source):
+    text = source.get('text')
+    return bool(isinstance(text, str) and text.strip() and not (
+        source.get('image_id') and text.startswith('可引用的案例画面。')))
 
 
 class _Archive:
@@ -168,13 +223,64 @@ def _office_archive(raw, batch, name, kind):
             raise _UnsafeUpload(f'“{name}”含宏，不支持作为案例上传')
         if expected not in actual:
             raise _UnsafeUpload(f'“{name}”的内容与扩展名不符，请使用原始格式上传')
-        ignored = [p for p in archive.entries if '/media/' in p or '/embeddings/' in p]
-        if ignored:
-            batch.warn(f'{name}：图片和嵌入附件未转成文字，请另附可读取的案例说明或证明文字')
         return archive
     except Exception:
         archive.close()
         raise
+
+
+def _linked_images(archive, batch, name, digest, part, sections):
+    if batch.images is None:
+        return
+    folder, filename = posixpath.split(part)
+    rels = f'{folder}/_rels/{filename}.rels'
+    if rels not in archive.entries:
+        return
+    targets = {}
+    for rel in _xml(archive.read(rels), name):
+        if rel.get('Type', '').endswith('/image') and rel.get('TargetMode') != 'External':
+            target = rel.get('Target', '')
+            path = (target.lstrip('/') if target.startswith('/')
+                    else posixpath.normpath(posixpath.join(folder, target)))
+            if path in archive.entries:
+                targets[rel.get('Id')] = path
+    for location, node, hint in sections:
+        paths = dict.fromkeys(targets.get(blip.get(R + 'embed')) for blip in node.iter(A + 'blip'))
+        for path in filter(None, paths):
+            batch.add_image(name, digest, f'{location} · {path}',
+                            lambda: Image.open(io.BytesIO(archive.read(path))), hint,
+                            original_bytes=lambda: archive.read(path))
+
+
+def _ocr_office_media(archive, batch, name, digest, prefix=''):
+    """Pull text from embedded images so scan-heavy case books stay usable."""
+    if batch.images_only:
+        return
+    import case_ocr
+    media = sorted(path for path in archive.entries
+                   if '/media/' in path and case_ocr.is_image_name(path))
+    embeddings = [path for path in archive.entries if '/embeddings/' in path]
+    if embeddings:
+        batch.warn(f'{name}：含嵌入 OLE 附件，未转成文字，请另附可读取的案例说明')
+    if not media:
+        return
+    if not case_ocr.available():
+        batch.warn(f'{name}：含 {len(media)} 张图片文字未识别（{case_ocr.unavailable_reason()}）。证明材料册中的关键信息可能丢失。')
+        return
+    budget = case_ocr.media_budget()
+    blank = 0
+    for index, path in enumerate(media):
+        if index >= budget:
+            batch.warn(f'{name}：图片超过 {budget} 张，其余未做 OCR，请拆分后上传')
+            break
+        text = case_ocr.recognize_image(archive.read(path))
+        label = f'{prefix}图片 OCR（{PurePosixPath(path).name}）'
+        if text:
+            batch.add_source(name, digest, label, text)
+        else:
+            blank += 1
+    if blank:
+        batch.warn(f'{name}：{blank} 张图片 OCR 未识别出文字，请人工核对原件')
 
 
 def _word_text(node):
@@ -219,6 +325,10 @@ def _parse_docx(raw, batch, name, digest):
         body = root.find(W + 'body')
         if body is None:
             raise ValueError(f'“{name}”缺少 Word 正文，无法读取')
+        _linked_images(archive, batch, name, digest, 'word/document.xml',
+                       ((f'正文第 {i} 段', para, _word_text(para)) for i, para in enumerate(body.iter(W + 'p'), 1)))
+        if batch.images_only:
+            return
         _word_blocks(body, batch, name, digest)
         for part in sorted(archive.entries):
             if re.fullmatch(r'word/(?:header\d+|footer\d+|footnotes|endnotes|comments)\.xml', part):
@@ -226,6 +336,7 @@ def _parse_docx(raw, batch, name, digest):
                 label = {'footnotes': '脚注', 'endnotes': '尾注', 'comments': '批注'}.get(PurePosixPath(part).stem)
                 label = label or ('页眉' if '/header' in part else '页脚')
                 _word_blocks(root, batch, name, digest, f'{label}（{PurePosixPath(part).name}）')
+        _ocr_office_media(archive, batch, name, digest)
     finally:
         archive.close()
 
@@ -253,13 +364,20 @@ def _parse_pptx(raw, batch, name, digest):
         for number, path in enumerate(slides, 1):
             root = _xml(archive.read(path), name)
             paragraphs = [''.join(t.text or '' for t in para.iter(A + 't')) for para in root.iter(A + 'p')]
-            batch.add_source(name, digest, f'第 {number} 张幻灯片', '\n'.join(paragraphs))
+            location = f'第 {number} 张幻灯片'
+            description = '\n'.join(paragraphs)
+            _linked_images(archive, batch, name, digest, path, [(location, root, description)])
+            if not batch.images_only:
+                batch.add_source(name, digest, location, description)
+        if batch.images_only:
+            return
         # Speaker notes are kept separately so claims remain traceable to their actual location.
         for path in sorted(archive.entries):
             if re.fullmatch(r'ppt/notesSlides/notesSlide\d+\.xml', path):
                 root = _xml(archive.read(path), name)
                 paragraphs = [''.join(t.text or '' for t in para.iter(A + 't')) for para in root.iter(A + 'p')]
                 batch.add_source(name, digest, f'演讲者备注（{PurePosixPath(path).name}）', '\n'.join(paragraphs))
+        _ocr_office_media(archive, batch, name, digest)
     finally:
         archive.close()
 
@@ -268,19 +386,38 @@ def _parse_pdf(raw, batch, name, digest):
     if not raw.lstrip(b'\xef\xbb\xbf\r\n\t ').startswith(b'%PDF-'):
         raise _UnsafeUpload(f'“{name}”不是 PDF 文件，请核对扩展名')
     try:
+        import case_ocr
         reader = PdfReader(io.BytesIO(raw))
         if reader.is_encrypted:
             raise _UnsafeUpload(f'“{name}”为加密 PDF，请解除密码后上传')
         empty_pages = []
+        ocr_count = 0
         for number, page in enumerate(reader.pages, 1):
             value = page.extract_text() or ''
-            batch.add_source(name, digest, f'第 {number} 页', value)
-            if not value.strip():
-                empty_pages.append(number)
+            if batch.images is not None and page.images.keys():
+                batch.add_image(name, digest, f'第 {number} 页 · 案例展示页',
+                                lambda: case_ocr.pdf_page_image(raw, number - 1), value.strip())
+            if batch.images_only:
+                continue
+            if value.strip():
+                batch.add_source(name, digest, f'第 {number} 页', value)
+                continue
+            if case_ocr.available() and ocr_count < case_ocr.MAX_IMAGES:
+                ocr_count += 1
+                ocr_text = case_ocr.recognize_pdf_page(raw, number - 1)
+                if ocr_text:
+                    batch.add_source(name, digest, f'第 {number} 页 OCR', ocr_text)
+                    continue
+            empty_pages.append(number)
         if empty_pages:
             numbers = '、'.join(map(str, empty_pages[:20]))
             extra = f'等 {len(empty_pages)} 页' if len(empty_pages) > 20 else '页'
-            batch.warn(f'{name}：第 {numbers} {extra}无可读取文字；扫描图片请先 OCR 或另附文字版')
+            if not case_ocr.available():
+                batch.warn(f'{name}：第 {numbers} {extra}无可读取文字（{case_ocr.unavailable_reason()}）')
+            elif ocr_count:
+                batch.warn(f'{name}：第 {numbers} {extra} OCR 后仍无文字，请另附可读取文字版')
+            else:
+                batch.warn(f'{name}：第 {numbers} {extra}无可读取文字；扫描图片请另附文字版')
     except _UnsafeUpload:
         raise
     except Exception:
@@ -330,13 +467,26 @@ def _parse_file(raw, batch, name, depth=0):
     if name in batch.logical_names:
         raise _UnsafeUpload('案例包出现重复来源路径，请移除重复文件后上传')
     batch.logical_names.add(name)
-    if extension not in SUPPORTED:
+    import case_ocr
+    if extension not in SUPPORTED and not case_ocr.is_image_name(name):
         batch.warn(f'{name}：不支持此格式，未作为写作资料使用')
         return
     digest = hashlib.sha256(raw).hexdigest()
     before = len(batch.sources)
     try:
-        if extension == '.doc':
+        if case_ocr.is_image_name(name) and extension not in SUPPORTED:
+            batch.add_image(name, digest, '原始图片', lambda: Image.open(io.BytesIO(raw)), original_bytes=lambda: raw)
+            if batch.images_only:
+                return
+            if not case_ocr.available():
+                batch.warn(f'{name}：图片文字未识别（{case_ocr.unavailable_reason()}）')
+            else:
+                text = case_ocr.recognize_image(raw)
+                if text:
+                    batch.add_source(name, digest, '图片 OCR', text)
+                else:
+                    batch.warn(f'{name}：图片 OCR 未识别出文字，请另附可读取说明')
+        elif extension == '.doc':
             if not raw.startswith(OLE_MAGIC):
                 raise _UnsafeUpload(f'“{name}”不是旧版 DOC 文件，请恢复正确扩展名后上传')
             from word_import import normalize_word
@@ -348,7 +498,7 @@ def _parse_file(raw, batch, name, depth=0):
             _parse_pptx(raw, batch, name, digest)
         elif extension == '.pdf':
             _parse_pdf(raw, batch, name, digest)
-        else:
+        elif not batch.images_only:
             _parse_text(raw, batch, name, digest)
     except _UnsafeUpload:
         raise
@@ -357,15 +507,17 @@ def _parse_file(raw, batch, name, depth=0):
         removed = batch.sources[before:]
         del batch.sources[before:]
         for source in removed:
+            if batch.images is not None and source['id'] in batch.images:
+                batch.image_bytes -= len(batch.images.pop(source['id']))
             batch.source_ids.remove(source['id'])
             batch.source_chars -= len(source['text'])
         batch.warn(f'{name}：未采用此文件；{exc}')
         return
-    if len(batch.sources) == before:
+    if not batch.images_only and len(batch.sources) == before:
         batch.warn(f'{name}：未读取到文字，未作为写作资料使用')
 
 
-def parse_uploads(files) -> dict:
+def parse_uploads(files, *, images=None) -> dict:
     """Parse base64 uploads; all file contents remain untrusted evidence, not instructions.
 
     ``files`` in the result lists top-level uploads. Sources from a ZIP retain its
@@ -375,7 +527,7 @@ def parse_uploads(files) -> dict:
         raise ValueError('请先上传相关项目案例文件或 ZIP 案例包')
     if len(files) > MAX_LOGICAL_FILES:
         raise ValueError(f'每批最多上传 {MAX_LOGICAL_FILES} 个文件，请拆分后上传')
-    batch = _Batch()
+    batch = _Batch(images=images)
     decoded = []
     total = 0
     encoded_limit = ((MAX_UPLOAD_BYTES + 2) // 3) * 4
@@ -404,7 +556,7 @@ def parse_uploads(files) -> dict:
         decoded.append((name, raw))
     for name, raw in decoded:
         _parse_file(raw, batch, name)
-    if not batch.sources:
+    if not any(readable_source(source) for source in batch.sources):
         reasons = '；'.join(batch.warnings[:5])
         raise ValueError('案例包未读取到可用文字，请上传文字版 DOCX、PDF、PPTX、TXT 或 MD。' + reasons)
     return dict(files=batch.files, sources=batch.sources, warnings=batch.warnings)

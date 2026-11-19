@@ -26,7 +26,7 @@
   - 在临时 Word 副本的非空段落中添加不可见定位书签，映射至 PDF 页面后显示原页及独立标记层；源模板不变。空白单元格与表格后追加从实际 PDF 边框定位，避免书签撑高空白表格；无边框、边界不完整或无法可靠区分的复杂表格会明确报错。复用导出的正文锚点与空白表格选择规则。渲染在数据库锁外运行，最多 90 秒，最多 600 页 / 15000 段；缓存保留最近两份模板，页面图片按需生成，服务关闭清理。
 - PATCH /api/projects/:id/mappings {mappings:[{id,locator_id,material_ids:[],action:'fill'|'missing'|'skip',confirmed:true|false,note}]} -> 完整 project。未知id拒绝；后端重新校验匹配。
 - PATCH /api/projects/:id/special-categories {industry_ids:[],no_special_materials:false} -> 完整 project。通用核对完成后才能提交；后端将所选行业展开为其全部启用专用栏目。空行业必须显式 no_special_materials:true；未知、重复行业拒绝。保存后生成核对项，保留通用核对；栏目范围变化取消专用确认。兼容旧客户端的 category_ids，但两种参数不可同时提交。
-- POST /api/projects/:id/export {mode:'draft'|'reviewed'} -> export。draft 不要求逐项确认，允许缺项/跳过并在报告/文档标明；所有模式拒绝材料或位置错误，reviewed 要求全部就绪且确认。
+- POST /api/projects/:id/export {mode:'draft'|'reviewed'} -> export。draft 不要求逐项材料确认，允许缺项/跳过并在报告/文档标明；所有模式拒绝材料或位置错误，reviewed 要求全部就绪且确认。框架项目的 draft 与 reviewed 均要求废标红线全部过关（规则无风险且 AI 通过项可自动确认）；未过关时 400。
 - GET /api/exports/:id/download -> docx
 - GET /api/exports/:id/report -> 可下载 JSON 核对报告（含来源、结果、缺项；不要绝对路径）
 
@@ -121,24 +121,30 @@ POST /api/materials/validate 接收材料表单字段、可选 material_id 与 u
 - 要求内容没有变化的保存或确认只更新状态及并发版本，不重建 Word/HTML，不新增产物修订目录；原件校验和过期页面拒绝规则继续有效。
 - 材料校验的 issue_types 为稳定问题类型，issues 仍为中文展示信息；自动预选依据类型判断部分覆盖，不解析中文提示前缀。材料解析及图片检查只在同一校验操作内复用；文件变化、后续操作和最终导出必须重新检查。
 - GET /api/projects/:id/writing 支持 view=full（默认）、status、job。status 仅返回轻量任务状态和版本，不读取 Word、不遍历材料、不返回来源全文；输入或候选版本变化后再读取 full/job。
-- POST /api/projects/:id/writing/generate 可传 chapter_ids 选择目标章节；省略则生成全部可写章节。正文保存维护逐章修订；候选记录其输入依据和目标章修订，采纳时继续检查。单章重生成合并其他候选，不能清空其他章节或覆盖已保存正文。
+- POST /api/projects/:id/writing/generate 可传 chapter_ids 选择目标章节；省略则生成全部可写章节。可传 model（须在本机 BID_OPENAI_MODELS 允许名单内，缺省用默认模型）；任务记录所用模型。正文保存维护逐章修订；候选记录其输入依据和目标章修订，采纳时继续检查。单章重生成合并其他候选，不能清空其他章节或覆盖已保存正文。
+- GET writing（full）的 model 含 {ready, model, models:[{id,label}], reasoning, status, message}；models 供页面下拉选择。
 - 写作每批只发送本批要求所引用的采购来源，案例和已选材料仍按当前项目共享依据处理。共享依据变更仍采用保守失效，未实现按单份材料精确推断全部受影响章节。
 
-- POST /api/projects/:id/writing/outbound（请求体同 generate）-> 本次将发给 AI 的资料清单 {model, chapter_count, group_count, requirement_count, procurement_source_count, case_files, materials_with_text, materials_name_only, business_notes_length}，不启动生成。页面在 generate 前展示并须确认。
+- POST /api/projects/:id/writing/outbound（请求体同 generate，可含 model）-> 本次将发给 AI 的资料清单 {model, chapter_count, group_count, requirement_count, procurement_source_count, case_files, materials_with_text, materials_name_only, business_notes_length}，不启动生成。页面在 generate 前展示并须确认。
 - 发给 AI 的材料：法定代表人身份证明、授权委托书、文书模板、营业执照、纳税社保、审计报告只发名称；公司简介、ISO、资质始终发正文；其余栏目仅当本组章节标题、路径或原文与栏目相关时发正文。
 
 ## 目录校验
 
-- GET /api/frameworks/:id 返回 `outline_check: {checked, issues:[{code, severity, message, chapter_ids, fixes:[{id, text}]}]}`，由 `skills/bid-response-framework/scripts/outline_check.py` 按当前目录计算。code：sequence（同级原文序号乱序/重复/跳号/不从 1 开始，附重新编号建议）、mixed_auto（原文序号与 Word 自动编号混用，附去掉原文序号建议）、mixed_style、level_style、attachment（只提示）、duplicate_title。
-- POST /api/frameworks/:id/confirm 首次确认时，有校验提示须带 `outline_check_acknowledged: true`，否则 400。
+- GET /api/frameworks/:id 返回 `outline_check: {checked, issues:[{code, severity, message, chapter_ids, fixes:[{id, text}]}]}`，由 `skills/bid-response-framework/scripts/outline_check.py` 按当前目录计算。code：sequence（同级原文序号乱序/重复/跳号/不从 1 开始）、mixed_auto（原文序号与 Word 自动编号混用）、mixed_style、level_style、attachment（只提示）、duplicate_title。该字段供接口诊断，目录编写页不再展示。
+- 生成 Word 前自动应用可安全修正的建议：sequence 重新编号、mixed_auto 去掉混用的原文序号；mixed_style、level_style、attachment、duplicate_title 不改写，也不阻断确认。
+- POST /api/frameworks/:id/confirm 不再要求 `outline_check_acknowledged`，有校验提示也不会返回 400。
 
 ## 废标红线扫描
 
-- GET /api/projects/:id/redline-scan -> {items:[{id,label,text,status:'risk'|'attention',findings,hints,auto_checked,linked_chapter_ids,material_category_ids,basis,acknowledged,ack_expired}],acknowledged_ids,pending_count,complete,scope}。
+- GET /api/projects/:id/redline-scan -> {items:[{id,label,text,status:'risk'|'attention',findings,hints,manual_check,auto_checked,linked_chapter_ids,material_category_ids,basis,acknowledged,ack_expired}],acknowledged_ids,pending_count,complete,scope}；有当前 AI 核对时另含 ai_review:{红线id:{verdict:'satisfied'|'risk'|'unclear',reason,evidence,evidence_verified,chapter_ids,suggestion}}、ai_reviewed_at；AI 输入已变化时含 ai_review_stale:true 且不返回旧结论。manual_check=true 表示该条命中保证金、签章、限价、有效期等只能人工核对的要点。
 - 自动检查只覆盖材料栏目缺漏/待补与关联章节是否有正文；保证金、签章、限价、有效期、工期、★条款等给出 hints 供人工核对。“重大税收违法”等违法失信表述不视为纳税凭证要求。
-- 每条红线的 basis 由该红线原文、关联章节正文、相关材料栏目计算；只有 basis 变化的红线确认失效。
-- POST /api/projects/:id/redline-scan {acknowledged:{红线id: basis}} 保存确认；basis 与当前不符的条目整体拒绝（400）。旧版 {input_token, acknowledged_ids} 仍接受，但 input_token 须与当前一致。
-- 框架项目导出（export / export-jobs）时服务端校验红线全部确认且依据未变，否则 400。
+- 每条红线的 basis 由该红线原文、关联章节正文、相关材料栏目及所选材料的修订号/附件 id 计算；只有 basis 变化的红线确认失效，替换或调整材料附件也会使相关确认和 AI 结果失效。
+- 采购要求或目录修订后重新确认时，旧工作稿中 basis 未变的红线确认会带入新工作稿；basis 变化的条目保持待确认。
+- POST /api/projects/:id/redline-scan {acknowledged:{红线id: basis}} 保存通过结果；basis 与当前不符的条目整体拒绝（400）。旧版 {input_token, acknowledged_ids} 仍接受，但 input_token 须与当前一致。
+- 旧版已保存的 redline_review {input_token, acknowledged_ids} 在当前输入或旧版指纹仍一致时，按当前 basis 迁移为 acknowledged，避免升级后要求重新逐条确认；对不上则保持待确认。
+- POST /api/projects/:id/redline-scan/ai-review 触发模型逐条核对，返回与 GET 相同的结构。verdict 在页面显示为“通过 / 有风险 / 需确认”；satisfied 必须带正文引用，无引用降级为 unclear；evidence 优先在 chapter_ids 指向的已保存章节中做去空白/标点后的逐字核对，未引用章节时核对全部正文，对不上时 evidence_verified=false。模型重复返回同一红线时取 risk > unclear > satisfied；调用期间正文、材料、目录或备注变化则丢弃结果并返回“已变化”。模型调用不持有 store 锁；只有快照与写库步骤加锁。
+- 页面提供“采纳 AI 通过项”（仅 AI 判定为 satisfied、evidence_verified=true、本地规则无风险且 manual_check=false）批量勾选。人工必核项和本地未覆盖项须逐条核对。
+- 框架项目导出（export / export-jobs）时生成 redline 摘要（条目、basis、确认状态、确认时间、输入指纹、complete、pending_count）。draft 与 reviewed 均要求红线全部过关且依据未变，否则 400；仅规则已覆盖且无风险、无需人工核对、AI satisfied 且引用核实的条目可在当前依据下自动通过。GET 无确认写入。确认请求携带 review_revision 进行并发检查，旧版请求只能追加。
 
 ## 远程入口（花生壳 / 局域网 / 节点）
 

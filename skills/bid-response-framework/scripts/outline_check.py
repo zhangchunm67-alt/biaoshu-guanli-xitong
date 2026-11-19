@@ -40,7 +40,8 @@ PATTERNS = (
     ('cn', re.compile(r'^([' + CN + r']{1,4})\s*[、.．]\s*')),
     ('circled', re.compile(r'^([' + CIRCLED + r'])\s*')),
     # “2023年…”“3.5万元”不是序号：数字后须是分隔符再接非数字。
-    ('decimal', re.compile(r'^(\d{1,3}(?:[.．]\d{1,3})*)(?:[.．、]\s*|\s+)(?![\d年月日%万元])')),
+    ('decimal', re.compile(r'^(\d{1,3}(?:[.．]\d{1,3})*)(?:[.．、]\s*|\s+)'
+                           r'(?![\d\s.．%％万元亿]|年(?!度|报)|月(?!度|报)|日(?!期|常|报))')),
 )
 
 
@@ -94,6 +95,31 @@ def parse_number(title):
         return {'style': style, 'value': value, 'path': path, 'prefix': text[:match.end()],
                 'rest': rest, 'match': match}
     return None
+
+
+def heading_title(text):
+    """Remove editorial numbering while retaining formal attachment identifiers."""
+    title = (text or '').strip()
+    while (number := parse_number(title)) and number['rest'] and number['style'] != 'attachment':
+        title = number['rest']
+    return title
+
+
+def decimal_headings(rows):
+    """Yield the displayed number and title for headings in outline order."""
+    parents, counters = [], []
+    for row in rows:
+        level = int(row.get('level') or 1)
+        while parents and parents[-1] >= level:
+            parents.pop()
+        depth = len(parents)
+        if depth == len(counters):
+            counters.append(0)
+        del counters[depth + 1:]
+        counters[depth] += 1
+        parents.append(level)
+        number = '.'.join(map(str, counters))
+        yield number + ('.' if depth == 0 else ''), heading_title(row['text'])
 
 
 def format_number(info, number):

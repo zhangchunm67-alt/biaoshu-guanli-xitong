@@ -114,7 +114,8 @@ def generate_framework(source, output, plan=None, *, scope='whole', parsed=None,
         if data.get("source_sha256") != hashlib.sha256(src.read_bytes()).hexdigest():
             raise ValueError("编排计划与招标文件版本不匹配，请从当前招标件重新核对。")
         from required_sections import ensure_business_license
-        data = ensure_business_license(data)
+        if not data.get('preserve_outline'):
+            data = ensure_business_license(data)
         if scope != "whole":
             from scope_framework import apply_scope
             data = apply_scope(data, scope)
@@ -156,7 +157,7 @@ def main():
             print(f"编制提示（源位置 {message.get('source_index', '未标')}）{message.get('text', '')}")
         else:
             print("编制提示", message)
-    # 目录校验：原文序号乱序、重复、跳号、与自动编号混用等，交付前须人工核对。
+    # 目录校验：可安全修正的序号问题已在生成前处理；这里输出剩余的结构提示供参考。
     from outline_check import check_outline, format_report, read_docx_outline
     entries = read_docx_outline(out)
     print(format_report(check_outline(entries), entries))
