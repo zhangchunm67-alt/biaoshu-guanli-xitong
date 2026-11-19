@@ -33,7 +33,7 @@ import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageOps
 
-from access_guard import AuditLog, LoginGuard, LoginLocked, Sessions
+from access_guard import DEVICE_TTL, AuditLog, DeviceTrust, LoginGuard, LoginLocked, Sessions
 from contributions import Contributions
 from credit_service import CreditService, MANAGED_IDS
 from errors import ConflictError
@@ -57,9 +57,11 @@ REQUEST_READ_TIMEOUT = 30
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 IMAGE_FORMATS = {'PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF'}
 ACCESS_COOKIE = 'bid_session'
+DEVICE_COOKIE = 'bid_device'
 MIN_TOKEN_LENGTH = 12
 PLACEHOLDER_TOKENS = {'请改成足够长的口令', 'changeme', 'password'}
 LOGIN_PATH = '/login'
+BOOTSTRAP_EXPORTS = 20
 
 
 class AuthRequired(PermissionError):
@@ -742,9 +744,12 @@ class Store(SpecialLibrary):
         historical = framework_service.archived_project_ids(self)
         projects = [self.project_summary(v) for v in reversed(self.all('project')) if v['id'] not in historical]
         exports = list(reversed(self.all('export')))
+        export_count = len(exports)
+        # 每个项目的导出记录随项目详情返回；首页只带最近的若干条，避免数据随使用时间无限增长。
+        exports = exports[:BOOTSTRAP_EXPORTS]
         source = self.get('meta', 'source_status') or {'state': 'not_imported', 'message': '此数据目录未导入示例材料'}
         source.pop('id', None)
-        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': self.all('industry'), 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(self.is_special(m) and not m.get('archived') for m in self.all('material')), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': len(exports), 'source_status': source, **self.contributions.stats()}}
+        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': self.all('industry'), 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(self.is_special(m) and not m.get('archived') for m in self.all('material')), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': export_count, 'source_status': source, **self.contributions.stats()}}
 
     @staticmethod
     def project_summary(project):
@@ -1761,23 +1766,46 @@ class Handler(BaseHTTPRequestHandler):
         # compare_digest 只接受 ASCII 字符串；统一转字节，中文口令才能正常比较。
         return secrets.compare_digest(candidate.encode('utf-8'), expected.encode('utf-8'))
 
-    def access_authenticated(self):
-        token = getattr(self.server, 'access_token', None)
-        if not token:
-            return True
+    def request_cookie(self, name):
         cookie = SimpleCookie()
         try:
             cookie.load(self.headers.get('Cookie', ''))
         except Exception:
-            cookie = SimpleCookie()
-        morsel = cookie.get(ACCESS_COOKIE)
-        if morsel and self.server.sessions.valid(unquote(morsel.value)):
+            return None
+        morsel = cookie.get(name)
+        return unquote(morsel.value) if morsel else None
+
+    def trusted_device(self):
+        """已用正确口令登录过的浏览器编号；没有或无效时返回 None。"""
+        trust = getattr(self.server, 'device_trust', None)
+        if not trust:
+            return None
+        return trust.device(self.request_cookie(DEVICE_COOKIE), getattr(self.server, 'access_token', None))
+
+    @staticmethod
+    def bearer_candidates(value):
+        """HTTP 头按 Latin-1 解码；中文口令可直接以 UTF-8 发送，或先做百分号编码。"""
+        values = [value]
+        try:
+            values.append(value.encode('latin-1').decode('utf-8'))
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        if '%' in value:
+            values.append(unquote(value, errors='strict') if value.isascii() else value)
+        return list(dict.fromkeys(values))
+
+    def access_authenticated(self):
+        token = getattr(self.server, 'access_token', None)
+        if not token:
+            return True
+        session = self.request_cookie(ACCESS_COOKIE)
+        if session and self.server.sessions.valid(session):
             return True
         auth = self.headers.get('Authorization', '')
         if auth.startswith('Bearer '):
             guard, source = self.server.login_guard, self.client_source()
             guard.check(source)
-            if self.token_matches(auth[7:]):
+            if any(self.token_matches(value) for value in self.bearer_candidates(auth[7:])):
                 guard.success(source)
                 return True
             guard.failure(source)
@@ -1821,9 +1849,12 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
         forwarded_proto = (self.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
         ttl = int(self.server.sessions.ttl)
         attrs = f'{ACCESS_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}'
+        device = (f'{DEVICE_COOKIE}={self.server.device_trust.issue(self.server.access_token)}; '
+                  f'Path=/; HttpOnly; SameSite=Lax; Max-Age={DEVICE_TTL}')
         if forwarded_proto == 'https':
             attrs += '; Secure'
-        return [('Set-Cookie', attrs)]
+            device += '; Secure'
+        return [('Set-Cookie', attrs), ('Set-Cookie', device)]
 
     def handle_login(self):
         if self.command == 'GET' or self.command == 'HEAD':
@@ -1853,21 +1884,26 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             token = payload.get('token', '') if isinstance(payload, dict) else ''
         else:
             raise ValueError('请使用登录表单提交口令')
-        guard, source = self.server.login_guard, self.client_source()
+        guard = self.server.login_guard
+        device = self.trusted_device()
+        # 花生壳穿透后所有同事的来源地址相同；登录过的浏览器按设备单独计数，
+        # 不会因陌生来源反复输错而被一起锁住。
+        source, trusted = (f'device:{device}', True) if device else (self.client_source(), False)
+        trusted_hint = '' if trusted else '（曾在本浏览器登录成功的同事不受此限制）'
         try:
-            guard.check(source)
+            guard.check(source, trusted=trusted)
         except LoginLocked as exc:
-            self.audit('login', result='locked')
-            return self.login_page(str(exc), 429)
+            self.audit('login', result='locked', trusted_device=trusted)
+            return self.login_page(str(exc) + trusted_hint, 429)
         if not self.token_matches(token):
-            remaining = guard.failure(source)
-            self.audit('login', result='failed')
+            remaining = guard.failure(source, trusted=trusted)
+            self.audit('login', result='failed', trusted_device=trusted)
             if remaining:
                 return self.login_page(f'口令不正确，还可尝试 {remaining} 次；如忘记口令，请联系本机管理员。', 401)
             try:
-                guard.check(source)
+                guard.check(source, trusted=trusted)
             except LoginLocked as exc:
-                return self.login_page(str(exc), 429)
+                return self.login_page(str(exc) + trusted_hint, 429)
             return self.login_page('口令不正确，请联系本机管理员。', 401)
         guard.success(source)
         self.audit('login', result='ok')
@@ -2192,6 +2228,8 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             self.validate_origin(False)
             self.require_access()
         except AuthRequired as exc:
+            # 未登录请求的正文没有读取；关闭连接，避免正文被当成下一个请求解析。
+            self.close_connection = True
             if path.startswith('/api/') or self.behind_proxy():
                 return self.request_error(exc)
             return self.login_page(str(exc), 401)
@@ -2377,6 +2415,7 @@ def _attach_server(httpd, *, store, bind_host, public, token, access_mode=None, 
     httpd.login_guard = LoginGuard()
     httpd.sessions = Sessions()
     httpd.audit_log = AuditLog(store.root)
+    httpd.device_trust = DeviceTrust(store.root) if token else None
     httpd.access_token = token
     httpd.access_mode = access_mode
     httpd.intranet_port = intranet_port

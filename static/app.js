@@ -40,7 +40,7 @@ const creditUi = {requesting:false,polling:false,timer:null,error:''};
 const isCreditCategory = id => CREDIT_CATEGORY_IDS.has(id);
 const navs = [{id:'dashboard',label:'工作台',icon:'grid'},{id:'materials',label:'材料库',icon:'folder'},{id:'projects',label:'标书项目',icon:'file'}];
 const specialState={industry:'',category:'',review:'',query:'',page:1,result:{items:[],total:0,counts:{}},cache:new Map()};
-const projectUi={id:null,step:'common',pickers:{},navigation:null};
+const projectUi={id:null,step:'common',pickers:{},pickerRequests:{},pickerTyped:{},navigation:null};
 const locationUi={mappingId:null,projectId:null,result:null,page:1,zoom:1,showMarkers:true,requestId:0};
 // Colleagues submit materials and cases; only the local entry reviews them into the library.
 const contributionUi={status:'pending',result:null,cases:null,caseArchived:false};
@@ -63,7 +63,7 @@ function textReviewed(){return !!state.project?.special_selection_confirmed&&(st
 function projectReviewed(){return commonReviewed()&&textReviewed();}
 function cacheProjectMaterials(){for(const m of state.project?.selected_special_materials||[])specialState.cache.set(m.id,m);}
 function resetProjectUi(){
-  projectUi.id=state.project.id;projectUi.pickers={};projectUi.navigation=null;projectUi.selected=new Set();cacheProjectMaterials();
+  projectUi.id=state.project.id;projectUi.pickers={};projectUi.pickerRequests={};projectUi.pickerTyped={};projectUi.navigation=null;projectUi.selected=new Set();cacheProjectMaterials();
   projectUi.step=!textReviewed()?'special':!commonReviewed()?'common':projectReviewed()?'export':'special';
 }
 function materialCompletionIssues(target='export'){
@@ -123,10 +123,20 @@ async function guideMaterialCompletion(target='export'){
   return true;
 }
 async function loadProjectPicker(category, page, query){
+  // Searches and refreshes can overlap; only the latest request for a category may update it,
+  // and a refresh started while a search is pending uses that newer query.
   const previous=projectUi.pickers[category]||{page:1,query:''};
-  const q=new URLSearchParams({category_id:category,page:page??previous.page,page_size:10,q:query??previous.query});
+  const pending=projectUi.pickerRequests[category]||{ticket:0,query:previous.query};
+  const wanted=query??pending.query;
+  const ticket=pending.ticket+1;
+  const pickers=projectUi.pickers;
+  projectUi.pickerRequests[category]={ticket,query:wanted};
+  const q=new URLSearchParams({category_id:category,page:page??previous.page,page_size:10,q:wanted});
   const result=await api('/api/materials?'+q);
-  projectUi.pickers[category]={...result,query:query??previous.query};
+  if(projectUi.pickers!==pickers||projectUi.pickerRequests[category]?.ticket!==ticket)return false;
+  projectUi.pickers[category]={...result,query:wanted};
+  if(projectUi.pickerTyped[category]===wanted)delete projectUi.pickerTyped[category];
+  return true;
 }
 async function loadProjectPickers(){
   if(!state.project)return;
@@ -400,7 +410,7 @@ function renderMaterialPicker(m){
   const special=isSpecial(m.category_id),picker=projectUi.pickers[m.category_id],selected=m.material_ids||[];
   const candidates=special?[...(picker?.items||[])]:state.data.materials.filter(x=>(x.category_id===m.category_id||(m.category_id==='authorization'&&x.category_id==='legal_identity'))&&(m.category_id!=='authorization'||['page','side_by_side'].includes(x.mode)));
   if(special)for(const id of selected){if(!candidates.some(x=>x.id===id)){const x=material(id);if(x)candidates.unshift(x);}}
-  return `${special?`<div class="project-picker-search"><input type="search" class="input" data-project-search="${esc(m.category_id)}" aria-label="搜索${esc(m.category_name)}" placeholder="搜索材料、客户、人员或项目" value="${esc(picker?.query||'')}"></div>`:''}<div class="material-picker" role="group" aria-labelledby="materials-label-${esc(m.id)}">${candidates.length?candidates.map(x=>`<div class="project-material-option"><label class="material-option"><input type="checkbox" data-map-material="${esc(m.id)}" value="${esc(x.id)}" ${selected.includes(x.id)?'checked':''} ${m.action==='skip'?'disabled':''}><span>${esc(x.name)}<small>${esc(x.subject)}${x.years?.length?` · ${esc(x.years.join('、'))}`:''}${special?` · ${esc(x.client_name||x.case_name||'')}`:''}</small></span></label>${special?`<button class="text-button small" data-action="open-material" data-id="${esc(x.id)}">预览</button>`:''}</div>`).join(''):`<div class="picker-empty">${special?(picker?.query?'没有找到符合搜索条件的材料':'此分类暂无材料，可新增材料或明确记录缺项'):'此栏目还没有材料'}</div>`}</div>${special?`<div class="project-picker-pagination">${button('上一页','project-picker-prev',{small:true,category:m.category_id,disabled:!picker||picker.page<=1})}<span class="muted small">${picker?`第 ${picker.page} / ${Math.max(1,Math.ceil(picker.total/picker.page_size))} 页 · 共 ${picker.total} 份`:'加载材料中…'}</span>${button('下一页','project-picker-next',{small:true,category:m.category_id,disabled:!picker||picker.page*picker.page_size>=picker.total})}</div>`:''}`;
+  return `${special?`<div class="project-picker-search"><input type="search" class="input" data-project-search="${esc(m.category_id)}" aria-label="搜索${esc(m.category_name)}" placeholder="搜索材料、客户、人员或项目" value="${esc(projectUi.pickerTyped[m.category_id]??picker?.query??'')}"></div>`:''}<div class="material-picker" role="group" aria-labelledby="materials-label-${esc(m.id)}">${candidates.length?candidates.map(x=>`<div class="project-material-option"><label class="material-option"><input type="checkbox" data-map-material="${esc(m.id)}" value="${esc(x.id)}" ${selected.includes(x.id)?'checked':''} ${m.action==='skip'?'disabled':''}><span>${esc(x.name)}<small>${esc(x.subject)}${x.years?.length?` · ${esc(x.years.join('、'))}`:''}${special?` · ${esc(x.client_name||x.case_name||'')}`:''}</small></span></label>${special?`<button class="text-button small" data-action="open-material" data-id="${esc(x.id)}">预览</button>`:''}</div>`).join(''):`<div class="picker-empty">${special?(picker?.query?'没有找到符合搜索条件的材料':'此分类暂无材料，可新增材料或明确记录缺项'):'此栏目还没有材料'}</div>`}</div>${special?`<div class="project-picker-pagination">${button('上一页','project-picker-prev',{small:true,category:m.category_id,disabled:!picker||picker.page<=1})}<span class="muted small">${picker?`第 ${picker.page} / ${Math.max(1,Math.ceil(picker.total/picker.page_size))} 页 · 共 ${picker.total} 份`:'加载材料中…'}</span>${button('下一页','project-picker-next',{small:true,category:m.category_id,disabled:!picker||picker.page*picker.page_size>=picker.total})}</div>`:''}`;
 }
 function renderLocationRecognition(m) {
   const match=m.location_match||{}, requirement=m.requirement||{};
@@ -1098,7 +1108,7 @@ document.addEventListener('click',async e=>{
     else if(action==='locate-material-issue')focusMaterialCompletionIssue(Number(id));
     else if(action==='project-picker-prev'||action==='project-picker-next'){
       const category=target.dataset.category,picker=projectUi.pickers[category];
-      await loadProjectPicker(category,picker.page+(action==='project-picker-next'?1:-1));render();
+      if(await loadProjectPicker(category,picker.page+(action==='project-picker-next'?1:-1)))render();
     }
     else if(action==='project-materials')await navigate('materials',target.dataset.category);
     else if(action==='save-project'){target.disabled=true;await saveProject();}
@@ -1163,8 +1173,10 @@ document.addEventListener('input',e=>{
   const el=e.target;
   if(el.dataset.projectSearch){
     clearTimeout(searchTimer);const category=el.dataset.projectSearch,query=el.value,position=el.selectionStart,projectId=state.project.id;
+    // Keep the typed text across re-renders (e.g. ticking a material) until its results arrive.
+    projectUi.pickerTyped[category]=query;
     searchTimer=setTimeout(async()=>{try{
-      await loadProjectPicker(category,1,query);if(state.project?.id!==projectId)return;
+      if(!(await loadProjectPicker(category,1,query))||state.project?.id!==projectId)return;
       render();const next=$$('input[data-project-search]').find(x=>x.dataset.projectSearch===category);next?.focus();try{next?.setSelectionRange(position,position);}catch{}
     }catch(err){toast(err.message,true);}},250);
   }

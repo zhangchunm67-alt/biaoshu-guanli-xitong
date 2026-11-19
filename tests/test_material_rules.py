@@ -120,6 +120,26 @@ class MaterialRuleTests(unittest.TestCase):
         doc.save(self.path)
         return engine.scan_document(self.path, self.categories, materials, ['text_template'])
 
+    def test_common_period_spellings_are_read_as_months(self):
+        six = {2025 * 12 + m for m in range(6)}
+        for text in ['2025年上半年', '2025年度1-6月', '2025.1-2025.6', '2025/01-2025/06',
+                     '2025-01至2025-06', '二〇二五年一月至六月', '２０２５年１月至６月']:
+            self.assertEqual(six, months(text), text)
+        self.assertEqual({2025 * 12 + m for m in range(3)}, months('2025年第一季度'))
+        self.assertEqual({2025 * 12 + m for m in range(9, 12)}, months('2025年度第4季度'))
+        self.assertEqual({2025 * 12 + m for m in range(6, 12)}, months('2025年下半年'))
+        self.assertEqual({2025 * 12, 2025 * 12 + 2, 2025 * 12 + 4}, months('2025年1月、3月、5月'))
+        self.assertFalse(months('2025-2026年纳税证明'))
+
+    def test_unreadable_or_relative_periods_warn_instead_of_passing(self):
+        from material_rules import period_issue, tax_errors
+        wrong = {'name': '2024年12月纳税证明'}
+        for title in ['提供2025年上半年的纳税证明', '提供2025.1-2025.6纳税证明', '提供2025年第二季度纳税证明']:
+            heading = {'title': title, 'preview': ''}
+            self.assertIn('缴费所属月份与目标要求不符', ''.join(tax_errors(wrong, heading)), title)
+        self.assertIn('相对月份', period_issue({'title': '提供上一季度纳税证明', 'preview': ''}))
+        self.assertIn('无法完整识别', period_issue({'title': '提供本年度第五季度纳税证明', 'preview': ''}))
+
     def test_incomplete_ranges_are_not_read_as_single_months(self):
         self.assertEqual(3, len(months('2025年12-2026年2月')))
         self.assertFalse(months('2026年9月至8月'))

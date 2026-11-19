@@ -4,9 +4,7 @@ const fs=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
 const {spawn,spawnSync}=require('node:child_process');
-let chromium;
-try { ({chromium}=require('playwright')); }
-catch { ({chromium}=require('/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright')); }
+const {chromium}=require('playwright');
 const app=path.resolve(__dirname,'..'),root=fs.mkdtempSync(path.join(os.tmpdir(),'bid-books-ui-'));
 const python=process.env.BID_TEST_PYTHON||path.join(app,'.venv/bin/python');
 const setup=spawnSync(python,['-B','-c',`
@@ -48,6 +46,9 @@ let server,browser;
  assert.equal(await page.locator('#wf-outline-title').inputValue(),'技术标');
  let frame=page.frameLocator('iframe');
  const titles=async selector=>(await frame.locator(selector).allTextContents()).map(title=>title.replace(/^\d+(?:\.\d+)*\.?\s+/,'').trim());
+ // The preview iframe reloads after a book switch; read it only once both books are rendered.
+ await frame.locator('[data-book-role="commercial"] li',{hasText:'公司介绍'}).first().waitFor();
+ await frame.locator('[data-book-role="technical"] li',{hasText:'项目方案'}).first().waitFor();
  const business=await titles('[data-book-role="commercial"] li');
  assert.equal(business[business.indexOf('公司介绍')-1],'营业执照');
  assert.ok((await titles('[data-book-role="technical"] li')).includes('项目方案'));
@@ -57,6 +58,7 @@ let server,browser;
  assert.equal(await page.getByRole('region',{name:'分册目录'}).count(),0);
  frame=page.frameLocator('iframe');await frame.locator('ul.outline').waitFor({state:'attached'});
  assert.equal(await frame.locator('[data-book-role]').count(),0);
+ await frame.locator('ul.outline li',{hasText:'公司介绍'}).first().waitFor();
  const unified=await titles('ul.outline li');
  assert.equal(unified[unified.indexOf('公司介绍')-1],'营业执照');
  assert.deepEqual(errors,[]);

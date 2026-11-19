@@ -4,7 +4,7 @@
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {spawn,spawnSync}=require('node:child_process');
-let pw;try{pw=require('playwright');}catch{pw=require('/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');}
+const pw=require('playwright');
 const app=path.resolve(__dirname,'..'),python=process.env.BID_TEST_PYTHON||path.join(app,'.venv/bin/python');
 const root=process.env.BID_CHAIN_QA_DIR||fs.mkdtempSync(path.join(os.tmpdir(),'bid-chain-'));
 fs.mkdirSync(root,{recursive:true});

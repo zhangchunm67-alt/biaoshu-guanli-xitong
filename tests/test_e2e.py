@@ -16,6 +16,10 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 APP = Path(__file__).resolve().parents[1]
+# 首个用例使用交付包中的真实材料台账和图片（不随代码仓库分发），缺少时跳过。
+SOURCE_LEDGER = APP.parent / "标书自动填充/示例/材料台账.xlsx"
+SOURCE_MATERIALS = APP.parent / "材料"
+HAS_SOURCE = SOURCE_LEDGER.is_file() and SOURCE_MATERIALS.is_dir()
 
 
 class FullWorkflow(unittest.TestCase):
@@ -77,6 +81,7 @@ class FullWorkflow(unittest.TestCase):
             blob = res.read()
             return blob if raw else json.loads(blob)
 
+    @unittest.skipUnless(HAS_SOURCE, "本机未提供交付包材料台账与材料目录")
     def test_seed_confirm_export_repeat_and_persist(self):
         state = self.request("GET", "/api/bootstrap")
         self.assertEqual(10, len([c for c in state["categories"] if c["layer"]=="common"]))

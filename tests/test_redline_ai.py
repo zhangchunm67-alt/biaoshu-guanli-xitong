@@ -146,6 +146,37 @@ class RedlineAiTests(unittest.TestCase):
         project = self.store.require('project', self.project['id'])
         self.assertNotIn('redline_ai', project)
 
+    def test_concurrent_review_of_one_project_calls_the_model_once(self):
+        import threading
+        self.write_chapters()
+        ids = [item['id'] for item in self.items]
+        entered, release = threading.Event(), threading.Event()
+
+        def slow(*_args, **_kwargs):
+            entered.set()
+            release.wait(10)
+            return {'items': [{'id': ident, 'verdict': 'unclear', 'reason': '待核对。', 'evidence': '',
+                               'chapter_ids': [], 'suggestion': ''} for ident in ids]}
+
+        errors = []
+        with patch('writing_model.complete_json', side_effect=slow) as call:
+            worker = threading.Thread(target=lambda: redline_ai.review(self.store, self.project['id']))
+            worker.start()
+            self.assertTrue(entered.wait(10))
+            try:
+                redline_ai.review(self.store, self.project['id'])
+            except ValueError as error:
+                errors.append(str(error))
+            release.set()
+            worker.join(10)
+            self.assertEqual(1, call.call_count)
+        self.assertTrue(errors and '正在进行' in errors[0], errors)
+        # 完成后可以再次核对。
+        with patch('writing_model.complete_json', side_effect=slow) as call:
+            release.set()
+            redline_ai.review(self.store, self.project['id'])
+            self.assertEqual(1, call.call_count)
+
     def test_review_requires_adopted_chapter_text(self):
         with patch('writing_model.complete_json') as call:
             with self.assertRaisesRegex(ValueError, '生成并采纳投标正文'):

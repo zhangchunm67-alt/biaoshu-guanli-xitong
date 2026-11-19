@@ -3,10 +3,16 @@
 - LoginGuard：按来源和全局统计口令错误，错误过多时逐步延长等待并临时锁定。
 - Sessions：登录成功后签发随机会话号（Cookie 不再携带口令本身），带有效期。
 - AuditLog：记录登录、材料变更、审核、导出等操作的时间与来源入口，不记录正文。
+- DeviceTrust：登录成功后给浏览器签发长期“已信任设备”标记。花生壳穿透后所有来源
+  都是 127.0.0.1，按来源锁定会让一个人输错口令锁住所有同事；带有效标记的浏览器
+  使用自己的错误计数，不受陌生来源触发的锁定影响。
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import secrets
 import threading
 import time
@@ -25,6 +31,7 @@ GLOBAL_LOCK = 10 * 60
 SESSION_TTL = 12 * 60 * 60
 MAX_SESSIONS = 1000
 AUDIT_ROTATE_BYTES = 5 * 1024 * 1024
+DEVICE_TTL = 180 * 24 * 60 * 60
 
 
 class LoginLocked(PermissionError):
@@ -42,18 +49,20 @@ class LoginGuard:
         self.recent = []   # 全局错误时间
         self.global_until = 0.0
 
-    def check(self, source):
-        """登录前调用；锁定中则抛出 LoginLocked。"""
+    def check(self, source, trusted=False):
+        """登录前调用；锁定中则抛出 LoginLocked。已信任设备不受全局锁定影响。"""
         now = self.clock()
         with self.lock:
-            if self.global_until > now:
+            if not trusted and self.global_until > now:
                 raise LoginLocked(self.global_until - now)
             entry = self.sources.get(source)
             if entry and entry['until'] > now:
                 raise LoginLocked(entry['until'] - now)
 
-    def failure(self, source):
-        """记录一次错误，返回本轮锁定前剩余尝试次数（0 表示已锁定）。"""
+    def failure(self, source, trusted=False):
+        """记录一次错误，返回本轮锁定前剩余尝试次数（0 表示已锁定）。
+
+        已信任设备只累计自己的次数，不计入全局错误窗口。"""
         now = self.clock()
         with self.lock:
             entry = self.sources.setdefault(source, {'failures': 0, 'until': 0.0})
@@ -61,8 +70,9 @@ class LoginGuard:
             over = entry['failures'] - FREE_ATTEMPTS
             if over >= 0:
                 entry['until'] = now + min(MAX_LOCK, BASE_LOCK * (2 ** over))
-            self.recent = [t for t in self.recent if now - t < GLOBAL_WINDOW] + [now]
-            if len(self.recent) >= GLOBAL_LIMIT:
+            if not trusted:
+                self.recent = [t for t in self.recent if now - t < GLOBAL_WINDOW] + [now]
+            if not trusted and len(self.recent) >= GLOBAL_LIMIT:
                 self.global_until = now + GLOBAL_LOCK
                 self.recent = []
             if len(self.sources) > 10000:
@@ -106,6 +116,48 @@ class Sessions:
     def clear(self):
         with self.lock:
             self.items.clear()
+
+
+class DeviceTrust:
+    """签发并校验“已信任设备”标记：随机编号 + 本机密钥 HMAC，服务重启后仍有效。
+
+    标记不含口令；只有输入过正确口令的浏览器才能拿到。删除数据目录下的
+    .device_secret 即可让全部标记失效（例如更换口令后）。"""
+
+    def __init__(self, directory, ttl=DEVICE_TTL):
+        self.ttl = ttl
+        path = Path(directory) / '.device_secret'
+        try:
+            secret = path.read_bytes()
+        except FileNotFoundError:
+            secret = b''
+        if len(secret) < 32:
+            secret = secrets.token_bytes(32)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(secret)
+        self.secret = secret
+
+    def _sign(self, device_id, token_digest):
+        return hmac.new(self.secret, f'{device_id}.{token_digest}'.encode(), hashlib.sha256).hexdigest()[:32]
+
+    @staticmethod
+    def _digest(token):
+        # 更换访问口令后，旧口令下签发的设备标记自动失效。
+        return hashlib.sha256((token or '').encode('utf-8')).hexdigest()[:16]
+
+    def issue(self, token):
+        device_id = secrets.token_urlsafe(16)
+        return f'{device_id}.{self._sign(device_id, self._digest(token))}'
+
+    def device(self, value, token):
+        """有效时返回设备编号，否则返回 None。"""
+        if not isinstance(value, str) or value.count('.') != 1:
+            return None
+        device_id, signature = value.split('.')
+        if not device_id or not hmac.compare_digest(signature, self._sign(device_id, self._digest(token))):
+            return None
+        return device_id
 
 
 class AuditLog:

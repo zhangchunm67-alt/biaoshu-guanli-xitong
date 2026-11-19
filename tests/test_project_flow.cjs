@@ -118,8 +118,12 @@ finally:s.server_close();s.store.close()
     const insurance=page.locator('.mapping-card').filter({has:page.getByRole('heading',{name:'保险项目业绩与案例',exact:true})});
     await insurance.locator('input[data-project-search]').fill('保险核对材料11');
     await insurance.locator('input[data-map-material][value="'+materials.ids[11]+'"]').check();
-    await insurance.locator('input[data-project-search]').fill('');
+    // Ticking re-renders the card after an async fetch; clear the search only once that render
+    // has replaced the input, or the clear lands on a detached element and is lost.
     await insurance.locator('.mapping-preview img').last().waitFor();
+    await insurance.locator('input[data-map-material][value="'+materials.ids[11]+'"]:enabled').waitFor();
+    await insurance.locator('input[data-project-search]').fill('');
+    await insurance.getByText('共 12 份').waitFor();
     assert.equal(await insurance.locator('.mapping-preview img').count(),2);
     // Conditional copy must keep actionable warnings and keyboard focus intact.
     await insurance.locator('.mapping-preview-page').first().click();

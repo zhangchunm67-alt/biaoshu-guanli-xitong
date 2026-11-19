@@ -121,7 +121,7 @@ class Source:
 
 def normal_title(s):
     s = s.strip(' ：:。')
-    return re.split(r'[【（(](?:模板|备注|格式|\*|非必选|如适用|若有|供应商承诺)', s, 1)[0].strip(' ：:')
+    return re.split(r'[【（(](?:模板|备注|格式|\*|非必选|如适用|若有|供应商承诺)', s, maxsplit=1)[0].strip(' ：:')
 
 
 def sample_deviation_cells(rows):
@@ -423,7 +423,7 @@ def list_items(plan, start, stop):
         if m:
             # A year range embedded in a document name is part of its identity.
             full = re.sub(r'[（(](20\d{2}\s*[-–—至]\s*20\d{2}年?)[）)]', r'〈\1〉', m[1])
-            name = re.split(r'[（【(，；]', full, 1)[0].replace('〈','（').replace('〉','）')
+            name = re.split(r'[（【(，；]', full, maxsplit=1)[0].replace('〈','（').replace('〉','）')
             items.append((n.index, normal_title(name)))
     return items
 

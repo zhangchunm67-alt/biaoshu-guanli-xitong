@@ -1,5 +1,6 @@
 """持久化、文件边界及同源保护测试；全部使用临时数据目录。"""
 import base64
+import contextlib
 import io
 import json
 import socket
@@ -413,6 +414,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class BootstrapSizeTests(unittest.TestCase):
+    def test_bootstrap_lists_recent_exports_and_keeps_total(self):
+        with tempfile.TemporaryDirectory(prefix='bid-bootstrap-') as tmp:
+            store = server.Store(tmp)
+            try:
+                for n in range(server.BOOTSTRAP_EXPORTS + 5):
+                    store.put('export', {'id': f'export_{n:03}', 'project_id': 'p', 'created_at': server.now()})
+                store.db.commit()
+                state = store.bootstrap()
+                self.assertEqual(server.BOOTSTRAP_EXPORTS, len(state['exports']))
+                self.assertEqual(f'export_{server.BOOTSTRAP_EXPORTS + 4:03}', state['exports'][0]['id'])
+                self.assertEqual(server.BOOTSTRAP_EXPORTS + 5, state['stats']['export_count'])
+            finally:
+                store.close()
+
+
 class OrayRemoteAccessTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='bid-oray-test-')
@@ -573,6 +590,64 @@ class OrayRemoteAccessTests(unittest.TestCase):
             guard.failure(f'10.0.0.{n}')
         _, _, status = self.login(self.token)
         self.assertEqual(429, status)
+
+    def device_cookie(self):
+        req = urllib.request.Request(self.local + '/login', method='POST',
+                                     data=f'token={self.token}'.encode(),
+                                     headers={'Host': self.public, 'Origin': self.public_origin,
+                                              'Content-Type': 'application/x-www-form-urlencoded'})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            opener.open(req, timeout=10)
+        self.assertEqual(303, caught.exception.code)
+        cookies = caught.exception.headers.get_all('Set-Cookie')
+        device = next(c for c in cookies if c.startswith('bid_device='))
+        self.assertIn('HttpOnly', device)
+        self.assertNotIn(self.token, device)
+        return device.split(';', 1)[0]
+
+    def test_trusted_browser_is_not_locked_out_by_shared_source_failures(self):
+        device = self.device_cookie()
+        # 花生壳下陌生来源与同事共用 127.0.0.1：连续输错锁住该来源，并触发全局锁定。
+        for _ in range(5):
+            self.login('wrong-token-000')
+        for n in range(30):
+            self.httpd.login_guard.failure(f'10.0.0.{n}')
+        _, _, status = self.login(self.token)
+        self.assertEqual(429, status)
+        _, headers, status = self.call('POST', '/login', host=self.public, origin=self.public_origin,
+                                       content_type='application/x-www-form-urlencoded',
+                                       headers={'Cookie': device}, data=f'token={self.token}'.encode())
+        self.assertEqual(303, status)
+        self.assertIn('bid_session=', headers.get('Set-Cookie'))
+        # 已信任设备自己的错误仍会被单独限制。
+        for _ in range(5):
+            _, _, status = self.call('POST', '/login', host=self.public, origin=self.public_origin,
+                                     content_type='application/x-www-form-urlencoded',
+                                     headers={'Cookie': device}, data=b'token=wrong-token-000')
+        self.assertEqual(429, status)
+
+    def test_forged_device_cookie_gets_no_exemption(self):
+        for _ in range(5):
+            self.login('wrong-token-000')
+        for value in ['bid_device=abc.def', 'bid_device=' + 'a' * 22 + '.' + '0' * 32]:
+            _, _, status = self.call('POST', '/login', host=self.public, origin=self.public_origin,
+                                     content_type='application/x-www-form-urlencoded',
+                                     headers={'Cookie': value}, data=f'token={self.token}'.encode())
+            self.assertEqual(429, status)
+
+    def test_unauthenticated_post_body_is_not_parsed_as_a_second_request(self):
+        smuggled = f'GET /api/bootstrap HTTP/1.1\r\nHost: {self.public}\r\n\r\n'.encode()
+        for path in (b'/', b'/api/projects'):
+            with socket.create_connection(('127.0.0.1', self.port), timeout=5) as sock:
+                sock.sendall(b'POST ' + path + b' HTTP/1.1\r\nHost: ' + self.public.encode() +
+                             b'\r\nContent-Type: application/json\r\nContent-Length: ' +
+                             str(len(smuggled)).encode() + b'\r\n\r\n' + smuggled)
+                received = b''
+                with contextlib.suppress(OSError):
+                    while chunk := sock.recv(65536):
+                        received += chunk
+            self.assertEqual(1, received.count(b'HTTP/1.1 '), (path, received[:200]))
 
     def test_remote_entry_cannot_change_material_library(self):
         material, _, _ = self.seed_material_and_export()
@@ -810,6 +885,14 @@ class ChineseTokenAndLanHosts(unittest.TestCase):
             status, _, raw = self.request('GET', '/api/bootstrap', host, headers={'Cookie': cookie})
             self.assertEqual(200, status)
             self.assertTrue(json.loads(raw)['remote_access']['materials_intranet_only'])
+
+    def test_chinese_token_works_as_bearer(self):
+        host = '192.168.8.20:8766'
+        for value in [self.token.encode('utf-8').decode('latin-1'), urllib.parse.quote(self.token)]:
+            status, _, _ = self.request('GET', '/api/bootstrap', host, headers={'Authorization': 'Bearer ' + value})
+            self.assertEqual(200, status, value)
+        status, _, _ = self.request('GET', '/api/bootstrap', host, headers={'Authorization': 'Bearer wrong-token-000'})
+        self.assertEqual(401, status)
 
     def test_unknown_host_rejected(self):
         status, _, _ = self.request('GET', '/login', '192.168.8.99:8766')
