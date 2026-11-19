@@ -1,9 +1,19 @@
 """Persistent local export jobs; document work never holds the application DB lock."""
 import copy
+import hashlib
+import json
 import math
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+
+
+def snapshot_revision(project, mode):
+    return hashlib.sha256(json.dumps([
+        mode, project.get('export_mapping_revision'), project.get('export_framework_revision'),
+        project.get('stage_overview', {}).get('stage_revision'),
+        project.get('redline_review'), project.get('redline_ai'),
+    ], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 class ExportJobs:
@@ -42,19 +52,28 @@ class ExportJobs:
         return value
 
     def start(self, key, body):
-        for job in self.store.all('export_job'):
-            if job['project_id'] == key and job['status'] in {'queued', 'running'}:
-                return self.public(job)
+        from errors import ConflictError
+
         snapshot = self.store.prepare_export(key, body)
         project, materials, categories, mappings, mode = snapshot
+        revision = snapshot_revision(project, mode)
+        for job in self.store.all('export_job'):
+            if (job['project_id'] == key and job['mode'] == mode
+                    and job['status'] in {'queued', 'running'}):
+                if job.get('snapshot_revision') == revision:
+                    return self.public(job)
+                raise ConflictError('当前导出基于旧版本，请等待完成后重试当前版本。')
+        project['export_snapshot_revision'] = revision
         selected = {mid for row in mappings for mid in row.get('material_ids', [])}
         files = sum(len(m.get('files', [])) for m in materials if m['id'] in selected)
         weight = max(1, len(mappings) + files * 2)
         history = [j for j in self.store.all('export_job') if j['status'] == 'completed' and j.get('duration')]
         estimate = max(3, (sum(j['duration']/j['weight'] for j in history[-10:])/len(history[-10:])*weight) if history else 3 + weight * .4)
         job = dict(id='export_job_'+uuid.uuid4().hex, project_id=key, project_name=project['name'],
-                   mode=mode, status='queued', stage='等待导出', progress=0, created_at=time.time(),
+                   mode=mode, snapshot_revision=revision, status='queued', stage='等待导出', progress=0, created_at=time.time(),
                    estimate_seconds=estimate, weight=weight)
+        if mode == 'stage':
+            job['stage_revision'] = body.get('stage_revision')
         self.store.put('export_job', job); self.store.db.commit()
         self.pool.submit(self.run, job['id'], snapshot)
         return self.public(job)

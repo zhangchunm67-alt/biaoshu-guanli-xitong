@@ -1,5 +1,5 @@
 /* Real local HTTP/browser chain; only model inference is deterministic and mocked.
- * All procurement, upload, persistence, adoption, and DOCX export code is real.
+ * All procurement, upload, persistence, redline orchestration, and DOCX export code is real.
  */
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
@@ -10,7 +10,7 @@ catch { playwright = require('/Users/mac/.cache/codex-runtimes/codex-primary-run
 const app = path.resolve(__dirname, '..');
 const python = process.env.BID_TEST_PYTHON || path.join(app, '.venv/bin/python');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bid-writing-ui-'));
-const env = {...process.env,  PYTHONDONTWRITEBYTECODE:'1'};
+const env = {...process.env,  PYTHONDONTWRITEBYTECODE:'1', BID_CASE_OCR:'off'};
 
 async function stop(server) {
   if (!server || server.exitCode !== null) return;
@@ -23,7 +23,7 @@ async function stop(server) {
   let server, browser, page, serverLog = '';
   try {
     server = spawn(python, ['-B', '-u', '-c', String.raw`
-import base64,io,json,signal,sys,time
+import base64,io,json,os,signal,sys,time
 from pathlib import Path
 from zipfile import ZipFile
 from docx import Document
@@ -32,41 +32,92 @@ import writing_model
 from server import create_server
 
 root=Path(sys.argv[1])
-writing_model.configuration=lambda:dict(ready=True,model='deterministic-test-model',message='测试模型已就绪')
-def generate(context):
+writing_model.configuration=lambda:dict(ready=True,model='deterministic-test-model',models=[{'id':'deterministic-test-model','label':'测试模型'},{'id':'alternate-model','label':'备选模型'}],message='测试模型已就绪',status='ready',reasoning='medium')
+writing_model.resolve_model=lambda requested=None: (requested or 'deterministic-test-model')
+def generate(context, model=None):
     time.sleep(1.1)
     if 'SIMULATED-FAILURE' in context['business_notes']:
         raise ValueError('模拟写作服务失败，请重试。')
     assert 'BUSINESS-NOTES-ALPHA' in context['business_notes']
+    if '只改' in context['business_notes']:
+        assert [c['title'] for c in context['chapters']] == [c['title'] for c in context['chapters'] if '测试实施计划' in c['title']]
+        assert 'WRITING-CANDIDATE-' in context['chapters'][0]['text']
+    assert all('技术方案' not in c['title'] and '现有技术细节' not in c['title'] for c in context['chapters'])
     source=next(source for source in context['case_sources'] if 'CASE-' in source['text'])
     rows=[]
     for chapter in context['chapters']:
         rows.append(dict(chapter_id=chapter['id'],text='WRITING-CANDIDATE-'+chapter['id']+'：'+chapter['title']+'。案例依据：'+source['text']+'。项目负责人：【待补】。',
             requirement_ids=chapter['requirement_ids'],source_refs=[source['id']],material_refs=[],
             missing_items=['项目负责人姓名【待补】'],conflicts=['历史案例的工期须按本次采购要求重新核对。']))
+        images={s['id']:s for s in context['case_sources'] if s.get('image_id')}
+        if images and '测试实施计划' in chapter['title']:
+            rows[-1]['visuals']=[
+                dict(kind='image', after=1, caption='系列海报展示', image_id=next(iter(images))),
+                dict(kind='flow', after=1, caption='本项目审校流程', steps=['编辑提交初稿','复核并返修','确认后交付']),
+                dict(kind='table', after=1, caption='阶段交付与验收', headers=['阶段','交付物','验收依据'],
+                     rows=[['初审','设计初稿','核对需求清单'],['交付','设计定稿','复核确认记录']])]
+            import writing_visuals
+            writing_visuals.prepare(rows[-1], images)
     return dict(chapters=rows,notes=['模型为确定性测试替身；业务事实不可用于真实投标。'])
 writing_model.generate=generate
+def complete(system, context, schema, **kwargs):
+    if 'redlines' not in context:
+        first=context['issues'][0]
+        source=next((r for r in context['cases'] if '曾按里程碑完成测试服务' in r['text']),None)
+        return {'items': [] if not source else [dict(issue_id=first['id'], chapter_id=first['chapters'][0],
+            source_id=source['id'], quote='曾按里程碑完成测试服务', addition='历史案例曾按里程碑完成测试服务。')]}
+    assert kwargs['model'] == 'alternate-model'
+    assert any('保留原始技术段落' in row['text'] for row in context['chapters'])
+    target=next((r for r in context['chapters'] if '测试实施计划' in r['path']),None)
+    return {'items': [dict(id=row['id'], verdict='unclear', reason='案例不足', evidence='',
+        chapter_ids=[target['id']] if target else [], suggestion='核对签章和递交要求。') for row in context['redlines']]}
+writing_model.complete_json=complete
 s=create_server(0,root/'data',seed=False)
 store=s.store
 for category in store.all('category'):
     category['enabled']=False;store.put('category',category)
 store.db.commit()
 doc=Document()
-for line in ['设备维保服务采购项目','第一章 合格供应商资格要求','供应商须提供2023年1月1日以来至少两个同类合同。','供应商须在两小时内响应报修。','第五章 响应文件格式','附件1 报价函','我方报价为____，供应商签字盖章：____。BUYER-ORIGINAL-KEEP。','附件2 人员表']:
+for line in ['设备维保服务采购项目','第一章 合格供应商资格要求','供应商须提供2023年1月1日以来至少两个同类合同。','供应商须在两小时内响应报修。','未在两小时内响应报修的，投标无效。','第五章 响应文件格式','一、投标函','我方报价为____，供应商签字盖章：____。BUYER-ORIGINAL-KEEP。','二、人员表']:
     doc.add_paragraph(line)
 table=doc.add_table(rows=2,cols=3)
 for cell,text in zip(table.rows[0].cells,['姓名','资格证书','证明页码']):cell.text=text
 doc.add_paragraph('注：逐人填写并签章。')
+doc.add_paragraph('三、技术方案')
+doc.add_paragraph('按采购要求编写技术方案。')
 stream=io.BytesIO();doc.save(stream)
-record=framework.create(store,dict(name='第四步写作浏览器验收',filename='synthetic-procurement.docx',data=base64.b64encode(stream.getvalue()).decode()))
+record=framework.create(store,dict(name='第四步写作浏览器验收',filename='synthetic-procurement.docx',data=base64.b64encode(stream.getvalue()).decode(),outline_choice=True))
 record=framework.revise(store,record['id'],dict(revision=record['revision'],items=record['requirements'],confirmed=True,notes_acknowledged=True,acknowledged_removed_ids=[]),'requirements')
-rows=record['outline']+[dict(id='',text='测试实施计划',level=1,requirement_ids=[]),dict(id='',text='测试交付安排',level=1,requirement_ids=[])]
-record=framework.revise(store,record['id'],dict(revision=record['revision'],items=rows),'outline')
+custom=Document()
+custom.add_heading('一、投标函',1)
+custom.add_heading('二、人员表',1)
+custom.add_heading('技术方案',1)
+custom.add_heading('现有技术细节',2)
+custom.add_paragraph('保留原始技术段落').runs[0].bold=True
+custom.add_table(rows=1,cols=1).cell(0,0).text='TECH-TABLE-KEEP'
+from PIL import Image
+pic=io.BytesIO()
+Image.new('RGB',(30,20),(20,80,160)).save(pic,format='PNG')
+pic.seek(0)
+custom.add_picture(pic)
+custom.add_heading('测试实施计划',1)
+custom.add_heading('测试交付安排',1)
+stream=io.BytesIO();custom.save(stream)
+record=framework.revise(store,record['id'],dict(revision=record['revision'],docx={
+    'name':'自定义目录.docx','data':base64.b64encode(stream.getvalue()).decode()}),'outline')
 project=framework.confirm(store,record['id'],dict(revision=record['revision']))
-project=store.prepare_text_materials(project['id'],text_first=True)
+with store.lock:
+    saved=store.require('project',project['id'])
+    saved.update(special_selection_confirmed=True,text_review_confirmed=True)
+    store.put('project',saved);store.db.commit()
 chapters={row['text']:row['id'] for row in record['outline']}
 (root/'case-one.txt').write_text('CASE-TXT-EVIDENCE：合成案例，曾按里程碑完成测试服务。',encoding='utf-8')
 with ZipFile(root/'case-bundle.zip','w') as archive:
+    poster=os.getenv('BID_CHAT_QA_IMAGE')
+    with Image.open(poster) if poster else Image.new('RGB',(320,180),'blue') as im:
+        out=io.BytesIO()
+        im.save(out,format='PNG')
+        archive.writestr('案例资料/系列展示.png',out.getvalue())
     archive.writestr('案例资料/项目说明.md','# 测试相关案例\nCASE-ZIP-EVIDENCE：替换后的合成案例，以交付清单验收。')
 print(json.dumps(dict(port=s.server_port,framework=record['id'],project=project['id'],first=chapters['测试实施计划'],second=chapters['测试交付安排'])),flush=True)
 def stop(*args):raise KeyboardInterrupt
@@ -87,209 +138,121 @@ finally:s.server_close();store.close()
       server.once('exit', code => { clearTimeout(timer); reject(Error('Fixture exited '+code+': '+serverLog)); });
     });
     const base = 'http://127.0.0.1:'+fixture.port;
-    const writingUrl = base+'/api/projects/'+fixture.project+'/writing';
     browser = await playwright.chromium.launch({headless:true});
     page = await browser.newPage({viewport:{width:1440,height:1100}});
     page.setDefaultTimeout(30000);
     const errors = [];
-    const writingRequests = [];
-    page.on('request', request => {if(request.url().startsWith(writingUrl))writingRequests.push(request);});
     page.on('pageerror', error => errors.push(error.message));
-    // 生成前的“外发资料确认”统一接受并记录；其他确认框按 nextDialog 处理（默认取消，与无监听时一致）。
-    let nextDialog=null; const outbound=[];
-    page.on('dialog', dialog => {
-      if(dialog.message().startsWith('生成初稿将把以下资料')){outbound.push(dialog.message());return dialog.accept();}
-      const act=nextDialog; nextDialog=null;
-      return act==='accept'?dialog.accept():dialog.dismiss();
-    });
-    const readWriting = async () => {
-      const response = await page.request.get(writingUrl);
-      assert.ok(response.ok(), await response.text());
-      return response.json();
-    };
-    const waitCompleted = async () => {
-      await page.waitForFunction(() => document.querySelector('#wf-writing-status')?.textContent.includes('个章节候选'), null, {timeout:45000});
-      const writing = await readWriting();
-      assert.equal(writing.job.status, 'completed', JSON.stringify(writing.job));
-      return writing;
-    };
-    await page.goto(base+'/?workflow='+fixture.framework+'&step=5');
-    await page.locator('#wf-case-upload').waitFor({state:'attached'});
-    assert.equal(await page.locator('[data-wf=generate-writing]').isDisabled(), true);
-    assert.equal(await page.locator('#wf-business-notes').getAttribute('maxlength'), '10000');
-    assert.equal(await page.locator('#wf-business-notes-status').isVisible(), false);
-
-    await page.locator('#wf-case-upload').setInputFiles(path.join(root,'case-one.txt'));
-    await page.locator('.wf-case-files').getByText('case-one.txt',{exact:true}).waitFor();
-    await page.locator('[data-wf=generate-writing]:enabled').waitFor();
-    await page.locator('#wf-chapter').selectOption(fixture.first);
-    await page.locator('#wf-body').fill('MANUAL-BEFORE-GENERATION：已保存的人工正文。');
-    await page.locator('#wf-business-notes').fill('BUSINESS-NOTES-ALPHA：测试输入，不是真实业务事实。');
-    assert.equal(await page.locator('#wf-business-notes-status').isVisible(), true);
-    await page.locator('[data-wf=generate-writing]').click();
-    await page.locator('.wf-writing-progress').waitFor();
-    assert.equal(outbound.length,1);
-    assert.match(outbound[0],/case-one\.txt/);
-    assert.match(outbound[0],/业务补充信息：\d+ 字/);
-    assert.match(outbound[0],/证件、授权书等正文不发送/);
-    assert.equal(await page.locator('.wf-step[data-id="4"]').isEnabled(), true);
-    await page.locator('.wf-step[data-id="4"]').click();
-    await page.getByRole('heading',{name:'系统填充',exact:true}).waitFor();
-    await page.locator('.wf-step[data-id="5"]').click();
-    let writing = await waitCompleted();
-    assert.equal(await page.locator('#wf-business-notes-status').isVisible(), false);
-    assert.ok(writing.job.chapters.length >= 2);
-    assert.equal(writing.job.accepted_chapter_ids.length, 0);
-    await page.locator('#wf-chapter').selectOption(fixture.first);
-    assert.match(await page.locator('#wf-body').inputValue(), /MANUAL-BEFORE-GENERATION/);
-    assert.match(await page.locator('.wf-candidate-text').innerText(), /CASE-TXT-EVIDENCE/);
-    assert.match(await page.locator('#wf-writing-candidate').innerText(), /项目负责人姓名【待补】/);
-    assert.match(await page.locator('#wf-writing-candidate').innerText(), /历史案例的工期/);
-    await page.locator('#wf-writing-candidate .wf-source-evidence > summary').click();
-    assert.match(await page.locator('.wf-writing-sources').innerText(), /case-one\.txt/);
-
-    // Full reload restores uploaded evidence, unaccepted candidates and hand-written text.
+    const requests=[];
+    page.on('request',request=>requests.push(request.url()));
+    page.on('dialog',dialog=>dialog.accept());
+    const url=base+'/?workflow='+fixture.framework+'&step=5';
+    await page.goto(url);
+    await page.locator('#wf-chat-upload').waitFor({state:'attached'});
+    await page.locator('#wf-redline-scan').waitFor();
+    await page.locator('[data-wf=formal-export][data-id=reviewed]').waitFor();
+    await page.locator('[data-wf=formal-export][data-id=draft]').waitFor();
+    const message=page.locator('#wf-chat-message');
+    const upload=page.locator('#wf-chat-upload');
+    const send=page.locator('[data-wf=chat-send]');
+    await send.waitFor();
+    await message.fill('未提供案例');
+    await send.click();
+    await page.getByText('请先用加号上传相关项目案例。',{exact:true}).first().waitFor();
+    await upload.setInputFiles(path.join(root,'case-one.txt'));
+    await page.locator('.wf-chat-files').getByText('case-one.txt',{exact:true}).waitFor();
+    await page.locator('#wf-writing-model').selectOption('alternate-model');
+    await message.fill('BUSINESS-NOTES-ALPHA：编写初稿');
+    await send.click();
+    await page.getByText('正在编写…',{exact:true}).waitFor();
     await page.reload();
-    await page.locator('#wf-chapter').waitFor();
-    await page.locator('#wf-chapter').selectOption(fixture.first);
-    assert.match(await page.locator('.wf-case-files').innerText(), /case-one\.txt/);
-    assert.match(await page.locator('#wf-business-notes').inputValue(), /BUSINESS-NOTES-ALPHA/);
-    const savedNotes=await page.locator('#wf-business-notes').inputValue();
-    await page.locator('#wf-business-notes').fill(savedNotes+'补充');
-    assert.equal(await page.locator('#wf-business-notes-status').isVisible(), true);
-    await page.locator('#wf-business-notes').fill(savedNotes);
-    assert.equal(await page.locator('#wf-business-notes-status').isVisible(), false);
-    assert.match(await page.locator('#wf-body').inputValue(), /MANUAL-BEFORE-GENERATION/);
-    nextDialog='dismiss';
-    await page.locator('[data-wf=accept-writing]').click();
-    assert.match(await page.locator('#wf-body').inputValue(), /MANUAL-BEFORE-GENERATION/);
-    nextDialog='accept';
-    await page.locator('[data-wf=accept-writing]').click();
-    await page.waitForFunction(() => document.querySelector('#wf-body')?.value.includes('WRITING-CANDIDATE-'));
-    assert.equal(await page.locator('[data-wf=accept-writing]').isDisabled(), true);
-    writing = await readWriting();
-    assert.deepEqual(writing.job.accepted_chapter_ids, [fixture.first]);
-    assert.equal(writing.job.stale, false);
-    await page.locator('#wf-chapter').selectOption(fixture.second);
-    assert.equal(await page.locator('[data-wf=accept-writing]').isEnabled(), true);
-    await page.locator('[data-wf=accept-all-writing]').click();
-    await page.waitForFunction(() => document.querySelector('[data-wf=accept-all-writing]')?.disabled === true);
-    writing = await readWriting();
-    assert.equal(writing.job.accepted_chapter_ids.length, writing.job.chapters.length);
-
-    // Editing one chapter does not discard another candidate. A failed targeted
-    // rewrite also leaves other candidates available for review and adoption.
-    await page.locator('[data-wf=generate-writing]').click();
-    await page.locator('.wf-writing-progress').waitFor();
-    writing = await waitCompleted();
-    const secondCandidate = writing.job.chapters.find(c=>c.chapter_id===fixture.second);
-    await page.locator('#wf-chapter').selectOption(fixture.first);
-    await page.locator('#wf-body').fill('MANUAL-LOCAL-EDIT：只修改第一章，不影响其余候选。');
-    await page.locator('[data-wf=save]').click();
-    assert.equal(await page.locator('[data-wf=accept-writing]').isDisabled(),true);
-    writing = await readWriting();
-    assert.deepEqual(writing.job.stale_chapter_ids,[fixture.first]);
-    await page.locator('#wf-business-notes').fill('SIMULATED-FAILURE');
-    nextDialog='accept';
-    await page.locator('[data-wf=generate-chapter-writing]').click();
-    await page.waitForFunction(()=>document.querySelector('#wf-writing-status')?.textContent.includes('模拟写作服务失败'));
-    await page.locator('#wf-chapter').selectOption(fixture.second);
-    assert.match(await page.locator('.wf-candidate-text').innerText(),/WRITING-CANDIDATE-/);
-    assert.equal(await page.locator('[data-wf=accept-writing]').isEnabled(),true);
-    nextDialog='accept';
-    await page.locator('[data-wf=accept-writing]').click();
-    writing = await readWriting();
-    assert.ok(writing.job.accepted_chapter_ids.includes(fixture.second));
-    await page.locator('#wf-chapter').selectOption(fixture.first);
-    assert.match(await page.locator('#wf-body').inputValue(),/MANUAL-LOCAL-EDIT/);
-    await page.locator('#wf-business-notes').fill('BUSINESS-NOTES-ALPHA：仅重新编写当前章节。');
-    nextDialog='accept';
-    await page.locator('[data-wf=generate-chapter-writing]').click();
-    await page.locator('.wf-writing-progress').waitFor();
-    writing = await waitCompleted();
-    assert.deepEqual(writing.job.target_chapter_ids,[fixture.first]);
-    assert.deepEqual(writing.job.chapters.find(c=>c.chapter_id===fixture.second),secondCandidate);
-    assert.ok(writing.job.accepted_chapter_ids.includes(fixture.second));
-    assert.match(await page.locator('#wf-body').inputValue(),/MANUAL-LOCAL-EDIT/);
-    nextDialog='accept';
-    await page.locator('[data-wf=accept-all-writing]').click();
-    await page.waitForFunction(()=>document.querySelector('[data-wf=accept-all-writing]')?.disabled===true);
-    assert.ok(writingRequests.some(request=>request.url().includes('?view=status')), 'browser must use the lightweight polling view');
-    assert.ok(writingRequests.some(request=>request.url().endsWith('/generate')&&request.postDataJSON()?.chapter_ids?.length===1));
-    const lightweight = await (await page.request.get(writingUrl+'?view=status')).json();
-    assert.equal('case_sources' in lightweight,false);
-    assert.equal('procurement_sources' in lightweight,false);
-    assert.equal('chapters' in lightweight.job,false);
-
-    // A new package invalidates old candidates while preserving adopted prose.
-    nextDialog='accept';
-    await page.locator('#wf-case-upload').setInputFiles(path.join(root,'case-bundle.zip'));
-    await page.locator('.wf-case-files').getByText('case-bundle.zip',{exact:true}).waitFor();
-    writing = await readWriting();
-    assert.equal(writing.case_revision, 2);
-    assert.equal(writing.job.stale, true);
-    assert.match(await page.locator('#wf-body').inputValue(), /CASE-TXT-EVIDENCE/);
-    assert.equal(await page.locator('[data-wf=accept-writing]').isDisabled(), true);
+    await page.getByRole('link',{name:'投标文件初稿',exact:true}).waitFor();
+    await upload.setInputFiles(path.join(root,'case-bundle.zip'));
+    await page.locator('.wf-chat-files').getByText(/case-bundle/).waitFor();
+    assert.equal(await page.locator('.wf-chat-files').getByText('case-one.txt',{exact:true}).count(),1);
+    await message.fill('BUSINESS-NOTES-ALPHA：只改测试实施计划');
+    await message.press('Enter');
+    await page.waitForFunction(()=>document.querySelectorAll('.wf-chat-downloads').length===2);
+    await page.getByRole('button',{name:'预览章节正文',exact:true}).last().click();
+    let chapter=page.locator('.wf-chat-chapter').filter({hasText:'系列海报展示'});
+    await chapter.locator('summary').click();
+    const poster=chapter.locator('img');
+    await poster.scrollIntoViewIfNeeded();
+    await page.waitForFunction(()=>document.querySelector('.wf-case-picture img')?.naturalWidth>0);
+    assert.equal(await chapter.locator('.wf-flow li').count(),3);
+    assert.equal(await chapter.locator('.wf-delivery-table tbody tr').count(),2);
+    await chapter.getByRole('button',{name:'采纳本章正文'}).click();
+    await chapter.getByText('已采纳',{exact:true}).waitFor({state:'attached'});
     await page.reload();
-    await page.locator('#wf-chapter').waitFor();
-    await page.locator('#wf-chapter').selectOption(fixture.first);
-    await page.locator('#wf-business-notes').fill('SIMULATED-FAILURE');
-    await page.locator('[data-wf=generate-writing]').click();
-    await page.waitForFunction(() => document.querySelector('#wf-writing-status')?.textContent.includes('模拟写作服务失败'));
-    assert.match(await page.locator('#wf-body').inputValue(), /CASE-TXT-EVIDENCE/);
-    await page.locator('#wf-business-notes').fill('BUSINESS-NOTES-ALPHA：使用替换后的案例包。');
-    await page.locator('[data-wf=generate-writing]').click();
-    writing = await waitCompleted();
-    assert.match(await page.locator('.wf-candidate-text').innerText(), /CASE-ZIP-EVIDENCE/);
-    await page.locator('#wf-writing-candidate .wf-source-evidence > summary').click();
-    assert.match(await page.locator('.wf-writing-sources').innerText(), /case-bundle\.zip.*项目说明\.md/);
-    nextDialog='accept';
-    await page.locator('[data-wf=accept-all-writing]').click();
-    await page.waitForFunction(() => document.querySelector('#wf-body')?.value.includes('CASE-ZIP-EVIDENCE'));
-
+    await page.getByRole('button',{name:'预览章节正文',exact:true}).last().click();
+    await chapter.locator('summary').click();
+    await chapter.getByText('已采纳',{exact:true}).waitFor();
+    const saved=await (await page.request.get(base+'/api/projects/'+fixture.project+'/chapter-drafts')).json();
+    assert.deepEqual(saved.chapters.find(c=>c.id===fixture.first).visuals.map(v=>v.kind),['image','flow','table']);
+    await message.fill('SIMULATED-FAILURE');
+    await send.click();
+    await page.getByText('模拟写作服务失败，请重试。',{exact:true}).waitFor();
+    assert.equal(await page.locator('.wf-chat-downloads').count(),2);
     await page.setViewportSize({width:390,height:844});
     await page.reload();
-    await page.locator('#wf-chapter').waitFor();
-    await page.locator('#wf-chapter').selectOption(fixture.first);
-    assert.match(await page.locator('#wf-body').inputValue(), /CASE-ZIP-EVIDENCE/);
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth+1), true, 'mobile page overflows viewport');
-    for (const selector of ['.wf-writing-inputs','.wf-candidate','.wf-saved-draft']) {
-      const box = await page.locator(selector).boundingBox();
-      assert.ok(box && box.x >= 0 && box.x+box.width <= 391, selector+' overflows mobile viewport');
+    await page.locator('.wf-chat-downloads').nth(1).waitFor();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+    for(const [label,name] of [['投标文件初稿','draft.docx'],['投标文件编制说明','notes.docx']]){
+      const link=page.getByRole('link',{name:label,exact:true}).last();
+      const response=await page.request.get(base+await link.getAttribute('href'));
+      assert.ok(response.ok());
+      fs.writeFileSync(path.join(root,name),await response.body());
     }
-    await page.locator('#wf-redline-scan').waitFor();
-    const redlines=page.locator('[data-wf=ack-redline]');
-    for(let i=0;i<await redlines.count();i++)await redlines.nth(i).check();
-    if(await redlines.count()){
-      await page.locator('[data-wf=save-redline]').click();
-      await page.waitForFunction(()=>/全部红线已勾选|未识别到废标红线/.test(document.querySelector('#wf-redline-scan')?.innerText||''));
-    }
-    await page.locator('[data-wf=export]').click();
-    const download = page.getByRole('link',{name:'Word 文件',exact:true}).first();
-    await download.waitFor({timeout:90000});
-    const response = await page.request.get(base+await download.getAttribute('href'));
-    assert.ok(response.ok());
-    const exported = path.join(root,'writing-export.docx');
-    fs.writeFileSync(exported,await response.body());
-    writing = await readWriting();
-    const check = spawnSync(python,['-B','-c',String.raw`
-import json,sys
+    const projectApi=base+'/api/projects/'+fixture.project;
+    const snapshot=await (await page.request.get(projectApi+'/stage-preview')).json();
+    const exported=await page.request.post(projectApi+'/export',{data:{mode:'stage',
+      mapping_revision:snapshot.mapping_revision,stage_revision:snapshot.stage_revision}});
+    assert.ok(exported.ok(),await exported.text());
+    const stageId=(await exported.json()).id;
+    const stageFile=await page.request.get(base+'/api/exports/'+stageId+'/download');
+    assert.ok(stageFile.ok());
+    fs.writeFileSync(path.join(root,'stage.docx'),await stageFile.body());
+    const inspected=spawnSync(python,['-B','-c',String.raw`
+import sys
+from pathlib import Path
 from docx import Document
+from docx.oxml.ns import qn
 from zipfile import ZipFile
-path=sys.argv[1];expected=json.loads(sys.argv[2]);d=Document(path)
-text='\n'.join(p.text for p in d.paragraphs)
-for chapter in expected:
-    assert text.count('WRITING-CANDIDATE-'+chapter+'：')==1,text
-assert 'CASE-ZIP-EVIDENCE' in text
-assert 'CASE-TXT-EVIDENCE' not in text
-assert 'MANUAL-BEFORE-GENERATION' not in text
-assert text.count('BUYER-ORIGINAL-KEEP')==1,text
-assert '项目负责人：【待补】' in text
-with ZipFile(path) as archive:assert archive.testzip() is None
-`, exported, JSON.stringify(writing.job.accepted_chapter_ids)], {cwd:app,env,encoding:'utf8'});
-    assert.equal(check.status,0,check.stderr);
+root=Path(sys.argv[1])
+draft=Document(root/'draft.docx')
+notes=Document(root/'notes.docx')
+text='\n'.join(p.text for p in draft.paragraphs)
+assert text.count('保留原始技术段落')==1,text
+assert len(list(draft.element.body.iter(qn('a:blip'))))==2
+assert any(t.cell(0,0).text=='TECH-TABLE-KEEP' for t in draft.tables)
+assert '系列海报展示' in text and '案例资料/系列展示.png' in text
+assert any(t.cell(0,0).text=='阶段' and t.cell(2,1).text=='设计定稿' for t in draft.tables)
+assert any(t.cell(2,0).text=='复核并返修' for t in draft.tables if len(t.rows)==5)
+stage=Document(root/'stage.docx')
+assert any(p.text=='系列海报展示' for p in stage.paragraphs)
+assert list(stage.element.body.iter(qn('a:blip')))
+assert any(t.cell(0,0).text=='阶段' and t.cell(2,1).text=='设计定稿' for t in stage.tables)
+assert 'BUYER-ORIGINAL-KEEP' in text
+assert 'WRITING-CANDIDATE-' in text and '项目负责人：【待补】' in text
+assert '历史案例曾按里程碑完成测试服务' in text
+assert {p.text for p in notes.paragraphs}>={'采购要点','目录对齐','素材台账','待补清单','评分索引'}
+assert '项目负责人姓名【待补】' in '\n'.join(p.text for p in notes.paragraphs)
+for name in ('draft.docx','notes.docx'):
+    with ZipFile(root/name) as archive: assert archive.testzip() is None
+`,root],{cwd:app,env,encoding:'utf8'});
+    assert.equal(inspected.status,0,inspected.stderr);
+    const project=await (await page.request.get(base+'/api/projects/'+fixture.project)).json();
+    const formal=await page.request.post(base+'/api/projects/'+fixture.project+'/export-jobs',
+      {data:{mapping_revision:project.mapping_revision,mode:'reviewed'}});
+    assert.ok(!formal.ok(), 'incomplete chat draft may not bypass the formal export gate');
+    await page.locator('.wf-branch-a').click();
+    await page.getByRole('button',{name:'生成阶段 Word',exact:true}).waitFor();
+    assert.ok(requests.some(url=>url.endsWith('/redline-scan')), 'writing step must read the current redline scan');
     assert.deepEqual(errors,[]);
-    console.log('PASS: uploads → lightweight polling → chapter-local invalidation/targeted regeneration → failed rewrite preserves other candidates → guarded adoption → source replacement → mobile layout → real DOCX contents.');
+    if(process.env.BID_CHAT_QA_DIR){
+      for(const name of ['draft.docx','notes.docx']) fs.copyFileSync(path.join(root,name),path.join(process.env.BID_CHAT_QA_DIR,name));
+    }
+    console.log('PASS: case uploads, model selection, background checks, same-project history, follow-up, preserved technical content, two Word downloads and mobile layout.');
   } catch(error) {
     if(page)console.error('Page:',await page.locator('body').innerText().catch(()=>''));
     if(serverLog)console.error('Server:',serverLog.slice(-8000));

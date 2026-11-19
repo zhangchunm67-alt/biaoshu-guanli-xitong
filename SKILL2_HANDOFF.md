@@ -15,8 +15,8 @@
 - 本项目采购原文、已确认要求及稳定的 `BidSection*` 章节 ID。
 - 业务上传案例的可读文字与定位出处。历史事实不能换名成为本项目事实；缺失信息标记 `【待补】` / `【待确认】`。
 - 本项目当前选中材料的文字及元信息、现有章节正文、业务补充。图片文件名不能证明图片中的资质事实。
-- 支持 DOC、DOCX、PDF、PPTX、TXT、MD、ZIP；上传合计 50 MB、100 个逻辑文件、累计解压 100 MB、案例文字 40 万字符。超限拒绝，不静默截断。
-- 不做 OCR；部分不可读文件提示并剔除，全部不可读则停止。DOC 转换依赖本机 LibreOffice。
+- 支持 DOC、DOCX、PDF、PPTX、TXT、MD、ZIP 及常见图片格式；上传合计 50 MB、100 个逻辑文件、累计解压 100 MB、案例文字 40 万字符。超限拒绝，不静默截断。
+- 案例内嵌图 / 扫描 PDF 页在安装 `requirements-ocr.txt`（RapidOCR/PP-OCR，PaddleOCR 同源）后本地 OCR；未安装或失败则提示并剔除不可用来源，全部不可读则停止。DOC 转换依赖本机 LibreOffice。
 
 ## 接口与版本
 
@@ -29,7 +29,7 @@
 
 ## 输出与验证范围
 
-每章输出 `chapter_id`、`text`、`requirement_ids`、`source_refs`、`material_refs`、`missing_items`、`conflicts`。程序校验章节身份、引用白名单和完整返回结构；这不等于核实全部业务事实。内容相关性、真实性及承诺仍须业务核对。
+每章输出 `chapter_id`、`text`、`requirement_ids`、`source_refs`、`material_refs`、`missing_items`、`conflicts` 和 `visuals`。图表用 `after` 指向正文中的非空段落，可引用本包带 `image_id` 的案例图片，也可提供流程步骤和结构化表格。预览、采纳及 Word 导出共用已定位的图文，图题、来源和表格内容同时进入正文核对。程序校验章节身份、引用白名单和完整返回结构；这不等于核实全部业务事实。内容相关性、真实性及承诺仍须业务核对。
 
 采纳沿用章节保存逻辑，按稳定章节锚点导出，避免同名章节串写。案例原件及采纳时来源记录保存在项目数据中，原采购文件保留。
 

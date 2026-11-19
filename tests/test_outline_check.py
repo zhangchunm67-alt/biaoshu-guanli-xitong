@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'skills/bid-response-framework/scripts'))
 import framework_service as service
-from outline_check import check_outline, format_report, parse_number, read_docx_outline
+from outline_check import check_outline, decimal_headings, format_report, parse_number, read_docx_outline
 from server import Store
 
 
@@ -28,6 +28,15 @@ def codes(result):
 
 
 class OutlineCheckUnitTests(unittest.TestCase):
+    def test_decimal_display_replaces_mixed_prefixes_at_each_level(self):
+        outline = rows(('一、商务部分', 1), ('3.1 一、投标一览表', 2),
+                       ('（一）分项报价', 3), ('二、技术方案', 1),
+                       ('9.5 项目理解', 2), ('附件3 报价说明', 2))
+        self.assertEqual([
+            ('1.', '商务部分'), ('1.1', '投标一览表'), ('1.1.1', '分项报价'),
+            ('2.', '技术方案'), ('2.1', '项目理解'), ('2.2', '附件3 报价说明'),
+        ], list(decimal_headings(outline)))
+
     def test_clean_outline_passes(self):
         result = check_outline(rows(('营业执照', 1), ('公司介绍', 1), ('服务方案', 1), ('实施计划', 2),
                                     ('附件1 报价函', 1), ('附件3 承诺书', 1)))
@@ -58,6 +67,29 @@ class OutlineCheckUnitTests(unittest.TestCase):
         result = check_outline(rows(('第五章 投标文件格式', 1), ('服务方案', 1), ('公司介绍', 1)))
         self.assertEqual(['mixed_auto'], codes(result))
         self.assertEqual([{'id': 'S1', 'text': '投标文件格式'}], result['issues'][0]['fixes'])
+
+    def test_safe_fixes_are_applied_to_plan_before_rendering(self):
+        plan = {'blocks': [
+            {'kind': 'heading', 'bookmark': 'S1', 'text': '商务部分', 'level': 1},
+            {'kind': 'heading', 'bookmark': 'S2', 'text': '三、报价函', 'level': 2},
+            {'kind': 'heading', 'bookmark': 'S3', 'text': '一、身份证明', 'level': 2},
+            {'kind': 'heading', 'bookmark': 'S4', 'text': '一、授权委托书', 'level': 2},
+        ]}
+        fixed = service.apply_outline_fixes(copy.deepcopy(plan))
+        self.assertEqual(['商务部分', '一、报价函', '二、身份证明', '三、授权委托书'],
+                         [block['text'] for block in fixed['blocks']])
+
+    def test_title_key_ignores_numbering_for_chapter_migration(self):
+        self.assertEqual(service._title_key('一、公司介绍'), service._title_key('公司介绍'))
+        self.assertEqual(service._title_key('1. 服务方案'), service._title_key('服务方案'))
+
+    def test_safe_fixes_remove_manual_numbers_when_mixed_with_auto_numbering(self):
+        plan = {'blocks': [
+            {'kind': 'heading', 'bookmark': 'S1', 'text': '第五章 投标文件格式', 'level': 1},
+            {'kind': 'heading', 'bookmark': 'S2', 'text': '服务方案', 'level': 1},
+        ]}
+        fixed = service.apply_outline_fixes(copy.deepcopy(plan))
+        self.assertEqual(['投标文件格式', '服务方案'], [block['text'] for block in fixed['blocks']])
         # （一）、附件N 不会关掉 Word 自动编号，不算混用。
         self.assertEqual([], check_outline(rows(('（一）投标函', 1), ('（二）报价表', 1)))['issues'])
 
@@ -78,9 +110,11 @@ class OutlineCheckUnitTests(unittest.TestCase):
         self.assertIn('duplicate_title', codes(result))
 
     def test_years_amounts_and_bare_numbers_are_not_sequence_numbers(self):
-        for title in ['2023年度审计报告', '3.5万元以下项目', '100%响应', '一、']:
+        for title in ['2023年度审计报告', '3.5万元以下项目', '3.5 万元以下项目', '100%响应', '一、']:
             self.assertIsNone(parse_number(title), title)
         self.assertEqual([], check_outline(rows(('业绩', 1), ('2023年业绩', 2), ('2024年业绩', 2)))['issues'])
+        self.assertEqual(('1.', '月度宣传推广情况报告机制'),
+                         next(decimal_headings(rows(('9.10.1 月度宣传推广情况报告机制', 1)))))
 
     def test_reads_headings_from_generated_word(self):
         document = Document()
@@ -125,26 +159,20 @@ class OutlineCheckServiceTests(unittest.TestCase):
             revision=record['revision'], items=record['requirements'], confirmed=True,
             notes_acknowledged=True, acknowledged_removed_ids=[]), 'requirements')
 
-    def test_messy_numbers_require_fix_or_acknowledgement_before_confirm(self):
+    def test_messy_numbers_are_fixed_automatically_without_confirmation(self):
         self.assertIn('outline_check', self.record)
-        rows = copy.deepcopy(self.record['outline'])
-        top = [r for r in rows if r['level'] == 1]
+        outline_rows = copy.deepcopy(self.record['outline'])
+        top = [r for r in outline_rows if r['level'] == 1]
         self.assertGreaterEqual(len(top), 3)
         top[0]['text'] = '三、' + top[0]['text']
         top[1]['text'] = '一、' + top[1]['text']
         top[2]['text'] = '一、' + top[2]['text']
-        messy = service.revise(self.store, self.record['id'], {'revision': self.record['revision'], 'items': rows}, 'outline')
-        self.assertTrue(messy['outline_check']['issues'])
-        with self.assertRaisesRegex(ValueError, '目录校验'):
-            service.confirm(self.store, messy['id'], {'revision': messy['revision']})
-        # 按建议修正后重新保存，仍有混用提示时可人工确认放行。
-        fixes = {f['id']: f['text'] for i in messy['outline_check']['issues'] for f in i['fixes']}
-        fixed_rows = [dict(r, text=fixes.get(r['id'], r['text'])) for r in messy['outline']]
-        fixed = service.revise(self.store, messy['id'], {'revision': messy['revision'], 'items': fixed_rows}, 'outline')
-        self.assertNotIn('sequence', [i['code'] for i in fixed['outline_check']['issues']])
-        project = service.confirm(self.store, fixed['id'], {'revision': fixed['revision'],
-                                                             'outline_check_acknowledged': True})
-        self.assertEqual(fixed['id'], project['framework_id'])
+        messy = service.revise(self.store, self.record['id'],
+                               {'revision': self.record['revision'], 'items': outline_rows}, 'outline')
+        # 可安全修正的序号问题已在生成目录时自动处理，不再要求人工勾选。
+        self.assertNotIn('sequence', codes(messy['outline_check']))
+        project = service.confirm(self.store, messy['id'], {'revision': messy['revision']})
+        self.assertEqual(messy['id'], project['framework_id'])
 
 
 if __name__ == '__main__':

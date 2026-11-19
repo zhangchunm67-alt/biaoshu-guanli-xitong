@@ -165,6 +165,108 @@ class ExtractionRegressionTests(unittest.TestCase):
         self.assertIn('响应时效', rows[1]['label'])
         self.assertFalse(any(r['category'] == 'score' for r in scoring(read_units(self.source)[0])))
 
+    def test_review_table_rows_become_redlines_when_header_states_one_fail_voids(self):
+        doc = Document()
+        doc.add_paragraph('第五章 评标办法')
+        doc.add_paragraph('符合性审查：有一项不符合的，投标无效。')
+        table = doc.add_table(rows=1, cols=3)
+        for cell, value in zip(table.rows[0].cells, ['序号', '审查内容', '审查标准']):
+            cell.text = value
+        for values in [
+            ['1', '投标文件签署齐全', '按招标文件要求签字盖章'],
+            ['2', '投标保证金已提交', '按前附表要求递交'],
+            ['3', '报价未超过最高限价', '总价与分项报价一致'],
+        ]:
+            for cell, value in zip(table.add_row().cells, values):
+                cell.text = value
+        rows = [r for r in eligibility(self.save(doc)) if r['category'] == 'redline']
+        texts = [r['text'] for r in rows]
+        self.assertTrue(any('签署' in t for t in texts), texts)
+        self.assertTrue(any('保证金' in t for t in texts), texts)
+        self.assertTrue(any('最高限价' in t for t in texts), texts)
+        self.assertGreaterEqual(len(rows), 3)
+        self.assertTrue(all(r.get('related') for r in rows if '签署' in r['text'] or '保证金' in r['text']))
+
+    def test_procedural_and_negation_rejection_wording_are_not_redlines(self):
+        doc = Document()
+        for line in [
+            '评标委员会应当对否决投标的情况作出书面说明。',
+            '投标文件格式不完全一致的，不作为否决投标的依据。',
+            '下列情形不会导致废标：装订轻微瑕疵。',
+            '有下列情形之一的，投标将被否决：未按要求密封投标文件。',
+        ]:
+            doc.add_paragraph(line)
+        rows = [r for r in eligibility(self.save(doc)) if r['category'] == 'redline']
+        texts = [r['text'] for r in rows]
+        self.assertFalse(any('作出书面说明' in t for t in texts), texts)
+        self.assertFalse(any('不作为否决投标的依据' in t for t in texts), texts)
+        self.assertFalse(any('不会导致废标' in t for t in texts), texts)
+        self.assertTrue(any('密封' in t for t in texts), texts)
+
+    def test_stored_otherwise_redline_expands_from_source_reference(self):
+        import framework_review as review
+        row = {
+            'id': 'r1', 'category': 'redline', 'label': '',
+            'text': '否则可以被视为无效响应。', 'scope': '', 'note': '',
+            'references': [{
+                'id': 's1', 'original_text': (
+                    '14 ｜ 盖章 ｜ 供应商在响应文件中的单位盖章、印章、公章等处均仅指与相关当事人名称全称相一致的标准公章，'
+                    '不得使用其它形式如带有“专用章”等字样的印章。否则可以被视为无效响应。'
+                    '如为了保证响应时效必须使用投标专用章的，则需出具公章对投标专用章同等法律效力的授权原件。'
+                ),
+            }],
+        }
+        polished = review.polish_requirement(row)
+        self.assertIn('不得使用其它形式如带有“专用章”等字样的印章', polished['text'])
+        self.assertIn('否则可以被视为无效响应', polished['text'])
+        self.assertFalse(polished['text'].startswith('否则'))
+
+    def test_otherwise_consequence_keeps_preceding_condition(self):
+        doc = Document()
+        doc.add_paragraph('第二章 供应商须知')
+        table = doc.add_table(rows=1, cols=3)
+        for cell, value in zip(table.rows[0].cells, ['序号', '条款', '内容']):
+            cell.text = value
+        for cell, value in zip(table.add_row().cells, [
+            '14', '盖章',
+            '供应商在响应文件中的单位盖章、印章、公章等处均仅指与相关当事人名称全称相一致的标准公章，'
+            '不得使用其它形式如带有“专用章”等字样的印章。否则可以被视为无效响应。'
+            '如为了保证响应时效必须使用投标专用章的，则需出具公章对投标专用章同等法律效力的授权原件。',
+        ]):
+            cell.text = value
+        rows = [r for r in eligibility(self.save(doc)) if r['category'] == 'redline']
+        texts = [r['text'] for r in rows]
+        self.assertTrue(any('标准公章' in t and '否则可以被视为无效响应' in t for t in texts), texts)
+        self.assertFalse(any(t.strip() == '否则可以被视为无效响应。' for t in texts), texts)
+        self.assertFalse(any((r.get('label') or '') == '否决响应' for r in rows), rows)
+
+    def test_checklist_invalid_response_question_is_not_a_redline(self):
+        doc = Document()
+        table = doc.add_table(rows=1, cols=3)
+        for cell, value in zip(table.rows[0].cells, ['评审因素', '评审标准', '要求']):
+            cell.text = value
+        for cell, value in zip(table.add_row().cells, [
+            '符合性评审标准', '供应商是否存在采购文件中无效响应情况', '满足采购文件要求',
+        ]):
+            cell.text = value
+        rows = [r for r in eligibility(self.save(doc)) if r['category'] == 'redline']
+        self.assertFalse(any('是否存在采购文件中无效响应情况' in r['text'] for r in rows), [r['text'] for r in rows])
+
+    def test_front_table_no_bid_bond_filters_bond_redline(self):
+        doc = Document()
+        table = doc.add_table(rows=1, cols=2)
+        for cell, value in zip(table.rows[0].cells, ['条款', '内容']):
+            cell.text = value
+        for cell, value in zip(table.add_row().cells, ['投标保证金', '本项目不收取']):
+            cell.text = value
+        doc.add_paragraph('有下列情形之一的，其投标将被否决：')
+        doc.add_paragraph('1）未按要求提交投标保证金；')
+        doc.add_paragraph('2）投标文件未盖单位公章。')
+        rows = [r for r in eligibility(self.save(doc)) if r['category'] == 'redline']
+        texts = [r['text'] for r in rows]
+        self.assertFalse(any('保证金' in t for t in texts), texts)
+        self.assertTrue(any('公章' in t for t in texts), texts)
+
     def test_spaced_rejection_bullets_inherit_consequence_and_ignore_bare_title(self):
         doc = Document()
         for line in ['6 、取消投标供应商竞标资格', '有下列任一情况的，将取消该投标供应商的竞标资格：',

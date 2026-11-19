@@ -17,6 +17,7 @@ from docx import Document
 from lxml import etree
 import olefile
 
+import writing_visuals
 import chapter_drafts
 import framework_review
 from unified_plan import build_unified_plan
@@ -44,18 +45,39 @@ def outline_check(record):
     return check_outline(record.get('outline') or [])
 
 
-def require_outline_check_ack(record, body):
-    result = outline_check(record)
-    if result['issues'] and body.get('outline_check_acknowledged') is not True:
-        raise ValueError(f'目录校验发现 {len(result["issues"])} 项序号或结构问题。请按提示修正后保存目录，'
-                         '或逐项核对后勾选“已核对目录校验提示”再确认。')
+def apply_outline_fixes(plan):
+    """在生成 Word 前自动应用可安全修正的目录建议（重新编号、去掉混用的原文序号）。"""
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
+    from outline_check import check_outline
+    headings = [block for block in plan.get('blocks', [])
+                if block.get('kind') == 'heading' and block.get('bookmark')]
+    for _ in range(4):
+        entries = [{'id': block['bookmark'], 'text': block.get('text', ''),
+                    'level': max(1, int(block.get('level') or 1))} for block in headings]
+        fixes = {}
+        for issue in check_outline(entries)['issues']:
+            for fix in issue.get('fixes') or []:
+                if isinstance(fix, dict) and isinstance(fix.get('id'), str) \
+                        and isinstance(fix.get('text'), str):
+                    fixes[fix['id']] = fix['text']
+        changed = False
+        for block in headings:
+            text = fixes.get(block['bookmark'])
+            if text is not None and text != block.get('text'):
+                block['text'] = text
+                changed = True
+        if not changed:
+            break
+    return plan
 
 
 def ensure_required_sections(plan):
     if str(SCRIPTS) not in sys.path:
         sys.path.insert(0, str(SCRIPTS))
     from required_sections import ensure_business_license
-    ensure_business_license(plan)
+    if not plan.get('preserve_outline'):
+        ensure_business_license(plan)
     framework_review.assign_bookmarks(plan)
     return plan
 
@@ -179,16 +201,16 @@ def run_skill(script, *args, payload=None, timeout=180):
 
 
 def build_edition(work, out, source, name, key, *, saved_plan=None, requirements=None,
-                  sources=None, source_notes=None):
+                  sources=None, source_notes=None, intake=False):
     """One bounded worker owns all planning, extraction and rendering for this edition."""
     payload = dict(work=str(work), out=str(out), source=str(source), name=name, key=key,
                    saved_plan=saved_plan, requirements=requirements, sources=sources,
-                   source_notes=source_notes)
+                   source_notes=source_notes, intake=intake)
     return tuple(json.loads(run_skill('framework_worker.py', payload=payload, timeout=360)))
 
 
 def build_edition_in_process(work, out, source, name, key, *, saved_plan=None, requirements=None,
-                             sources=None, source_notes=None):
+                             sources=None, source_notes=None, intake=False):
     """Render the same merged plan into Word, the HTML outline and API metadata."""
     work, out, source = Path(work), Path(out), Path(source)
     metrics_module = metric_module()
@@ -196,6 +218,22 @@ def build_edition_in_process(work, out, source, name, key, *, saved_plan=None, r
     from generate import generate_framework
     source_document = Source(source)
     parsed = metrics_module.read_units(source)
+    if intake:
+        payload = framework_review.normalize_sources(metrics_module.export_review(
+            source, parsed=parsed, source_document=source_document))
+        requirements = payload['requirements']
+        metrics = [{'key': group, 'label': metrics_module.CATEGORIES[group][0],
+                    'unit': metrics_module.CATEGORIES[group][1],
+                    'count': sum(row['category'] == group for row in requirements)} for group in GROUPS]
+        notes = payload.get('notes', [])
+        metadata = {'layout': 'whole', 'normalized_sha256': source_document.digest, 'metrics': metrics,
+                    'outline': [], 'books': [], 'notes': notes, 'artifacts': [],
+                    '_plan': {'source_sha256': source_document.digest, 'project': name,
+                              'blocks': [{'kind': 'toc'}], 'review': []},
+                    'requirements': requirements, 'sources': payload['sources'], 'source_notes': notes,
+                    'revision': 1, 'review_version': REVIEW_VERSION, 'review_editable': True,
+                    'requirements_confirmed': False}
+        return metadata, {}, {}
     if saved_plan is None:
         try:
             original = generate(source_document)
@@ -217,7 +255,8 @@ def build_edition_in_process(work, out, source, name, key, *, saved_plan=None, r
         plan = framework_review.bind_requirements(plan, requirements)
     else:
         plan['reviewed_requirements'] = requirements
-    plan = organize_books(plan, source, requirements, source_document)
+    if not plan.get('preserve_outline'):
+        plan = apply_outline_fixes(organize_books(plan, source, requirements, source_document))
     out.mkdir()
     stem = re.sub(r'[^\w\-·]+', '_', name).strip('_')[:45] or '项目'
     word = out / (stem + '_投标文件框架.docx')
@@ -239,7 +278,12 @@ def build_edition_in_process(work, out, source, name, key, *, saved_plan=None, r
     if bookmark_map and merged_notice not in plan_notes:
         plan_notes.append(merged_notice)
     notes.extend(plan_notes)
-    rendered = generate_framework(source, word, plan, parsed=parsed,
+    from outline_check import decimal_headings
+    rendered_plan = copy.deepcopy(plan)
+    headings = [block for block in rendered_plan['blocks'] if block['kind'] == 'heading']
+    for heading, (number, title) in zip(headings, decimal_headings(headings)):
+        heading.update(text=f'{number} {title}', numbered=False)
+    rendered = generate_framework(source, word, rendered_plan, parsed=parsed,
                                   extra_notes=list(dict.fromkeys(plan_notes)))
     metrics = [{'key': group, 'label': metrics_module.CATEGORIES[group][0],
                 'unit': metrics_module.CATEGORIES[group][1], 'count': rendered['counts'][group]}
@@ -274,6 +318,31 @@ def save_record(store, record):
     return store.put('framework', canonical_record(record))
 
 
+def procurement_audit_requirement(record):
+    """Use a single unscoped procurement qualification clause with an explicit year."""
+    import engine
+    if not record or not record.get('requirements_confirmed'):
+        return None
+    requirements = framework_review.expand_requirements(record.get('requirements', []), record.get('sources', []))
+    candidates = {}
+    for row in requirements:
+        if row['category'] != 'qualification' or row.get('scope') or '审计报告' not in row['text']:
+            continue
+        for ref in row['references']:
+            text = ref.get('original_text') or ref.get('text', '')
+            if ref.get('part') != '主件' or not re.search(r'提供|提交', text) or '审计报告' not in text:
+                continue
+            years = engine._years(text.split('银行资信证明', 1)[0])
+            if len(years) != 1 or re.search(r'不要求|无需|无须|不需', text):
+                continue
+            bank = re.search(r'开标日前\s*(\d+)\s*个月内开具的银行资信证明', text)
+            candidates[(tuple(years), bank[1] if bank else '')] = {
+                'required_years': years, 'bank_credit_months': int(bank[1]) if bank else None,
+                'source': {'locator': ref.get('locator'), 'text': text,
+                           'source_id': ref.get('source_id') or ref.get('id')}}
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+
 def public(record):
     value = {k: copy.deepcopy(v) for k, v in record.items() if k not in {'storage', 'source_storage', 'normalized_storage', 'legacy_artifacts', 'model_review'}
              and not k.startswith('_')}
@@ -283,6 +352,8 @@ def public(record):
     if not record.get('review_version'):
         value.update(review_editable=False, revision=0, requirements_confirmed=True,
                      requirements=[], sources=[])
+    if record.get('outline_mode') == 'pending':
+        value.update(outline=[], books=[], artifacts=[])
     value['outline_check'] = outline_check(record)
     return value
 
@@ -291,6 +362,7 @@ def list_frameworks(store):
     result = []
     for record in reversed(store.all('framework')):
         summary = {k: record[k] for k in ('id', 'name', 'filename', 'created_at', 'project_id', 'projects')}
+        summary['outline_mode'] = record.get('outline_mode')
         history = record.get('legacy_projects', [])
         if any(a['kind'] == 'part' for a in record['artifacts']):
             history = [p for pid in record['projects'].values() if (p := store.get('project', pid))]
@@ -316,7 +388,8 @@ def create(store, body):
     skill_hash = hashlib.sha256()
     for script in sorted(SCRIPTS.glob('*.py')):
         skill_hash.update(script.name.encode() + b'\0' + hashlib.sha256(script.read_bytes()).digest())
-    identity = json.dumps([name, filename, source_hash, skill_hash.hexdigest(), REVIEW_VERSION],
+    choice = body.get('outline_choice') is True
+    identity = json.dumps([name, filename, source_hash, skill_hash.hexdigest(), REVIEW_VERSION] + (['outline-choice'] if choice else []),
                           ensure_ascii=False, sort_keys=True)
     key = 'framework_' + hashlib.sha256(identity.encode()).hexdigest()
     with store.lock:
@@ -337,13 +410,15 @@ def create(store, body):
             source = sources / 'normalized-source.docx'
             source.write_bytes(raw)
         out = work / 'deliverables'
-        metadata, _, _ = build_edition(work, out, source, name, key)
+        metadata, _, _ = build_edition(work, out, source, name, key, intake=choice)
         record = {'id': key, 'name': name, 'filename': filename, 'created_at': now(),
                   'source_sha256': source_hash, 'skill_sha256': skill_hash.hexdigest(),
                   'source_storage': str(original_path.relative_to(work)), 'projects': {}, 'project_id': None,
                   'normalized_storage': str(source.relative_to(work)),
                   'storage': {a['id']: str(Path(out.name) / a['name']) for a in metadata['artifacts']},
                   'legacy_projects': [], **metadata}
+        if choice:
+            record['outline_mode'] = 'pending'
         with store.lock:
             store.db.execute('BEGIN IMMEDIATE')
             published = False
@@ -366,6 +441,8 @@ def create(store, body):
 
 def asset(store, key, asset_id):
     record = current(store, key) if asset_id in {'word', 'html'} else store.require('framework', key)
+    if asset_id in {'word', 'html'} and record.get('outline_mode') == 'pending':
+        raise LookupError('请先生成或导入目录')
     if asset_id == 'source':
         filename = record['filename']
         return (store.path(Path('frameworks') / key / record['source_storage']),
@@ -389,8 +466,20 @@ def new_project(store, record):
                'template_import_kind': 'generated_framework', 'template_source_hash': record['source_sha256'],
                'created_at': stamp, 'updated_at': stamp, 'status': '待确认', 'mappings': [],
                'headings': [], 'warnings': []}
+    if record.get('outline_mode') in {'automatic', 'custom'}:
+        project['material_conflicts'] = True
+        project['not_applicable_chapters'] = [item['id'] for item in record['outline'] if item.get('not_applicable')]
     store.scan(project)
     return project
+
+
+def _title_key(text):
+    """Compare headings without their original numbering so auto-fixes keep chapter migration."""
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
+    from outline_check import parse_number
+    info = parse_number(text or '')
+    return re.sub(r'\s+', '', (info['rest'] if info else (text or '')).strip())
 
 
 def copy_previous_work(store, record, project, old_projects, bookmark_map, old_titles):
@@ -412,9 +501,11 @@ def copy_previous_work(store, record, project, old_projects, bookmark_map, old_t
             for key, text in draft.items():
                 target = mapping.get(key)
                 if (target in new_chapters and old_sections.get(key) is not None
-                        and old_sections[key] == expected.get(key) == new_chapters[target] and target not in texts):
+                        and _title_key(old_sections[key]) == _title_key(expected.get(key)) == _title_key(new_chapters[target])
+                        and target not in texts):
                     texts[target] = text
                     matched[key] = target
+        writing_visuals.inherit_chapters(project, previous, matched)
         history.append({'id': pid, 'name': previous['name'], 'artifact_id': aid,
                         'migrated_chapters': len(matched), 'pending_chapters': len(draft) - len(matched),
                         'chapter_map': matched, 'pending_chapter_ids': sorted(draft.keys() - matched.keys()),
@@ -553,6 +644,11 @@ def confirm(store, key, body):
         store.db.execute('BEGIN IMMEDIATE')
         try:
             record = store.require('framework', key)
+            if record.get('outline_mode') == 'pending':
+                raise ValueError('请先生成或导入目录')
+            # 自定义目录以上传内容为准：采购原文中未被上传目录收录的原表只提示，不再阻断确认。
+            if record.get('outline_missing') and record.get('outline_mode') != 'custom':
+                raise ValueError('仍有采购指定原表未关联章节，请先在目录编辑中处理')
             if record.get('review_version'):
                 if not record.get('requirements_confirmed'):
                     raise ValueError('请先保存并确认招标要求，再确认目录进入系统填充')
@@ -562,8 +658,6 @@ def confirm(store, key, body):
             if pid:
                 project = store.require('project', pid)
             else:
-                if record.get('review_version'):
-                    require_outline_check_ack(record, body)
                 project = new_project(store, record)
                 # Edits publish a new template; old projects/exports stay immutable.
                 # Surviving stable chapter IDs retain the user's authored text.
@@ -572,6 +666,15 @@ def confirm(store, key, body):
                     allowed = {r['id'] for r in record['outline']}
                     texts = {k: v for k, v in (previous or {}).get('chapter_texts', {}).items() if k in allowed}
                     project.update(chapter_texts=texts, chapter_revision=1 if texts else 0)
+                    # 要求/目录修订后保留旧确认；未变化的 basis 继续有效，变化的条目由 apply_ack 自动回到待确认。
+                    if previous:
+                        writing_visuals.inherit_chapters(project, previous, {k:k for k in texts})
+                        if project.get('material_conflicts'):
+                            store.restore_material_decisions(project, previous)
+                        if isinstance(previous.get('redline_review'), dict):
+                            project['redline_review'] = copy.deepcopy(previous['redline_review'])
+                        if isinstance(previous.get('redline_ai'), dict):
+                            project['redline_ai'] = copy.deepcopy(previous['redline_ai'])
                     for history in record.get('legacy_projects', []):
                         if history['id'] == record['_previous_project']:
                             history.update(migrated_chapters=len(texts),
@@ -599,6 +702,7 @@ def revise(store, key, body, kind):
     requirements = framework_review.expand_requirements(record['requirements'], record['sources'])
     plan = record['_plan']
     confirmed = record.get('requirements_confirmed', False)
+    outline_update = {}
     if kind == 'requirements':
         previous_requirements = requirements
         requirements = framework_review.validate_requirements(body.get('items'), record['sources'], requirements)
@@ -607,7 +711,9 @@ def revise(store, key, body, kind):
         confirmed = body['confirmed']
         framework_review.require_confirmation_acks(
             requirements, previous_requirements, record.get('notes', []), body)
-        if framework_review.compact_requirements(requirements) == record['requirements']:
+        pending = record.get('outline_mode') == 'pending'
+        compact_requirements = framework_review.compact_requirements(requirements)
+        if compact_requirements == record['requirements'] or pending:
             # Confirming the same content is a state transition, not a new edition.
             verified_original(store, record)
             if record.get('normalized_storage'):
@@ -622,17 +728,28 @@ def revise(store, key, body, kind):
                         raise ValueError('此项目已在其他窗口更新，本次未覆盖；请重新读取后核对')
                     latest.update(revision=record['revision'] + 1, requirements_confirmed=confirmed,
                                   updated_at=now())
+                    if pending:
+                        latest['requirements'] = compact_requirements
+                        for metric in latest['metrics']:
+                            metric['count'] = sum(row['category'] == metric['key'] for row in requirements)
                     save_record(store, latest)
                     store.db.commit()
                 except Exception:
                     store.db.rollback()
                     raise
             return public(latest)
-        plan = framework_review.bind_requirements(plan, requirements)
+        if plan.get('preserve_outline'):
+            from outline_workflow import bind_plan_requirements
+            plan = bind_plan_requirements(plan, requirements)
+        else:
+            plan = framework_review.bind_requirements(plan, requirements)
     elif kind == 'outline':
         if not confirmed:
             raise ValueError('请先确认招标要求，再修改响应目录')
-        plan = framework_review.edit_outline(plan, body.get('items'), requirements)
+        use_outline_sources = bool(record.get('outline_mode') or
+                                   any(field in body for field in ('docx', 'text', 'automatic')))
+        if not use_outline_sources:
+            plan = framework_review.edit_outline(plan, body.get('items'), requirements)
     else:
         raise ValueError('未知核对操作')
     plan = ensure_required_sections(plan)
@@ -640,12 +757,37 @@ def revise(store, key, body, kind):
     with tempfile.TemporaryDirectory(prefix='.revision-', dir=root) as temporary:
         work = Path(temporary)
         source = edition_source(store, record, work)
+        if kind == 'outline' and use_outline_sources:
+            from outline_workflow import prepare
+            plan, outline_update = prepare(record, source, body, requirements)
         out = work / 'deliverables'
         metadata, _, _ = build_edition(work, out, source, record['name'], key,
             saved_plan=plan, requirements=requirements, sources=record['sources'],
             source_notes=record.get('source_notes', []))
         next_revision = record['revision'] + 1
         target = root / ('revision-' + str(next_revision) + '-' + work.name.removeprefix('.revision-'))
+        if kind == 'outline' and 'docx' in body:
+            import outline_inputs
+            import writing_chat
+            from server import decode_upload
+            _, raw = decode_upload(body['docx'], 30 * 1024 * 1024)
+            positioned = outline_inputs.parse_docx(raw, include_positions=True)
+            protected = writing_chat.imported_sections(raw, positioned)
+            outline_update['_writing_technical'] = {}
+            if protected:
+                sections = [b for b in plan['blocks'] if b['kind'] == 'heading']
+                (out / 'custom-technical.docx').write_bytes(raw)
+                outline_update['_writing_technical'] = {
+                    'storage':str((target / 'custom-technical.docx').relative_to(store.root)),
+                    'sha256':hashlib.sha256(raw).hexdigest(),
+                    'sections':{sections[i]['bookmark']: value for i, value in protected.items()}}
+        elif kind == 'outline' and ('text' in body or 'automatic' in body):
+            outline_update['_writing_technical'] = {}
+        elif kind == 'outline' and record.get('_writing_technical'):
+            remaining = {b['bookmark'] for b in plan['blocks'] if b['kind'] == 'heading'}
+            original = record['_writing_technical']
+            retained = {key:value for key,value in original['sections'].items() if key in remaining}
+            outline_update['_writing_technical'] = {**original, 'sections':retained} if retained else {}
         cache_edition_source(source, root, work, out, target, metadata)
         published = False
         with store.lock:
@@ -658,6 +800,8 @@ def revise(store, key, body, kind):
                 published = True
                 revised_content = canonical_record(metadata)
                 changed = (record['_plan'] != revised_content['_plan']
+                           or ('_writing_technical' in outline_update and
+                               record.get('_writing_technical', {}) != outline_update['_writing_technical'])
                            or record['requirements'] != revised_content['requirements'])
                 # Confirmation can create a project while rendering runs without
                 # the store lock. Keep its latest pointers/history before publishing.
@@ -666,7 +810,10 @@ def revise(store, key, body, kind):
                         record[field] = copy.deepcopy(current_record[field])
                 pid = record['projects'].get('word')
                 record.update(metadata, revision=next_revision, requirements_confirmed=confirmed,
-                              updated_at=now())
+                              updated_at=now(), **outline_update)
+                for field in ('_auto_outline', '_outline_job', '_calibration'):
+                    if field in current_record:
+                        record[field] = current_record[field]
                 record['storage'].update({a['id']: str(Path(target.name) / a['name']) for a in metadata['artifacts']})
                 if pid and changed:
                     previous = store.require('project', pid)
@@ -683,6 +830,8 @@ def revise(store, key, body, kind):
                 if published:
                     shutil.rmtree(target)
                 raise
+    if outline_update.get('outline_mode') == 'custom':
+        store.outline_jobs.start(key, 'calibration', auto=True)
     return public(record)
 
 

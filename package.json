@@ -6,7 +6,8 @@
   "scripts": {
     "test:credit": "node --test tests/test_credit_capture.cjs",
     "test:workflow": "node tests/test_project_flow.cjs",
-    "test:contributions": "node tests/test_contribution_flow.cjs"
+    "test:contributions": "node tests/test_contribution_flow.cjs",
+    "test": "node --test --test-concurrency=2 --test-timeout=150000 tests/test_app_copy.cjs tests/test_authorization_sequence_ui.cjs tests/test_contribution_flow.cjs tests/test_contribution_ui.cjs tests/test_credit_capture.cjs tests/test_export_progress.cjs tests/test_framework_review_ui.cjs tests/test_material_navigation.cjs tests/test_new_project.cjs tests/test_original_authorization_ui.cjs tests/test_project_flow.cjs tests/test_project_refresh.cjs tests/test_response_books_ui.cjs tests/test_tender_chain.cjs tests/test_workflow_navigation.cjs tests/test_writing_flow_ui.cjs tests/test_writing_poll.cjs"
   },
   "dependencies": {
     "playwright": "1.62.1"

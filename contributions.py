@@ -309,6 +309,44 @@ class Contributions:
                 'library_case_count': sum(not case.get('archived') for case in self.store.all('library_case'))}
 
     # Case library ---------------------------------------------------------------------------
+    def save_project_case(self, project_id, proposal, parsed, upload_paths):
+        """Create a reusable package as part of the caller's upload transaction."""
+        from server import now, uid
+
+        metadata = parsed['files'][:len(upload_paths)]
+        file_hashes = [(item['name'], item['sha256']) for item in metadata]
+        for case in self.store.all('library_case'):
+            if (case.get('source_project_id') == project_id and not case.get('archived')
+                    and case['name'] == proposal['name']
+                    and [(item['name'], item['sha256']) for item in case['files']] == file_hashes):
+                return case['id'], None
+        case_id = uid('case')
+        target = self.store.path('case-library/' + case_id)
+        prefix_names = [item['name'] for item in metadata]
+        sources = [s for s in parsed['sources'] if any(s['file_name'] == name or s['file_name'].startswith(name + '/')
+                                                     for name in prefix_names)]
+        from writing_cases import readable_source
+        sources = [source for source in sources if readable_source(source)]
+        if not sources:
+            raise ValueError('上传的文件中没有可加入案例库的正文。')
+        try:
+            target.mkdir(parents=True)
+            files = []
+            for item, source in zip(metadata, upload_paths):
+                dest = target / (item['id'] + source.suffix)
+                shutil.copyfile(source, dest)
+                files.append({**item, 'storage': str(dest.relative_to(self.store.root))})
+            stamp = now()
+            self.store.put('library_case', {'id': case_id, **proposal, 'source_project_id': project_id,
+                'contributor': '', 'files': files, 'size': sum(item['size'] for item in files),
+                'summary': {'source_count': len(sources), 'char_count': sum(len(s['text']) for s in sources),
+                            'warnings': parsed['warnings'][:50]}, 'archived': False, 'revision': 1,
+                'created_at': stamp, 'updated_at': stamp})
+        except Exception:
+            shutil.rmtree(target, ignore_errors=True)
+            raise
+        return case_id, target
+
     def public_case(self, case, *, remote):
         value = copy.deepcopy(case)
         value['files'] = [{'id': item['id'], 'name': item['name'], 'size': item['size'],

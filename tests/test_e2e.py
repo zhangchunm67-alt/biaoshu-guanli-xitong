@@ -1,3 +1,4 @@
+import os
 """真实来源的端到端测试，所有写入均在独立临时目录中。"""
 import base64
 import io
@@ -20,6 +21,7 @@ APP = Path(__file__).resolve().parents[1]
 class FullWorkflow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="bid-e2e-")
+        self.addCleanup(self.tmp.cleanup)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             self.port = sock.getsockname()[1]
@@ -32,7 +34,9 @@ class FullWorkflow(unittest.TestCase):
              "--data-dir", self.tmp.name, "--seed"],
             cwd=APP, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-        for _ in range(200):
+        self.addCleanup(self.stop_process, self.proc)
+        deadline = time.monotonic() + float(os.environ.get("BID_TEST_STARTUP_TIMEOUT", "90"))
+        while time.monotonic() < deadline:
             try:
                 self.request("GET", "/api/bootstrap")
                 return
@@ -42,12 +46,16 @@ class FullWorkflow(unittest.TestCase):
                 time.sleep(.1)
         self.fail("本地服务未及时启动")
 
-    def tearDown(self):
-        if self.proc.poll() is None:
-            self.proc.terminate()
-        self.proc.wait(timeout=10)
-        self.proc.stderr.close()
-        self.tmp.cleanup()
+    @staticmethod
+    def stop_process(proc):
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        proc.stderr.close()
 
     def request(self, method, path, value=None, raw=False, origin=None):
         if value is not None and method in {'POST', 'PATCH'}:

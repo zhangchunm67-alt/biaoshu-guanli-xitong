@@ -49,7 +49,7 @@ class FinancialMigrationTests(unittest.TestCase):
         token = self.store.mapping_revision(project)
         with patch.object(self.store, 'scan_project_template', side_effect=AssertionError('No financial rows')):
             result = self.store.public_project(project)
-        expected = dict(before, common_locator_version=12)
+        expected = dict(before, common_locator_version=engine.COMMON_LOCATOR_VERSION)
         self.assertEqual(expected, self.store.require('project', project['id']))
         self.assertEqual(token, result['mapping_revision'])
         self.assertEqual('已确认', result['status'])
@@ -59,7 +59,7 @@ class FinancialMigrationTests(unittest.TestCase):
         before = copy.deepcopy(project)
         token = self.store.mapping_revision(project)
         result = self.store.public_project(project)
-        self.assertEqual(dict(before, common_locator_version=12), self.store.require('project', project['id']))
+        self.assertEqual(dict(before, common_locator_version=engine.COMMON_LOCATOR_VERSION), self.store.require('project', project['id']))
         self.assertEqual(token, result['mapping_revision'])
         self.assertTrue(all(row['confirmed'] for row in result['mappings']))
 
@@ -90,6 +90,33 @@ class FinancialMigrationTests(unittest.TestCase):
         persisted = self.store.require('project', project['id'])
         with patch.object(self.store, 'scan_project_template', side_effect=AssertionError('Migration repeated')):
             self.store.public_project(persisted)
+
+    def test_intermediate_versions_preserve_other_confirmations_and_upgrade_once(self):
+        for version in (12, 13, 14, 15):
+            with self.subTest(version=version):
+                project = self.project((2024,))
+                project.update(common_locator_version=version)
+                self.store.put('project', project)
+                self.store.db.commit()
+                before = next(row for row in project['mappings'] if row['category_id'] == 'company_profile')
+                result = self.store.public_project(project)
+                self.assertEqual(engine.COMMON_LOCATOR_VERSION, result['common_locator_version'])
+                self.assertEqual(before, next(row for row in result['mappings'] if row['id'] == before['id']))
+                saved = self.store.require('project', result['id'])
+                with patch.object(self.store, 'scan_project_template', side_effect=AssertionError('Migration repeated')):
+                    self.store.public_project(saved)
+                self.assertEqual(saved, self.store.require('project', result['id']))
+
+    def test_financial_confirmation_from_unmarked_current_version_requires_review(self):
+        project = self.project((2024,))
+        project['common_locator_version'] = engine.COMMON_LOCATOR_VERSION
+        project.pop('financial_review_migrated', None)
+        self.store.put('project', project)
+        self.store.db.commit()
+        result = self.store.public_project(project)
+        for row in result['mappings']:
+            self.assertEqual(row['category_id'] != 'audit_report', row['confirmed'])
+        self.assertEqual('待确认', result['status'])
 
     def test_archived_version_11_project_is_unchanged_even_by_direct_sync_calls(self):
         project = self.project((2024, 2025))

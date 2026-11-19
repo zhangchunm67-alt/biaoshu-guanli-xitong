@@ -39,7 +39,7 @@ const CREDIT_CATEGORY_IDS = new Set(['credit_dishonest','credit_tax_violation','
 const creditUi = {requesting:false,polling:false,timer:null,error:''};
 const isCreditCategory = id => CREDIT_CATEGORY_IDS.has(id);
 const navs = [{id:'dashboard',label:'工作台',icon:'grid'},{id:'materials',label:'材料库',icon:'folder'},{id:'projects',label:'标书项目',icon:'file'}];
-const specialState={industry:'',category:'',query:'',page:1,result:{items:[],total:0,counts:{}},cache:new Map()};
+const specialState={industry:'',category:'',review:'',query:'',page:1,result:{items:[],total:0,counts:{}},cache:new Map()};
 const projectUi={id:null,step:'common',pickers:{},navigation:null};
 const locationUi={mappingId:null,projectId:null,result:null,page:1,zoom:1,showMarkers:true,requestId:0};
 // Colleagues submit materials and cases; only the local entry reviews them into the library.
@@ -63,7 +63,7 @@ function textReviewed(){return !!state.project?.special_selection_confirmed&&(st
 function projectReviewed(){return commonReviewed()&&textReviewed();}
 function cacheProjectMaterials(){for(const m of state.project?.selected_special_materials||[])specialState.cache.set(m.id,m);}
 function resetProjectUi(){
-  projectUi.id=state.project.id;projectUi.pickers={};projectUi.navigation=null;cacheProjectMaterials();
+  projectUi.id=state.project.id;projectUi.pickers={};projectUi.navigation=null;projectUi.selected=new Set();cacheProjectMaterials();
   projectUi.step=!textReviewed()?'special':!commonReviewed()?'common':projectReviewed()?'export':'special';
 }
 function materialCompletionIssues(target='export'){
@@ -148,7 +148,7 @@ async function projectStep(step){
   if(step==='export'&&state.view==='dashboard'){await tenderFlow.setStep(5);return;}
   projectUi.navigation=null;projectUi.step=step;render();window.scrollTo({top:0});
 }
-async function loadSpecial(){const q=new URLSearchParams({industry_id:specialState.industry,category_id:specialState.category,q:specialState.query,page:specialState.page});specialState.result=await api('/api/materials?'+q);specialState.page=specialState.result.page;}
+async function loadSpecial(){const q=new URLSearchParams({industry_id:specialState.industry,category_id:specialState.category,q:specialState.query,review_status:specialState.review,page:specialState.page});specialState.result=await api('/api/materials?'+q);specialState.page=specialState.result.page;}
 let dialogReturnFocus = null;
 let drawerReturnFocus = null;
 
@@ -163,7 +163,7 @@ async function refreshData({refreshProject=true}={}) {
   state.data = await api('/api/bootstrap');
   const auditCategory = state.data.categories.find(c=>c.id==='audit_report');
   if(auditCategory?.name==='2023-2024年财务审计报告')auditCategory.name='近三年财务审计报告';
-  if(!state.data.industries.some(i=>i.id===specialState.industry))specialState.industry=state.data.industries[0]?.id||'';
+  if(specialState.industry&&!state.data.industries.some(i=>i.id===specialState.industry))specialState.industry='';
   if(state.view==='industries')await loadSpecial();
   if(state.view==='submissions')await loadSubmissions();
   if(state.view==='cases')await loadCaseLibrary();
@@ -195,7 +195,8 @@ function renderCreditLive() {
     const link=safeExternalUrl(source.url);
     return `<article class="credit-source"><div class="credit-source-title"><h3>${esc(source.name||'官方查询来源')}</h3></div>${link?`<a class="credit-source-link" href="${esc(link)}" target="_blank" rel="noopener noreferrer">官方查询入口 ↗</a>`:''}</article>`;
   }).join('');
-  return `<div class="credit-sources">${sourceCards}</div>`;
+  return `<div class="credit-sources">${sourceCards}</div>${creditSourceList().filter(s=>s.reason).map(s=>`<p class="small">${esc(s.name)} · ${esc(s.reason)}</p>`).join('')}${creditUi.error?`<p role="alert">${esc(creditUi.error)}</p>`:''}
+    ${isRemote()?'':button(creditIsRunning()?'正在检测…':'检测全自动条件','credit-check',{disabled:creditIsRunning()})}`;
 }
 function updateCreditCard() {
   if(state.view!=='materials'||state.project)return;
@@ -280,14 +281,16 @@ function button(label, action, opts = {}) {
 }
 function render() {
   if (!state.data) return;
-  const nav = navs.find(n => n.id === (MATERIAL_VIEWS.includes(state.view)?'materials':state.view)) || navs[0];
+  const calibrationActive=state.view==='calibration'||(state.view==='dashboard'&&tenderFlow.calibrationState().active);
+  const nav = navs.find(n => n.id === (calibrationActive?'projects':MATERIAL_VIEWS.includes(state.view)?'materials':state.view)) || navs[0];
   const pendingSubmissions=Number(state.data.stats?.pending_submission_count||0);
-  $('#app').innerHTML = `<div class="app-shell"><button type="button" class="mobile-shade" data-action="toggle-nav" aria-label="关闭导航"></button><aside class="sidebar" aria-label="主导航"><a class="brand" href="#" data-action="navigate" data-view="dashboard"><span class="brand-mark">${icon('layers')}</span><span><span class="brand-title">腾宝 · 标书管理</span></span></a><nav class="nav-items">${navs.map(n=>{const active=n.id===state.view||(n.id==='materials'&&MATERIAL_VIEWS.includes(state.view));return `<button type="button" class="nav-button ${active?'active':''}" data-action="navigate" data-view="${n.id}" ${active?'aria-current="page"':''}>${icon(n.icon)}${n.label}${n.id==='projects'?`<span class="nav-count" style="margin-left:auto">${state.data.projects.length}</span>`:''}</button>${n.id==='materials'&&active?`<div class="material-subnav" aria-label="材料库分类">${[['materials','图片材料'],['industries','文字材料'],['cases','案例库'],['submissions','投稿入库']].map(([id,label])=>`<button type="button" class="nav-button ${state.view===id?'active':''}" data-action="navigate" data-view="${id}" ${state.view===id?'aria-current="page"':''}>${label}${id==='submissions'&&pendingSubmissions?`<span class="nav-count" style="margin-left:auto">${pendingSubmissions}<span class="sr-only"> 份待审核</span></span>`:''}</button>`).join('')}</div>`:''}`;}).join('')}</nav><div class="sidebar-bottom"><div class="sidebar-footnote">文件保存在本机；使用 AI 时，相关文本会发送至所配置的模型服务。</div></div></aside><div class="main-shell"><header class="topbar"><button type="button" class="icon-button mobile-menu" data-action="toggle-nav" aria-label="打开导航">${icon('menu')}</button><div class="breadcrumb"><strong>${nav.label}</strong>${state.project&&state.view==='projects'?`${icon('chevron')}<span>项目核对</span>`:''}</div><div class="topbar-right">${button('新建项目','new-framework',{primary:true,icon:'plus'})}<span class="avatar" aria-label="腾宝">腾</span></div></header>${remoteBanner()}<main id="main-content" class="main-content" tabindex="-1">${renderView()}</main></div></div>`;
+  $('#app').innerHTML = `<div class="app-shell"><button type="button" class="mobile-shade" data-action="toggle-nav" aria-label="关闭导航"></button><aside class="sidebar" aria-label="主导航"><a class="brand" href="#" data-action="navigate" data-view="dashboard"><span class="brand-mark">${icon('layers')}</span><span><span class="brand-title">腾宝 · 标书管理</span></span></a><nav class="nav-items">${navs.map(n=>{const active=(!calibrationActive&&n.id===state.view)||(n.id==='materials'&&MATERIAL_VIEWS.includes(state.view));return `<button type="button" class="nav-button ${active?'active':''}" data-action="navigate" data-view="${n.id}" ${active?'aria-current="page"':''}>${icon(n.icon)}${n.label}${n.id==='projects'?`<span class="nav-count" style="margin-left:auto">${state.data.projects.length}</span>`:''}</button>${n.id==='projects'?`<div class="material-subnav" aria-label="标书项目工具"><button type="button" class="nav-button ${calibrationActive?'active':''}" data-action="workflow-calibration" ${calibrationActive?'aria-current="page"':''}>${icon('refresh')}校准</button></div>`:''}${n.id==='materials'&&active?`<div class="material-subnav" aria-label="材料库分类">${[['materials','图片材料'],['industries','文字材料'],['cases','案例库'],['submissions','投稿入库']].map(([id,label])=>`<button type="button" class="nav-button ${state.view===id?'active':''}" data-action="navigate" data-view="${id}" ${state.view===id?'aria-current="page"':''}>${label}${id==='submissions'&&pendingSubmissions?`<span class="nav-count" style="margin-left:auto">${pendingSubmissions}<span class="sr-only"> 份待审核</span></span>`:''}</button>`).join('')}</div>`:''}`;}).join('')}</nav><div class="sidebar-bottom">${state.data.portal?`<a class="nav-button portal-link" href="${esc(state.data.portal.href)}">${icon('back')}返回商机系统</a>`:''}<div class="sidebar-footnote">${state.data.portal?'文件保存在公司 NAS':'文件保存在本机'}；使用 AI 时，相关文本会发送至所配置的模型服务。</div></div></aside><div class="main-shell"><header class="topbar"><button type="button" class="icon-button mobile-menu" data-action="toggle-nav" aria-label="打开导航">${icon('menu')}</button><div class="breadcrumb"><strong>${nav.label}</strong>${calibrationActive?`${icon('chevron')}<span>校准</span>`:''}${state.project&&state.view==='projects'?`${icon('chevron')}<span>项目核对</span>`:''}</div><div class="topbar-right">${button('新建项目','new-framework',{primary:true,icon:'plus'})}<span class="avatar" aria-label="腾宝">腾</span></div></header>${remoteBanner()}<main id="main-content" class="main-content" tabindex="-1">${renderView()}</main></div></div>`;
   $('#app').inert=state.busy;
   updateCreditCard();syncCreditPolling();observeInlineLocations();
 }
 function renderView() {
   if(state.view==='dashboard')return renderDashboard();
+  if(state.view==='calibration')return `${heading('目录校准')}<section class="panel wf-card">${tenderFlow.calibrationProjects()}</section>`;
   if (state.project) return renderProject();
   return ({materials:renderMaterials,industries:renderIndustries,projects:renderProjects,cases:renderCaseLibrary,submissions:renderSubmissions}[state.view] || renderDashboard)();
 }
@@ -317,15 +320,20 @@ function renderMaterialsLibrary() {
   const modeCounts={all:inCategory.length,image:inCategory.filter(m=>!isText(m)).length,text:inCategory.filter(isText).length};
   const modeTabs=modeCounts.text&&modeCounts.image?`<div class="mode-tabs" role="group" aria-label="按材料类型筛选">${[['all','全部'],['image','图片材料'],['text','文字材料']].map(([id,label])=>`<button type="button" class="mode-tab ${state.materialMode===id?'active':''}" data-action="filter-mode" data-id="${id}" ${state.materialMode===id?'aria-pressed="true"':'aria-pressed="false"'}>${label} ${modeCounts[id]}</button>`).join('')}</div>`:'';
   const rows = inCategory.filter(m=>(state.materialMode==='all'||!modeCounts.text||!modeCounts.image||(state.materialMode==='text')===isText(m))&&(!query||[m.name,m.subject,m.version,categoryName(m.category_id),(m.years||[]).join(' ')].join(' ').toLocaleLowerCase().includes(query)));
-  return `<div class="filter-tabs" aria-label="按栏目筛选"><button type="button" class="filter-tab ${state.category==='all'?'active':''}" data-action="filter-category" data-id="all">全部材料 <span>${state.data.materials.length}</span></button>${cats.map(c=>`<button type="button" class="filter-tab ${state.category===c.id?'active':''}" data-action="filter-category" data-id="${esc(c.id)}">${esc(c.name)}${!c.enabled?'（停用）':''}<span>${state.data.materials.filter(m=>m.category_id===c.id).length}</span></button>`).join('')}</div>
+  return `${isRemote()?'':`<details class="panel"><summary>栏目设置</summary><div class="panel-body actions">${button('新增栏目','new-category',{small:true})}${button('新增行业','new-industry',{small:true})}
+    ${cats.filter(c=>!isCreditCategory(c.id)).map(c=>`<div><label><input type="checkbox" data-category-toggle="${esc(c.id)}" ${c.enabled?'checked':''}> ${esc(c.name)}</label> ${button('编辑','edit-category',{small:true,id:c.id})}</div>`).join('')}</div></details>`}
+  <div class="filter-tabs" aria-label="按栏目筛选"><button type="button" class="filter-tab ${state.category==='all'?'active':''}" data-action="filter-category" data-id="all">全部材料 <span>${state.data.materials.length}</span></button>${cats.map(c=>`<button type="button" class="filter-tab ${state.category===c.id?'active':''}" data-action="filter-category" data-id="${esc(c.id)}">${esc(c.name)}${!c.enabled?'（停用）':''}<span>${state.data.materials.filter(m=>m.category_id===c.id).length}</span></button>`).join('')}</div>
   <div class="toolbar"><div class="search-box">${icon('search')}<input id="material-search" class="input" type="search" placeholder="搜索材料名称、主体或年度" aria-label="搜索图片材料" value="${esc(state.query)}"></div>${modeTabs}<span class="muted small">共 ${rows.length} 份材料</span></div>
   <section class="panel">${rows.length?`<div class="table-wrap material-table-wrap"><table class="data-table material-table"><thead><tr><th>材料名称 / 所属栏目 / 类型</th><th>所属主体</th><th>年度 / 版本</th><th>有效期</th><th>操作</th></tr></thead><tbody>${rows.map(m=>`<tr><td><div class="name-cell"><span class="file-icon">${icon(m.mode==='text'?'file':'image')}</span><div><button type="button" class="text-button table-title" data-action="open-material" data-id="${esc(m.id)}">${esc(m.name)}</button><div class="table-subtitle">${esc(categoryName(m.category_id))} · ${m.mode==='text'?'文字':'图片'}</div></div></div></td><td>${esc(m.subject || '待补充')}</td><td>${(m.years||[]).length?esc(m.years.join('、')):'—'}<div class="table-subtitle">${esc(m.version || '—')}</div></td><td>${validityBadge(m.valid_until)}</td><td><button type="button" class="text-button" data-action="open-material" data-id="${esc(m.id)}">查看材料</button></td></tr>`).join('')}</tbody></table></div>`:emptyState(query?'没有找到符合条件的材料':isCreditCategory(state.category)?'此栏目等待全自动验证归档':'此栏目尚未添加材料',query?'试试其他名称、主体或年度。':isCreditCategory(state.category)?'仅在三项官方查询全部验证完成后自动生成材料；当前不提供手工接力。':'',query||isCreditCategory(state.category)?'':addMaterialButton('添加材料',state.category!=='all'?state.category:undefined))}</section>
   `;
 }
 function renderIndustries() {
   const ss=specialState,r=ss.result,cats=state.data.categories.filter(c=>c.layer==='special'),rows=r.items;
-  return `${heading('文字材料','',addMaterialButton('新增文字材料',isRemote()?undefined:cats[0]?.id,{primary:true,disabled:!cats.length}))}
-  <div class="toolbar special-toolbar"><div class="search-box">${icon('search')}<input class="input" id="special-search" type="search" aria-label="搜索文字材料" placeholder="搜索模板名称或内容说明" value="${esc(ss.query)}"></div></div>
+  return `${heading('文字材料','',addMaterialButton('新增文字材料',isRemote()?undefined:ss.category||cats.find(c=>!ss.industry||c.industry_id===ss.industry)?.id,{primary:true,disabled:!cats.length}))}
+  <div class="toolbar special-toolbar">
+  <label>行业<select id="special-industry"><option value="">全部行业</option>${state.data.industries.map(i=>`<option value="${esc(i.id)}" ${i.id===ss.industry?'selected':''}>${esc(i.name)}</option>`).join('')}</select></label>
+  <label>栏目<select id="special-category"><option value="">全部栏目</option>${cats.filter(c=>!ss.industry||c.industry_id===ss.industry).map(c=>`<option value="${esc(c.id)}" ${c.id===ss.category?'selected':''}>${esc(c.name)}</option>`).join('')}</select></label>
+  <label>核对状态<select id="special-review"><option value="">全部状态</option>${[['pending','待核对'],['checked','已核对'],['reference','仅参考']].map(([id,name])=>`<option value="${id}" ${id===ss.review?'selected':''}>${name}</option>`).join('')}</select></label><div class="search-box">${icon('search')}<input class="input" id="special-search" type="search" aria-label="搜索文字材料" placeholder="搜索模板名称或内容说明" value="${esc(ss.query)}"></div></div>
   <section class="panel">${rows.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>模板名称</th><th>所属主体</th><th>版本</th><th>操作</th></tr></thead><tbody>${rows.map(m=>`<tr><td><button class="text-button table-title" data-action="open-material" data-id="${esc(m.id)}">${esc(m.name)}</button></td><td>${esc(m.subject)}</td><td>${esc(m.version||'—')}</td><td>${button('查看','open-material',{small:true,id:m.id})}</td></tr>`).join('')}</tbody></table></div>`:emptyState('暂无文字材料','添加投标函、授权书等模板')}
   <div class="panel-body actions">${button('上一页','special-prev',{small:true,disabled:ss.page<=1})}<span>第 ${ss.page} / ${Math.max(1,Math.ceil(r.total/(r.page_size||25)))} 页 · 共 ${r.total} 份</span>${button('下一页','special-next',{small:true,disabled:ss.page*(r.page_size||25)>=r.total})}</div></section>`;
 }
@@ -366,19 +374,27 @@ function renderProjects() {
 function renderProject(insideWorkflow=false) {
   if(projectUi.id!==state.project.id)resetProjectUi();
   const p=state.project, all=p.mappings||[], step=projectUi.step;
-  const maps=projectRows(step==='special'?'special':'common'),ready=maps.filter(m=>m.status==='ready').length,missing=maps.filter(m=>['missing','blocked'].includes(m.status)).length,confirmed=maps.filter(m=>m.confirmed).length;
+  const maps=projectRows(step==='special'?'special':'common');
+  const ready=maps.filter(m=>m.status==='ready').length;
+  const missing=maps.filter(m=>m.status==='missing').length;
+  const blocked=maps.filter(m=>m.status==='blocked').length;
+  const skipped=maps.filter(m=>m.status==='skipped').length;
   const allConfirmed=projectReviewed(),reviewing=['common','special'].includes(step);
+  const canAdvance=step==='special'?textReviewed():commonReviewed();
+  const done=maps.length-blocked;
+  const nextStatus=p.material_conflicts&&maps.length?`<span>已处理 <strong>${done}</strong> / ${maps.length}</span><progress aria-label="材料处理进度" max="${maps.length}" value="${done}"></progress>`:'';
+  const reviewStatus=state.dirty?'<span>保存核对后更新进度</span>':`<span><strong>${ready}</strong>项就绪</span><span><strong>${skipped}</strong>项跳过或保留</span><span><strong>${missing}</strong>项待补</span><span><strong>${blocked}</strong>项需处理</span>${nextStatus}`;
   const stages=[['upload','上传标书',true,false],['special','核对文字材料',textReviewed(),true],['common','核对图片材料',commonReviewed(),textReviewed()],['export','导出标书',false,allConfirmed]];
-  return `${insideWorkflow?'':`<button type="button" class="back-link" data-action="navigate" data-view="projects">${icon('back')}返回项目列表</button><div class="project-header">${heading(p.name,'',button('重新扫描','rescan',{icon:'refresh'})+(reviewing?button('保存核对','save-project',{primary:true,icon:'check',disabled:state.busy}):''), '')}<div class="project-facts"><span>${icon('file')}${esc(p.template_name)}</span></div></div>
+  return `${insideWorkflow?'':`<button type="button" class="back-link" data-action="navigate" data-view="projects">${icon('back')}返回项目列表</button><div class="project-header">${heading(p.name,'',button('重新扫描','rescan',{icon:'refresh'}), '')}<div class="project-facts"><span>${icon('file')}${esc(p.template_name)}</span></div></div>
   <nav class="stepper project-stepper" aria-label="标书制作步骤">${stages.map(([id,label,done,enabled],i)=>`<button type="button" class="step ${done?'done':''} ${step===id?'active':''}" data-action="project-step" data-id="${id}" aria-label="${esc(label)}，${id==='upload'?'已上传':done?'已完成':step===id?'当前步骤':'待完成'}" ${id==='upload'||state.busy?'disabled':''} ${step===id?'aria-current="step"':''}><span class="step-number">${done?icon('check'):String(i+1).padStart(2,'0')}</span><span><strong>${label}</strong></span></button>`).join('')}</nav>`}
   ${reviewing?`<div class="panel-heading review-stage-heading"><h2>${step==='common'?'核对图片材料':'核对文字材料'}</h2></div>
-  <div class="mapping-toolbar"><div class="mapping-summary"><span><strong>${maps.length}</strong>个匹配项</span><span><strong>${ready}</strong>项就绪</span><span><strong>${missing}</strong>项待处理</span></div><div class="actions">${insideWorkflow?button('保存核对','save-project',{primary:true,disabled:state.busy}):''}</div></div>
+  <div class="mapping-toolbar"><div class="mapping-summary"><span><strong>${maps.length}</strong>个匹配项</span>${reviewStatus}</div>${p.material_conflicts?button('批量跳过所选','batch-skip-mappings',{small:true,disabled:!projectUi.selected?.size}):''}</div>
 
   ${renderMaterialCompletionNotice()}
   <div class="mapping-list">${maps.length?maps.map((m,i)=>renderMapping(m,i,p.headings||[])).join(''):`<section class="panel panel-body">暂无待核对的${step==='common'?'图片':'文字'}材料，可继续下一步。</section>`}</div>
   ${state.dirty?`<div class="sticky-save"><div><p>有未保存修改，请先保存</p></div>${button('保存核对','save-project',{primary:true,icon:'check',disabled:state.busy})}</div>`:''}
-  <div class="project-next">${step==='common'?button('上一步：核对文字材料','project-step',{id:'special'}):''}<span class="muted ${!state.dirty&&!rowsReviewed(maps)?'project-blocked-hint':'small'}">${!state.dirty&&!rowsReviewed(maps)?'请处理材料或位置问题后继续':''}</span>${button(step==='special'?'下一步：核对图片材料':insideWorkflow?'下一步：编写投标文件':'下一步：导出标书','project-step',{id:step==='special'?'common':'export',primary:true,icon:'chevron',disabled:state.busy})}</div>`:''}
-  ${step==='export'?`<section class="panel export-panel"><div class="panel-heading"><h2>导出标书</h2><span class="count-label">共 ${all.length} 项</span></div><div class="export-controls"><div><h3>${allConfirmed?'材料匹配可导出':'请先处理材料匹配问题'}</h3><p>图片材料 ${projectRows('common').length} 项 · 文字材料 ${projectRows('special').length} 项 · 导出初稿</p></div><div class="actions">${button('导出','export-project',{primary:true,icon:'download',disabled:!allConfirmed||state.dirty})}</div></div><div class="note-bar" style="margin:0 20px 20px">${icon('info')}<span>导出后请在 Word 中更新目录，复核项目名称、日期、待补项、报价、签章及页码。</span></div></section>${renderExports(p.exports||[])}`:''}`;
+  <div class="project-next">${step==='common'?button('上一步：核对文字材料','project-step',{id:'special'}):'<span></span>'}<span class="muted ${!canAdvance?'project-blocked-hint':'small'}">${state.dirty?'有未保存修改，请先保存核对':!rowsReviewed(maps)?'请处理材料或位置问题后继续':!canAdvance?'请先点击“保存核对”后再继续':''}</span><div class="project-next-actions">${button('保存核对','save-project',{icon:'check',disabled:state.busy})}${insideWorkflow&&step==='common'?button('导出半成品标书','export-project',{icon:'download',disabled:!allConfirmed||state.dirty}):''}${button(step==='special'?'下一步：核对图片材料':insideWorkflow?'下一步：编写投标文件':'下一步：导出标书','project-step',{id:step==='special'?'common':'export',primary:canAdvance,icon:'chevron',disabled:state.busy})}</div></div>${insideWorkflow&&step==='common'?'<p class="wf-help wf-draft-export-help">材料核对完成后，可直接导出半成品标书，不必先进入“编写投标文件”。</p>':''}`:''}
+  ${step==='export'?`<section class="panel export-panel"><div class="panel-heading"><h2>导出标书</h2><span class="count-label">共 ${all.length} 项</span></div><div class="export-controls"><div><h3>${allConfirmed?'材料匹配可导出':'请先处理材料匹配问题'}</h3><p>图片材料 ${projectRows('common').length} 项 · 文字材料 ${projectRows('special').length} 项 · 导出初稿</p></div><div class="actions">${button('导出','export-project',{primary:true,icon:'download',disabled:!allConfirmed||state.dirty})}</div></div><div class="note-bar" style="margin:0 20px 20px">${icon('info')}<span>导出后请在 Word 中更新目录，复核项目名称、日期、待补项、报价、签章及页码。</span></div>${insideWorkflow?`<div class="project-next">${button('上一步：核对图片材料','project-step',{id:'common'})}</div>`:''}</section>${renderExports(p.exports||[])}`:''}`;
 }
 function renderMaterialPicker(m){
   const special=isSpecial(m.category_id),picker=projectUi.pickers[m.category_id],selected=m.material_ids||[];
@@ -394,7 +410,8 @@ function renderLocationRecognition(m) {
   else if(match.status==='manual')location='<div class="location-recognition">人工指定</div>';
   else if(match.reason&&match.status!=='matched')location=`<div class="location-recognition">${esc(match.reason)}${match.status==='ambiguous'?'；下拉选项中已标出候选位置。':''}</div>`;
   const years=requirement.year_options?.length?`<div>可接受年度：${esc(requirement.year_options.map(x=>x.join('、')).join(' 或 '))}</div>`:'';
-  return location+(requirement.status&&years?`<div class="mapping-hint">${years}</div>`:'');
+  const bank=requirement.bank_credit_months?`<div>也可提交开标日前 ${esc(requirement.bank_credit_months)} 个月内开具的银行资信证明。</div>`:'';
+  return location+(years||bank?`<div class="mapping-hint">${years}${bank}</div>`:'');
 }
 function renderLocationDescription(description,className='') {
   if(!description||description==='当前选择跳过，不填入材料；导出初稿时会在此位置之后添加跳过说明。')return '';
@@ -402,6 +419,19 @@ function renderLocationDescription(description,className='') {
 }
 function isPreservedTemplateMapping(mapping) {
   return mapping.category_id==='text_template'&&mapping.preserve_original===true;
+}
+function materialState(m) {
+  if(!state.project?.material_conflicts)return '';
+  if(m.status==='blocked')return '需处理';
+  if(m.status==='missing')return '待补材料';
+  if(m.status==='skipped'||m.action==='skip')return m.retains_content?'已保留原内容':'已跳过';
+  return m.confirmed?'已完成':'就绪';
+}
+function conflictControls(m) {
+  if(!m.conflict_review||m.action!=='fill'||!(m.content_conflict||m.existing_content))return '';
+  const options=[['','请选择，默认不追加'],['keep','保留原内容'],['append','追加'],
+    ...(m.replaceable_content?[['replace','替换已定位内容']]:[])];
+  return `<label class="field-label">重复材料处理<select data-map-field="existing_handling" data-map-id="${esc(m.id)}">${options.map(([value,label])=>`<option value="${value}" ${(m.existing_handling||'')===value?'selected':''}>${label}</option>`).join('')}</select></label>`;
 }
 function renderMapping(m,index,headings) {
   const attention=projectUi.navigation?.issues[projectUi.navigation.activeIndex]?.mappingId===m.id?' mapping-needs-attention':'';
@@ -419,14 +449,16 @@ function renderMapping(m,index,headings) {
     '仅作为身份证附件；原证明/授权正文、人员、日期和签章须单独核对。'];
   const warnings=(m.warnings||[]).filter(w=>!authorizationHint||typeof w!=='string'||
     !genericAttachmentWarnings.some(note=>w===note||w.endsWith('：'+note)));
-  const title=esc(m.category_id === 'authorization' ? '授权人及代理人身份证' : (m.category_id==='audit_report' ? '近三年财务审计报告' : (m.category_id==='text_template' ? m.title : (m.category_name || m.title || categoryName(m.category_id)))));
-  const main=`<div class="mapping-main"><div><label class="field-label" for="locator-${esc(m.id)}">模板插入位置</label><select id="locator-${esc(m.id)}" data-map-field="locator_id" data-map-id="${esc(m.id)}"><option value="">请选择模板位置</option>${headings.map(h=>`<option value="${esc(h.id)}" ${h.id===m.locator_id?'selected':''}>${esc(h.title || h.preview || '未命名段落')}${h.kind==='placeholder'?' · 占位符':''}${m.location_match?.status==='ambiguous'&&m.location_match.candidates?.some(c=>c.locator_id===h.id)?' · 候选位置':''}</option>`).join('')}</select><div class="inline-location-preview" data-location-mapping="${esc(m.id)}" aria-live="polite"><p class="muted small">正在加载插入位置预览…</p></div><div class="location-preview-entry">${button('放大查看','preview-location',{small:true,icon:'file',id:m.id})}</div>${renderLocationRecognition(m)}${m.required_years?.length?`<div class="mapping-hint">要求年度：${esc(m.required_years.join('、'))}</div>`:''}</div><div><span class="field-label" id="materials-label-${esc(m.id)}">匹配材料${selected.length?` · 已选 ${selected.length} 份`:''}</span>${renderMaterialPicker(m)}<button type="button" class="text-button small" data-action="${isSpecial(m.category_id)?'new-material':'project-materials'}" data-category="${esc(m.category_id)}" style="margin-top:7px">${isSpecial(m.category_id)?'新增此分类材料':'管理此栏目材料'} →</button></div><div class="mapping-processing"><div><label class="field-label" for="action-${esc(m.id)}">处理方式</label><select id="action-${esc(m.id)}" data-map-field="action" data-map-id="${esc(m.id)}"><option value="fill" ${action==='fill'?'selected':''}>填入已选材料</option><option value="missing" ${action==='missing'?'selected':''}>保留为缺项</option><option value="skip" ${action==='skip'?'selected':''}>${preservesForm?'保留采购原表，不另填模板':'本项目跳过'}</option></select>${action==='skip'&&!preservesForm?'<p class="muted small">跳过不视为材料齐全。</p>':''}${authorizationHint?`<p class="muted small">${authorizationHint}</p>`:''}</div><div style="margin-top:10px"><label class="field-label" for="note-${esc(m.id)}">核对备注</label><textarea rows="2" id="note-${esc(m.id)}" placeholder="记录缺项原因或使用说明" data-map-field="note" data-map-id="${esc(m.id)}">${esc(m.note)}</textarea></div></div></div>${renderMappingPreview(m)}`;
+  const title=esc(m.category_id==='authorization'?'授权人及代理人身份证':m.category_id==='audit_report'
+    ?(m.requirement?.bank_credit_months?'财务审计报告或银行资信证明':'财务审计报告')
+    :m.category_id==='text_template'?m.title:(m.category_name||m.title||categoryName(m.category_id)));
+  const main=`<div class="mapping-main"><div><label class="field-label" for="locator-${esc(m.id)}">模板插入位置</label><select id="locator-${esc(m.id)}" data-map-field="locator_id" data-map-id="${esc(m.id)}"><option value="">请选择模板位置</option>${headings.map(h=>`<option value="${esc(h.id)}" ${h.id===m.locator_id?'selected':''}>${esc(h.chapter_path && !h.chapter_path.endsWith(h.title) ? h.chapter_path+' / '+h.title : h.chapter_path || h.title || h.preview || '未命名段落')}${h.kind==='placeholder'?' · 占位符':''}${m.location_match?.status==='ambiguous'&&m.location_match.candidates?.some(c=>c.locator_id===h.id)?' · 候选位置':''}</option>`).join('')}</select><div class="inline-location-preview" data-location-mapping="${esc(m.id)}" aria-live="polite"><p class="muted small">正在加载插入位置预览…</p></div><div class="location-preview-entry">${button('放大查看','preview-location',{small:true,icon:'file',id:m.id})}</div>${renderLocationRecognition(m)}${m.required_years?.length?`<div class="mapping-hint">要求年度：${esc(m.required_years.join('、'))}</div>`:''}</div><div><span class="field-label" id="materials-label-${esc(m.id)}">匹配材料${selected.length?` · 已选 ${selected.length} 份`:''}</span>${renderMaterialPicker(m)}<button type="button" class="text-button small" data-action="${isSpecial(m.category_id)?'new-material':'project-materials'}" data-category="${esc(m.category_id)}" style="margin-top:7px">${isSpecial(m.category_id)?'新增此分类材料':'管理此栏目材料'} →</button></div><div class="mapping-processing"><div><label class="field-label" for="action-${esc(m.id)}">处理方式</label><select id="action-${esc(m.id)}" data-map-field="action" data-map-id="${esc(m.id)}"><option value="fill" ${action==='fill'?'selected':''}>填入已选材料</option><option value="missing" ${action==='missing'?'selected':''}>保留为缺项</option><option value="skip" ${action==='skip'?'selected':''}>${preservesForm?'保留采购原表，不另填模板':'本项目跳过'}</option></select>${action==='skip'&&!preservesForm?'<p class="muted small">跳过不视为材料齐全。</p>':''}${authorizationHint?`<p class="muted small">${authorizationHint}</p>`:''}</div><div style="margin-top:10px"><label class="field-label" for="note-${esc(m.id)}">核对备注</label><textarea rows="2" id="note-${esc(m.id)}" placeholder="记录缺项原因或使用说明" data-map-field="note" data-map-id="${esc(m.id)}">${esc(m.note)}</textarea></div></div></div>${renderMappingPreview(m)}`;
   const bottomHtml=`<div class="mapping-bottom"><div>${m.issues?.length?`<ul class="issue-list">${m.issues.map(issue=>`<li>${esc(typeof issue==='string'?issue:JSON.stringify(issue))}</li>`).join('')}</ul>`:''}${warnings.length?`<div class="mapping-advisories"><span>材料核对提示</span><ul>${warnings.map(w=>`<li>${esc(typeof w==='string'?w:JSON.stringify(w))}</li>`).join('')}</ul></div>`:''}</div></div>`;
   if(!isSpecial(m.category_id)&&!m.locator_id&&m.location_match?.status==='not_found'&&m.status!=='blocked'&&!selected.length){
     // 模板没有此附件位置：只给一句结论，手动指定位置的控件折叠起来，避免“缺材料/选位置/不插入”三条提示互相矛盾。
     return `<article class="mapping-card mapping-card-collapsed${attention}" data-mapping="${esc(m.id)}" tabindex="-1"><div class="mapping-top"><div class="mapping-name"><span class="mapping-index">${String(index+1).padStart(2,'0')}</span><h3>${title}</h3></div><div class="actions">${statusBadge('skipped','无需插入')}</div></div><div class="panel-body"><p class="mapping-conclusion">本项目模板未标注此附件位置，无需附${title}图片。</p>${m.location_match.reason?`<p class="muted small">${esc(m.location_match.reason)}</p>`:''}<details class="mapping-manual"><summary>采购文件确实要求附此材料？手动选择插入位置</summary>${main}</details></div></article>`;
   }
-  return `<article class="mapping-card${attention}" data-mapping="${esc(m.id)}" tabindex="-1"><div class="mapping-top"><div class="mapping-name"><span class="mapping-index">${String(index+1).padStart(2,'0')}</span><h3>${title}</h3></div><div class="actions">${statusBadge(m.status,m.preserve_original?'已保留原表':'')}</div></div>${main}${bottomHtml}</article>`;
+  return `<article class="mapping-card${attention}" data-mapping="${esc(m.id)}" tabindex="-1"><div class="mapping-top"><div class="mapping-name">${m.conflict_review?`<input type="checkbox" data-map-select="${esc(m.id)}" aria-label="选择 ${title}" ${projectUi.selected?.has(m.id)?'checked':''}>`:`<span class="mapping-index">${String(index+1).padStart(2,'0')}</span>`}<h3>${title}</h3></div><div class="actions">${statusBadge(m.status,m.preserve_original?'已保留原表':materialState(m))}${m.conflict_review&&m.action==='skip'?button('恢复核对','resume-mapping',{id:m.id,small:true}):''}</div></div>${conflictControls(m)?`<div class="panel-body mapping-conflict">${conflictControls(m)}</div>`:''}${main}${bottomHtml}</article>`;
 }
 const inlineLocationCache=new Map();
 let inlineLocationObserver;
@@ -529,7 +561,7 @@ function renderMappingPreview(mapping) {
   }).join('')}</div>`;
 }
 function renderExports(exports) {
-  return `<section class="panel export-panel"><div class="panel-heading"><h2>导出历史</h2><span class="count-label">${exports.length} 份记录</span></div>${exports.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>导出文件</th><th>类型</th><th>结果</th><th>导出时间</th><th>下载</th></tr></thead><tbody>${exports.map(e=>`<tr><td class="table-title">${esc(e.filename)}</td><td>${statusBadge(e.mode,e.mode==='reviewed'?'核对版':'初稿')}</td><td class="muted">填入 ${e.filled_count||0} · 缺项 ${e.missing_count||0} · 跳过 ${e.skipped_count||0}</td><td class="muted">${date(e.created_at,true)}</td><td><a href="${esc(e.download_url || `/api/exports/${encodeURIComponent(e.id)}/download`)}" download>Word 文件</a> <span class="muted"> / </span> <a href="${esc(e.report_url || `/api/exports/${encodeURIComponent(e.id)}/report`)}" download>核对报告</a></td></tr>`).join('')}</tbody></table></div>`:emptyState('暂无导出记录','','',true,'download')}</section>`;
+  return `<section class="panel export-panel"><div class="panel-heading"><h2>导出历史</h2><span class="count-label">${exports.length} 份记录</span></div>${exports.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>导出文件</th><th>类型</th><th>结果</th><th>导出时间</th><th>下载</th></tr></thead><tbody>${exports.map(e=>`<tr><td class="table-title">${esc(e.filename)}</td><td>${statusBadge(e.mode,e.mode==='stage'?'阶段预览':e.mode==='reviewed'?'核对版':'初稿')}</td><td class="muted">填入 ${e.filled_count||0} · 缺项 ${e.missing_count||0} · 跳过 ${e.skipped_count||0}</td><td class="muted">${date(e.created_at,true)}</td><td><a href="${esc(e.download_url || `/api/exports/${encodeURIComponent(e.id)}/download`)}" download>Word 文件</a> <span class="muted"> / </span> <a href="${esc(e.report_url || `/api/exports/${encodeURIComponent(e.id)}/report`)}" download>核对报告</a></td></tr>`).join('')}</tbody></table></div>`:emptyState('暂无导出记录','','',true,'download')}</section>`;
 }
 
 function openModal(title, subtitle, content, formName, submitLabel, options = {}) {
@@ -723,7 +755,7 @@ async function submitForm(form) {
   try {
     let result;
     if(kind==='project') {
-      const body={name:String(fd.get('name')).trim()};
+      const body={name:String(fd.get('name')).trim(),material_conflicts:true};
       if(fd.get('source')==='sample')body.use_sample=true;
       else {const f=$('input[name=file]',form).files[0];if(!f)throw new Error('请选择一个 .doc 或 .docx 模板，或使用已有示例。');if(!/\.docx?$/i.test(f.name))throw new Error('模板需为 .doc 或 .docx 格式，请先在 Word 中另存为对应格式。');if(f.size>30*1024*1024)throw new Error('Word 模板不能超过 30 MB。');if(!f.size)throw new Error('Word 模板不能为空，请重新选择文件。');const item=(await toFiles([f]))[0];body.filename=item.name;body.data=item.data;}
       submit.innerHTML='<span class="spinner" style="width:14px;height:14px"></span> 正在读取并扫描模板…';
@@ -797,6 +829,9 @@ async function submitForm(form) {
       result=await api(id?`/api/categories/${encodeURIComponent(id)}`:'/api/categories',{method:id?'PATCH':'POST',body});
     } else if(kind==='industry') {
       const name=String(fd.get('name')).trim();if(!name)throw new Error('请填写行业分类名称。');result=await api('/api/industries',{method:'POST',body:{name}});
+    } else if(kind==='stage-preview') {
+      await queueExport(id,'stage',String(fd.get('mapping_revision')),String(fd.get('stage_revision')));
+      submit.disabled=false;closeModal(false);return;
     } else if(kind==='rescan') {
       result=await api(`/api/projects/${encodeURIComponent(state.project.id)}/scan`,{method:'POST',body:{mapping_revision:form.dataset.mappingRevision}});state.project=result;state.dirty=false;
     }
@@ -815,9 +850,10 @@ async function submitForm(form) {
 async function saveProject(notify=true) {
   if(!state.project)return;
   if(state.busy)throw new Error('正在保存核对，请等待完成。');
-  const mappings=state.project.mappings.map(m=>({id:m.id,locator_id:m.locator_id,material_ids:m.material_ids||[],action:m.action||'fill',confirmed:!!m.confirmed,note:m.note||''}));
+  const mappings=state.project.mappings.map(m=>({id:m.id,locator_id:m.locator_id,material_ids:m.material_ids||[],action:m.action||'fill',confirmed:!!m.confirmed,note:m.note||'',existing_handling:m.existing_handling}));
+  const review_ids=state.project.material_conflicts&&notify?projectRows(projectUi.step==='special'?'special':'common').map(row=>row.id):[];
   state.busy=true;$('#app').inert=true;
-  try {state.project=await api(`/api/projects/${encodeURIComponent(state.project.id)}/mappings`,{method:'PATCH',body:{mappings,mapping_revision:state.project.mapping_revision}});state.dirty=false;projectUi.navigation=null;await refreshData({refreshProject:false});if(notify)toast('核对已保存');}
+  try {state.project=await api(`/api/projects/${encodeURIComponent(state.project.id)}/mappings`,{method:'PATCH',body:{mappings,review_ids,mapping_revision:state.project.mapping_revision}});state.dirty=false;projectUi.navigation=null;projectUi.selected?.clear();await refreshData({refreshProject:false});if(notify)toast('核对已保存');}
   finally {state.busy=false;render();}
 }
 async function navigate(view, category) {
@@ -832,6 +868,7 @@ async function navigate(view, category) {
   }
   await tenderFlow.beforeLeave();
   if(state.dirty)await saveProject(false);
+  if(view==='calibration')await tenderFlow.loadLibrary();
   closeDrawer();state.view=view;state.project=null;state.query='';state.category=category||'all';tenderFlow.url();if(view==='industries')await loadSpecial();if(view==='submissions')await loadSubmissions();if(view==='cases')await loadCaseLibrary();render();window.scrollTo({top:0});
 }
 async function openProject(id) {
@@ -852,7 +889,7 @@ async function changeFile(action) {
   catch(e){renderDrawer();throw e;}
 }
 let exportInFlight=false;
-const exportTasks={jobs:[],timer:null,modalId:null,polling:false,loaded:false,hidden:new Set(),error:''};
+const exportTasks={jobs:[],timer:null,modalId:null,polling:false,visibleIds:new Set(),error:''};
 function exportRemaining(job){
   if(job.status==='queued')return '排队中';
   if(job.status!=='running')return '';
@@ -860,12 +897,13 @@ function exportRemaining(job){
 }
 function exportTaskContent(job){
   const active=['queued','running'].includes(job.status),result=job.result;
-  return `<div class="export-progress-heading"><strong role="status">${esc(job.stage)}</strong><span class="export-elapsed">${esc(exportRemaining(job))}</span></div><progress class="export-progress-bar" aria-label="导出进度" max="100" ${job.status==='queued'?'':`value="${job.progress}"`}></progress>${job.status==='failed'||active?`<p class="muted export-progress-detail">${esc(job.status==='failed'?job.error:'可继续处理其他项目。')}</p>`:''}${result?`<div class="actions"><a class="btn primary" href="${esc(result.download_url)}" download>下载 Word 文件</a><a class="btn" href="${esc(result.report_url)}" download>下载核对报告</a></div>`:''}`;
+  const warnings=Array.isArray(result?.warnings)?result.warnings.filter(Boolean):[];
+  return `<div class="export-progress-heading"><strong role="status">${esc(job.stage)}</strong><span class="export-elapsed">${esc(exportRemaining(job))}</span></div><progress class="export-progress-bar" aria-label="导出进度" max="100" ${job.status==='queued'?'':`value="${job.progress}"`}></progress>${job.status==='failed'||active?`<p class="muted export-progress-detail">${esc(job.status==='failed'?job.error:'可继续处理其他项目。')}</p>`:''}${warnings.length?`<div class="warning-box export-warnings" role="status"><strong>导出提示</strong><ul>${warnings.map(note=>`<li>${esc(note)}</li>`).join('')}</ul></div>`:''}${result?`<div class="actions"><a class="btn primary" href="${esc(result.download_url)}" download>下载 Word 文件</a><a class="btn" href="${esc(result.report_url)}" download>下载核对报告</a></div>`:''}`;
 }
 function paintExportTasks(){
   let dock=$('#export-task-dock');
   if(!dock){dock=document.createElement('aside');dock.id='export-task-dock';dock.setAttribute('aria-label','后台导出任务');document.body.append(dock);}
-  const visible=exportTasks.jobs.filter(j=>!exportTasks.hidden.has(j.id));
+  const visible=exportTasks.jobs.filter(j=>exportTasks.visibleIds.has(j.id));
   dock.hidden=!visible.length;
   dock.innerHTML=visible.map(j=>`<div class="export-task-item"><button class="text-button" data-action="export-task-open" data-id="${esc(j.id)}"><strong>${esc(j.project_name)}</strong><span>${esc(j.stage)}${exportRemaining(j)?' · '+esc(exportRemaining(j)):''}</span></button>${['queued','running'].includes(j.status)?'':`<button class="icon-button" data-action="export-task-dismiss" data-id="${esc(j.id)}" aria-label="收起导出任务">×</button>`}</div>`).join('')+(exportTasks.error?`<p role="status">${esc(exportTasks.error)}</p>`:'');
   const modal=$('#export-task-modal'),job=exportTasks.jobs.find(j=>j.id===exportTasks.modalId);
@@ -877,7 +915,7 @@ function openExportTask(id){
   exportTasks.modalId=id;
   const modal=document.createElement('dialog');modal.id='export-task-modal';modal.className='modal export-progress-modal';
   modal.setAttribute('aria-labelledby','export-task-title');
-  modal.innerHTML=`<div class="modal-header"><div><h2 id="export-task-title">${job.mode==='reviewed'?'核对版':'初稿'}导出</h2><p>${esc(job.project_name)}</p></div></div><div class="modal-body">${exportTaskContent(job)}</div><div class="modal-footer"><button class="btn" id="export-background">${['queued','running'].includes(job.status)?'后台运行':'关闭'}</button></div>`;
+  modal.innerHTML=`<div class="modal-header"><div><h2 id="export-task-title">${job.mode==='stage'?'阶段预览':job.mode==='reviewed'?'核对版':'初稿'}导出</h2><p>${esc(job.project_name)}</p></div></div><div class="modal-body">${exportTaskContent(job)}</div><div class="modal-footer"><button class="btn" id="export-background">${['queued','running'].includes(job.status)?'后台运行':'关闭'}</button></div>`;
   modal.addEventListener('close',()=>{modal.remove();exportTasks.modalId=null;});
   $('#export-background',modal).addEventListener('click',()=>modal.close());
   document.body.append(modal);modal.showModal();
@@ -887,12 +925,9 @@ async function pollExportTasks(){
   clearTimeout(exportTasks.timer);
   try{
     const jobs=await api('/api/export-jobs');
-    if(!exportTasks.loaded){
-      // Completed downloads are already available in each project's export history.
-      for(const job of jobs){
-        if(job.status==='completed'&&!exportTasks.jobs.some(current=>current.id===job.id))exportTasks.hidden.add(job.id);
-      }
-      exportTasks.loaded=true;
+    // Keep active jobs visible through completion. Earlier results stay in project history.
+    for(const job of jobs){
+      if(job.status==='queued'||job.status==='running')exportTasks.visibleIds.add(job.id);
     }
     const newlyDone=jobs.filter(j=>j.status==='completed'&&exportTasks.jobs.some(old=>old.id===j.id&&['queued','running'].includes(old.status)));
     exportTasks.jobs=jobs;exportTasks.error='';paintExportTasks();
@@ -904,16 +939,69 @@ async function pollExportTasks(){
   exportTasks.polling=false;
   exportTasks.timer=setTimeout(pollExportTasks,exportTasks.jobs.some(j=>['queued','running'].includes(j.status))?1000:10000);
 }
+async function ensureProjectRedline(project){
+  if(!project?.framework_id)return true;
+  let scan=await api(`/api/projects/${encodeURIComponent(project.id)}/redline-scan`);
+  const hasChapters=Object.values(project.chapter_texts||{}).some(text=>String(text||'').trim());
+  if(scan.items?.length&&hasChapters&&(!scan.ai_review||scan.ai_review_stale)){
+    if(!window.confirm('导出前须完成废标红线 AI 核对，将把已保存正文发送到本项目配置的模型服务。确认继续？')){
+      toast('已取消导出：请先完成废标红线核对。',true);return false;
+    }
+    try{
+      scan=await api(`/api/projects/${encodeURIComponent(project.id)}/redline-scan/ai-review`,{method:'POST',body:{}});
+    }catch(err){
+      toast('红线 AI 核对失败，已阻止导出：'+err.message,true);return false;
+    }
+  }
+  if(scan.items?.length&&!scan.complete){
+    toast(`尚有 ${scan.pending_count||0} 条废标红线未过关，已阻止导出。请到“编写投标文件 → 废标红线扫描”修复后再导出。`,true);
+    return false;
+  }
+  const ai=scan.ai_review&&typeof scan.ai_review==='object'?scan.ai_review:{};
+  const risks=(scan.items||[]).filter(item=>item.status==='risk'
+    ||(!item.acknowledged&&['risk','unclear'].includes(ai[item.id]?.verdict)));
+  if(risks.length){
+    toast(`尚有 ${risks.length} 条废标红线存在风险或需确认，已阻止导出。`,true);
+    return false;
+  }
+  if(scan.items?.length&&hasChapters&&!Object.keys(ai).length){
+    toast('请先完成废标红线 AI 逐条核对后再导出。',true);
+    return false;
+  }
+  return true;
+}
+async function showStagePreview(){
+  if(state.dirty)await saveProject(false);
+  const id=state.project.id;
+  const data=await api('/api/projects/'+encodeURIComponent(id)+'/stage-preview');
+  if(state.project?.id!==id)return;
+  const labels={completed:'已完成',pending:'未完成',skipped:'已跳过'};
+  const count=status=>data.chapters.filter(row=>row.status===status).length;
+  openModal('阶段预览','仅供内部核对 · 禁止投标',`
+    <input type="hidden" name="mapping_revision" value="${esc(data.mapping_revision)}">
+    <input type="hidden" name="stage_revision" value="${esc(data.stage_revision)}">
+    <p>目录版本 ${data.outline_revision} · 将填入 ${data.filled_material_count} 项已核对材料</p>
+    <p>${Object.entries(labels).map(([code,label])=>label+' '+count(code)).join(' · ')}</p>
+    ${data.missing_original_forms?.length?`<div class="warning-box"><strong>待补采购原表（${data.missing_original_forms.length}）</strong><ul>${data.missing_original_forms.map(name=>`<li>${esc(name)}</li>`).join('')}</ul></div>`:''}
+    <ol class="stage-preview-list">${data.chapters.map(row=>`<li style="--stage-depth:${row.level-1}"><span>${esc(row.text)}</span><strong>${labels[row.status]}</strong></li>`).join('')}</ol>
+    ${data.redlines.length?`<details class="wf-note"><summary>待核对红线（${data.redlines.length}）</summary><ul>${data.redlines.map(row=>`<li>${esc(row.label)}</li>`).join('')}</ul></details>`:''}
+    ${data.other_pending_materials.length?`<details class="wf-note"><summary>未定位或待核对材料</summary><ul>${data.other_pending_materials.map(name=>`<li>${esc(name)}</li>`).join('')}</ul></details>`:''}
+    `,'stage-preview','生成阶段 Word',{id});
+}
+async function queueExport(id,mode,mapping_revision,stage_revision){
+  const job=await api('/api/projects/'+encodeURIComponent(id)+'/export-jobs',{method:'POST',body:{mode,mapping_revision,stage_revision}});
+  exportTasks.visibleIds.add(job.id);exportTasks.jobs=[job,...exportTasks.jobs.filter(j=>j.id!==job.id)];
+  paintExportTasks();openExportTask(job.id);await pollExportTasks();
+}
 async function exportProject(sourceButton){
   if(exportInFlight)return;
   exportInFlight=true;sourceButton.disabled=true;
   try{
-    const mode='draft';
-    const job=await api(`/api/projects/${encodeURIComponent(state.project.id)}/export-jobs`,{method:'POST',body:{mode,mapping_revision:state.project.mapping_revision}});
-    exportTasks.hidden.delete(job.id);exportTasks.jobs=[job,...exportTasks.jobs.filter(j=>j.id!==job.id)];
-    paintExportTasks();openExportTask(job.id);await pollExportTasks();
+    if(state.view==='dashboard'){if(!(await tenderFlow.ensureRedlineForExport()))return;}
+    else if(state.view==='projects'&&!(await ensureProjectRedline(state.project)))return;
+    await queueExport(state.project.id,'draft',state.project.mapping_revision);
   }catch(error){toast(error.message,true);await pollExportTasks();}
-  finally{exportInFlight=false;sourceButton.disabled=false;}
+  finally{exportInFlight=false;if(sourceButton.isConnected)sourceButton.disabled=false;}
 }
 
 function mappingChange(id,field,value,rerender=true) {
@@ -921,6 +1009,7 @@ function mappingChange(id,field,value,rerender=true) {
   $('.material-completion-notice')?.remove();
   $$('.mapping-needs-attention').forEach(card=>card.classList.remove('mapping-needs-attention'));
   const m=state.project?.mappings.find(x=>x.id===id);if(!m)return;
+  if(field==='locator_id'&&m.locator_id!==value)delete m.existing_handling;
   m[field]=value;if(field==='locator_id'&&isSpecial(m.category_id))m.location_match={status:'manual',reason:'位置已由人工调整',candidates:[]};if(field!=='confirmed')m.confirmed=false;state.dirty=true;
   if(rerender){const scroll=window.scrollY;render();window.scrollTo(0,scroll);}
 }
@@ -931,9 +1020,22 @@ document.addEventListener('click',async e=>{
   try {
     if(isRemote()&&LOCAL_ADMIN_ACTIONS.has(action)){toast(LOCAL_ADMIN_MESSAGE,true);return;}
     if(action==='export-task-open')openExportTask(id);
-    else if(action==='export-task-dismiss'){exportTasks.hidden.add(id);paintExportTasks();}
+    else if(action==='export-task-dismiss'){exportTasks.visibleIds.delete(id);paintExportTasks();}
     else if(action==='navigate')await navigate(target.dataset.view);
     else if(action==='toggle-nav')$('.app-shell')?.classList.toggle('nav-open');
+    else if(action==='workflow-calibration'){
+      const calibration=tenderFlow.calibrationState();
+      if(state.view==='dashboard'&&calibration.available){
+        if(!calibration.active)await tenderFlow.openCalibration();
+        else $('.app-shell')?.classList.remove('nav-open');
+      }
+      else if(state.view!=='calibration')await navigate('calibration');
+      else $('.app-shell')?.classList.remove('nav-open');
+    }
+    else if(action==='open-calibration'&&state.view==='calibration'){
+      target.disabled=true;
+      try{await tenderFlow.openCalibration(id);}finally{if(target.isConnected)target.disabled=false;}
+    }
     else if(action==='new-framework'){
       target.disabled=true;
       try{await tenderFlow.enter();}finally{if(target.isConnected)target.disabled=false;}
@@ -983,6 +1085,16 @@ document.addEventListener('click',async e=>{
     else if(action==='location-zoom-in'||action==='location-zoom-out'){locationUi.zoom=Math.max(.75,Math.min(2,locationUi.zoom+(action==='location-zoom-in'?.25:-.25)));renderLocationPreview();}
     else if(action==='location-toggle'){locationUi.showMarkers=!locationUi.showMarkers;renderLocationPreview();}
     else if(action==='project-step')await projectStep(id);
+    else if(action==='batch-skip-mappings'){
+      for(const row of projectRows(projectUi.step==='special'?'special':'common')){
+        if(projectUi.selected.has(row.id))mappingChange(row.id,'action','skip',false);
+      }
+      await saveProject();
+    }
+    else if(action==='resume-mapping'){
+      const row=state.project.mappings.find(item=>item.id===id);
+      if(row)mappingChange(id,'action',row.material_ids?.length?'fill':'missing');
+    }
     else if(action==='locate-material-issue')focusMaterialCompletionIssue(Number(id));
     else if(action==='project-picker-prev'||action==='project-picker-next'){
       const category=target.dataset.category,picker=projectUi.pickers[category];
@@ -991,8 +1103,8 @@ document.addEventListener('click',async e=>{
     else if(action==='project-materials')await navigate('materials',target.dataset.category);
     else if(action==='save-project'){target.disabled=true;await saveProject();}
 
-    else if(action==='rescan')openModal('重新扫描模板','将按当前栏目与材料重新匹配。',`<div class="warning-box" style="margin-bottom:0">重新扫描会清除当前项目的人工确认与匹配调整。导出历史仍会保留，原始模板不会修改。</div>`,'rescan','确认重新扫描');
-    else if(action==='export-project')await exportProject(target);
+    else if(action==='rescan')openModal('重新扫描模板','将按当前栏目与材料重新匹配。',`<div class="warning-box" style="margin-bottom:0">${state.project.material_conflicts?'可定位到同一位置的处理决定会保留，请核对重新识别的项目。':'重新扫描会清除当前项目的人工确认与匹配调整。导出历史仍会保留，原始模板不会修改。'}</div>`,'rescan','确认重新扫描');
+    else if(action==='export-project')await (state.view==='dashboard'&&state.project?.framework_id ? showStagePreview() : exportProject(target));
     else if(action==='preview-prev'){state.pageIndex--;renderDrawer();}
     else if(action==='preview-next'){state.pageIndex++;renderDrawer();}
     else if(action==='preview-page'){state.pageIndex=Number(target.dataset.index);renderDrawer();}
@@ -1003,6 +1115,11 @@ document.addEventListener('click',async e=>{
 document.addEventListener('submit',e=>{const form=e.target.closest('form[data-form]');if(form){e.preventDefault();submitForm(form);}});
 document.addEventListener('change',async e=>{
   const el=e.target;
+  if(el.dataset.mapSelect){
+    if(el.checked)projectUi.selected.add(el.dataset.mapSelect);else projectUi.selected.delete(el.dataset.mapSelect);
+    const batch=$('[data-action="batch-skip-mappings"]');if(batch)batch.disabled=!projectUi.selected.size;
+    return;
+  }
   if(el.id==='location-locator'){
     const mapping=state.project?.mappings.find(m=>m.id===locationUi.mappingId);
     if(!mapping)return;
@@ -1028,6 +1145,15 @@ document.addEventListener('change',async e=>{
       const ids=new Set(m.material_ids||[]);if(checked)ids.add(id);else ids.delete(id);
       if(checked)m.action='fill';mappingChange(m.id,'material_ids',[...ids]);
     }catch(err){el.checked=!checked;el.disabled=false;toast(err.message,true);}
+  }
+  if(['special-industry','special-category','special-review'].includes(el.id)){
+    const field=el.id.slice(8);
+    specialState[field]=el.value;
+    if(field==='industry')specialState.category='';
+    specialState.page=1;
+    try{await loadSpecial();render();document.getElementById(el.id)?.focus();}
+    catch(err){toast(err.message,true);}
+    return;
   }
   if(el.dataset.categoryToggle&&isRemote()){el.checked=!el.checked;toast(LOCAL_ADMIN_MESSAGE,true);return;}
   if(el.dataset.categoryToggle){if(isCreditCategory(el.dataset.categoryToggle)){el.checked=!!state.data.categories.find(c=>c.id===el.dataset.categoryToggle)?.enabled;el.disabled=true;return;}el.disabled=true;try{await api(`/api/categories/${encodeURIComponent(el.dataset.categoryToggle)}`,{method:'PATCH',body:{enabled:el.checked}});await refreshData();render();toast('栏目状态已更新；已有项目可重新扫描以应用。');}catch(err){el.checked=!el.checked;el.disabled=false;toast(err.message,true);}}

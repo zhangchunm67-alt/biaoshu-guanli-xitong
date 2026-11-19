@@ -1,0 +1,29 @@
+# Configure the actual portal hostname and authentication upstream before deployment.
+server {
+    listen 8082 default_server;
+    server_name _;
+    return 403;
+}
+server {
+    listen 8082;
+    server_name bid.example.invalid;
+
+    location = /_bid_portal_auth {
+        internal;
+        proxy_pass http://portal-auth:8080/session/check;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Remote-User "";
+        proxy_set_header X-Bid-Proxy-Key "";
+        proxy_set_header X-Original-URI $request_uri;
+    }
+
+    location / {
+        auth_request /_bid_portal_auth;
+        auth_request_set $bid_portal_user $upstream_http_x_remote_user;
+        proxy_set_header X-Remote-User $bid_portal_user;
+        include /run/secrets/bid-key.conf;
+        proxy_set_header Host bid.example.invalid;
+        proxy_pass http://bid:8766;
+    }
+}

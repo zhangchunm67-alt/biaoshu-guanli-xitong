@@ -74,7 +74,7 @@ class AuthorizationSequenceTests(unittest.TestCase):
 
     def test_composed_preview_http_access_expires_when_body_changes(self):
         p,auth,_=self.prepare()
-        httpd=create_server(0,self.store.root,seed=False)
+        httpd=create_server(0,self.store.root,seed=False,store=self.store)
         thread=threading.Thread(target=httpd.serve_forever,daemon=True);thread.start()
         base=f'http://127.0.0.1:{httpd.server_port}'
         opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -89,7 +89,7 @@ class AuthorizationSequenceTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as error:opener.open(url,timeout=10)
             self.assertEqual(400,error.exception.code)
         finally:
-            httpd.shutdown();thread.join();httpd.server_close();httpd.store.close()
+            httpd.shutdown();thread.join();httpd.server_close()
 
     def test_names_must_match_the_reviewed_body(self):
         p,auth,_=self.prepare()

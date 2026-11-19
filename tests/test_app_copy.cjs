@@ -11,7 +11,7 @@ function harness() {
       querySelectorAll:()=>[],body:{style:{}}},window:{addEventListener(){}},
     setTimeout:()=>1,clearTimeout(){},IntersectionObserver:class{disconnect(){} observe(){}},
     tenderFlow:{projectArchives:()=>''}});
-  vm.runInContext(source+'\nglobalThis.copyTest={state,projectUi,renderMapping,renderMappingPreview,renderLocationDescription,openLocationPreview,renderLocationPreview,locationUi,renderCreditEvidence,renderCreditCard,materialFeedbackSummary,updateBatchSelection,exportTasks,pollExportTasks,validityBadge};',context);
+  vm.runInContext(source+'\nglobalThis.copyTest={state,projectUi,renderProject,renderMapping,renderMappingPreview,renderLocationDescription,openLocationPreview,renderLocationPreview,locationUi,renderCreditEvidence,renderCreditCard,materialFeedbackSummary,updateBatchSelection,exportTasks,exportTaskContent,pollExportTasks,validityBadge};',context);
   const h=context.copyTest;
   h.state.data={categories:[{id:'general',name:'普通栏目',layer:'common'},{id:'authorization',name:'授权',layer:'common'},
     {id:'text_template',name:'文书',layer:'special'}],materials:[],projects:[]};
@@ -184,4 +184,73 @@ test('completion toast only appears for a background export',async()=>{
   const check=async modal=>{h.exportTasks.jobs=[{id:'job',status:'running'}];h.exportTasks.modalId=modal;await h.pollExportTasks();};
   await check('job');assert.equal(h.context.messages.length,0);
   await check(null);assert.equal(h.context.messages.length,1);
+});
+
+test('export dock hides earlier results and keeps a running task visible through completion',async()=>{
+  const h=harness(),dock={hidden:true,innerHTML:''};
+  h.nodes.set('#export-task-dock',dock);
+  vm.runInContext('globalThis.jobs=[];toast=()=>{};refreshData=async()=>{};render=()=>{};api=async()=>jobs;',h.context);
+  const oldJobs=[{id:'failed',project_name:'旧失败任务',status:'failed'},
+    {id:'done',project_name:'旧完成任务',status:'completed'}];
+  h.context.jobs=oldJobs;
+  await h.pollExportTasks();
+  assert.equal(dock.hidden,true);
+  h.context.jobs=[...oldJobs,{id:'live',project_name:'跟踪任务',status:'running'}];
+  await h.pollExportTasks();
+  assert.equal(dock.hidden,false);
+  assert.match(dock.innerHTML,/跟踪任务/);
+  assert.doesNotMatch(dock.innerHTML,/旧失败任务|旧完成任务/);
+  h.context.jobs=[...oldJobs,{id:'live',project_name:'跟踪任务',status:'completed',stage:'导出完成'}];
+  await h.pollExportTasks();
+  assert.match(dock.innerHTML,/导出完成/);
+  assert.doesNotMatch(dock.innerHTML,/旧失败任务|旧完成任务/);
+});
+
+test('system filling offers a half-finished export once material review is saved',()=>{
+  const h=harness();
+  h.state.project={id:'project',framework_id:'framework',mappings:[],special_selection_confirmed:true,text_review_confirmed:true,material_flow:'text-first'};
+  h.projectUi.id='project';h.projectUi.step='common';h.state.dirty=false;
+  let html=h.renderProject(true);
+  assert.match(html,/导出半成品标书/);
+  let action=html.match(/<button[^>]+data-action="export-project"[^>]*>/)[0];
+  assert.doesNotMatch(action,/disabled/);
+  assert.match(html,/不必先进入“编写投标文件”/);
+  h.state.dirty=true;
+  html=h.renderProject(true);
+  action=html.match(/<button[^>]+data-action="export-project"[^>]*>/)[0];
+  assert.match(action,/disabled/);
+  h.state.dirty=false;h.projectUi.step='special';
+  assert.doesNotMatch(h.renderProject(true),/data-action="export-project"/);
+});
+
+test('saved missing materials count toward workflow progress but remain visibly missing',()=>{
+  const h=harness();
+  h.state.project={id:'project',framework_id:'framework',material_conflicts:true,
+    special_selection_confirmed:true,text_review_confirmed:true,material_flow:'text-first',
+    mappings:[
+      mapping({id:'ready',confirmed:true}),
+      mapping({id:'skip',status:'skipped',action:'skip',confirmed:true}),
+      mapping({id:'missing',status:'missing',action:'missing',confirmed:false}),
+    ]};
+  h.projectUi.id='project';h.projectUi.step='common';
+  let html=h.renderProject(true);
+  assert.match(html,/1<\/strong>项待补.*0<\/strong>项需处理.*已处理 <strong>3<\/strong> \/ 3/s);
+  assert.match(html,/class="status missing">待补材料/);
+  h.state.project.mappings[0].status='blocked';
+  html=h.renderProject(true);
+  assert.match(html,/1<\/strong>项待补.*1<\/strong>项需处理.*已处理 <strong>2<\/strong> \/ 3/s);
+  h.state.dirty=true;
+  html=h.renderProject(true);
+  assert.match(html,/保存核对后更新进度/);
+  assert.doesNotMatch(html,/材料处理进度/);
+});
+
+test('export task displays warnings from the completed result',()=>{
+  const h=harness();
+  const html=h.exportTaskContent({status:'completed',stage:'导出完成',progress:100,mode:'draft',project_name:'项目',
+    result:{download_url:'/download',report_url:'/report',
+      warnings:['废标红线尚有 2 条未确认通过；本次导出为仅供内部核对的半成品/初稿，递交前须完成红线核对。']}});
+  assert.match(html,/导出提示/);
+  assert.match(html,/废标红线尚有 2 条未确认通过/);
+  assert.match(html,/下载 Word 文件/);
 });

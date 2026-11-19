@@ -31,13 +31,31 @@ TRAIT = re.compile(r'法人|法定代表人|营业执照|注册|经营范围|依
 ACTOR_GATE = re.compile(ACTOR + r'.{0,9}(?:必须|应当|需要|须|应具|应为|应是|应提|应有|不得|需具备|需满足|未被列入|不存在重大|不存在控股)')
 REFER = re.compile(r'^(?:详见|见第|符合第.{0,20}章|按.{0,12}(?:公告|须知前附表)|详参)|由招标人在资格预审中确定')
 STAR_POLICY = re.compile(r'标识|标注|标记|标有|带[有“「]?|加[注“]|(?:任一|任何|所有)[“「]?★|★[”」]?号?条款')
-META = re.compile(r'具体条款是否实施|否决投标的情况说明|(?:废标|否决投标)(?:情况|情形)(?:报告|汇总)|招标人.{0,15}以显著的方式标明|[投应]标文件中?是否存在.{0,15}无效|评审标准和内容见|将可能被拒绝[：:]?[（(]详见|'
-                  r'不得(?:以.{0,26})?(?:认定|视为|判定|作|作为).{0,4}(?:无效|废标)|不(?:能|会|应)导致.{0,8}(?:废标|被否决)')
-NOT_APPLICABLE = re.compile(r'(?:投标|响应)保证金(?:是否收取|金额)?[：: ]*(?:本项目)?(?:无[，。 0-9１２]|无$|不(?:予)?收取|无需|免收)')
+META = re.compile(
+    r'具体条款是否实施|否决投标的情况说明|(?:废标|否决投标)(?:情况|情形)(?:报告|汇总)|'
+    r'(?:评标委员会|招标人|采购人|代理机构).{0,20}对否决(?:投标|响应).{0,12}作出.{0,8}(?:书面)?说明|'
+    r'招标人.{0,15}以显著的方式标明|[投应]标文件中?是否存在.{0,15}无效|评审标准和内容见|将可能被拒绝[：:]?[（(]详见|'
+    r'不得(?:以.{0,26})?(?:认定|视为|判定|作|作为).{0,4}(?:无效|废标)|不(?:能|会|应)导致.{0,8}(?:废标|被否决)|'
+    r'不作为.{0,12}(?:废标|否决(?:投标|响应)?|无效)(?:的)?依据')
+NOT_APPLICABLE = re.compile(
+    r'(?:投标|响应)?保证金(?:是否收取|金额)?'
+    r'[：:｜|／/\s]*'
+    r'(?:本项目)?(?:无[，。 0-9１２]|无$|不(?:予)?收取|无需|免收)')
+REVIEW_TABLE_CONSEQUENCE = re.compile(
+    r'(?:有一项|任一项|任何一项|凡有一项|一项).{0,16}不(?:符合|满足|通过).{0,24}'
+    r'(?:其)?(?:投标|响应|报价)?(?:文件)?(?:将|即|视为|按)?(?:无效|否决)|'
+    r'(?:符合性|资格性|形式|响应性).{0,10}(?:审查|评审).{0,40}'
+    r'(?:有一项|任一项|一项).{0,12}不(?:符合|满足).{0,16}(?:无效|否决)')
+REVIEW_HEADER_MARK = re.compile(
+    r'^(?:序号|审查(?:内容|项目|因素|标准)|评审(?:内容|因素|标准)|合格条件|检查内容)$')
 OTHER_HEADING = re.compile(r'^(?:第'+NUMBER+r'(?:部分|章|节)|['+'一二三四五六七八九十'+r']+[、．.])')
 CONTRACT = re.compile(r'乙方应|合同签订后.{0,12}(?:提供|提交)|采购人(?:有权|可)(?:随时)?解除合同')
 VAGUE = re.compile(r'(?:法律法规|法律、法规|法律或招标文件|法律法规及招标文件).{0,20}(?:其他|其它)(?:情形|情况)|'
                    r'^(?:(?:其他|其它).{0,20}规定的(?:情形|情况)|(?:须|应)?符合.{0,18}供应商管理相关要求)[。；;]?$')
+# “否则/则视为无效”只是后果尾巴，必须并回前句条件，否则业务侧只看到空壳。
+CONSEQUENCE_TAIL = re.compile(r'^(?:否则|则|并?将|可被|可以被|则视为|将被视为|视为)')
+WEAK_QUALIFIER = re.compile(
+    r'^(?:否决响应|否决投标|废标|无效(?:投标|响应|标书)?|(?:废标|否决)(?:情形|情况|条件|条款))[。；;]?$')
 
 
 def compact(s):
@@ -73,9 +91,39 @@ def split_numbered(s):
 
 
 def reject(s):
-    if META.search(s) or re.search(r'不(?:会|应|得|因此)?(?:予以)?(?:废标|否决其投标)|不作为.{0,8}(?:废标|否决)依据',s):
+    if META.search(s) or META.search(compact(s)) or re.search(
+            r'不(?:会|应|得|因此)?(?:予以)?(?:废标|否决其投标)|不作为.{0,12}(?:废标|否决(?:投标|响应)?|无效)(?:的)?依据', s):
+        return False
+    # 符合性表常见“是否存在…无效响应情况”是审查项标题，不是一条可执行否决条件。
+    if (re.match(r'^(?:供应商|投标人|响应人|报价人)?是否存在', stripped(s))
+            and re.search(r'无效响应情况|否决(?:响应|投标)?情形|废标情形', s)):
         return False
     return bool(REJECT.search(compact(s)) or re.search(r'逾期(?:送达|递交|提交).{0,40}不(?:予|再)(?:受理|接受|接收)',s))
+
+
+def review_table_consequence(text):
+    return bool(REVIEW_TABLE_CONSEQUENCE.search(text) or REVIEW_TABLE_CONSEQUENCE.search(compact(text)))
+
+
+def review_criterion_cells(cells):
+    """Pick the actionable criterion text from a review-table row."""
+    values = [v.strip() for v in cells if v and v.strip()]
+    if not values:
+        return None
+    if all(REVIEW_HEADER_MARK.fullmatch(re.sub(r'\s+', '', v)) or v.isdigit() for v in values):
+        return None
+    # Prefer the content column after a leading serial number; fall back to the first body cell.
+    body = values[1:] if re.fullmatch(r'\d{1,3}', values[0]) and len(values) > 1 else values
+    if not body:
+        return None
+    if all(REVIEW_HEADER_MARK.fullmatch(re.sub(r'\s+', '', v)) for v in body):
+        return None
+    chosen = next((v for v in body if len(compact(v)) >= 4 and not REVIEW_HEADER_MARK.fullmatch(re.sub(r'\s+', '', v))), None)
+    if not chosen:
+        return None
+    if VAGUE.search(chosen) or META.search(chosen):
+        return None
+    return chosen
 
 
 def normalized_key(s):
@@ -95,9 +143,24 @@ def hit(category, s, unit, related=(), qualifier=''):
     item = {'category':category, 'text':raw, 'key':normalized_key(raw), 'unit':unit}
     if related:
         item['related'] = list(related)
-    if qualifier:
+    # 短后果词（如「否决响应」）不能当展示标题，否则列表只剩关键字。
+    if qualifier and not WEAK_QUALIFIER.fullmatch(compact(qualifier)):
         item['label'] = qualifier
     return item
+
+
+def with_condition(sentence, sentences, pos, unit=None, units=None, index=None):
+    """把「否则…无效」并回前句；必要时再借上一段落。"""
+    text = sentence
+    if pos and CONSEQUENCE_TAIL.match(stripped(sentence)):
+        text = sentences[pos - 1] + sentence
+    elif CONSEQUENCE_TAIL.match(stripped(sentence)) and units is not None and index:
+        previous = units[index - 1]
+        if (previous.kind == unit.kind == 'paragraph'
+                and previous.part == unit.part and previous.scope == unit.scope
+                and 0 < unit.index - previous.index <= 3):
+            text = previous.text.rstrip() + sentence
+    return text
 
 
 def established_star(unit):
@@ -169,6 +232,7 @@ def grounds(units, stars):
     subheading = ''
     style = None
     last_idx = -1
+    review_table = None  # consequence unit activating row-level redlines
     for u in units:
         vals = [v.strip() for v in u.cells if v.strip()] if u.kind=='row' else [u.text.strip()]
         if not vals:
@@ -177,6 +241,24 @@ def grounds(units, stars):
         if not s:
             continue
         footprint = (u.part,u.scope)
+        if review_table and (u.part != review_table.part or u.scope != review_table.scope):
+            review_table = None
+        if u.kind == 'paragraph' and review_table and (
+                getattr(u, 'is_heading', False) or OTHER_HEADING.match(s) or u.index - review_table.index > 40):
+            review_table = None
+        joined = ' '.join(vals)
+        if review_table_consequence(joined) or (u.kind == 'paragraph' and review_table_consequence(s)):
+            # Keep the consequence sentence itself if it is a concrete reject trigger;
+            # always arm the following review-table rows.
+            review_table = u
+        if review_table and u.kind == 'row':
+            criterion = review_criterion_cells(u.cells if u.kind == 'row' else vals)
+            if criterion and not review_table_consequence(criterion):
+                yield hit('redline', criterion, u, [review_table], '审查表：一项不符合即触发原件规定的否决后果')
+                continue
+            if all(REVIEW_HEADER_MARK.fullmatch(re.sub(r'\s+', '', v)) or v.isdigit()
+                   for v in [v.strip() for v in (u.cells if u.kind == 'row' else vals) if v and v.strip()]):
+                continue
         rule = stars.get(footprint) or stars.get((u.part,''))
         starred = next((v for v in vals if re.match(r'^\s*★\s*\S',v)), '')
         if rule and starred and not established_star(u):
@@ -235,6 +317,7 @@ def grounds(units, stars):
             continue
         # End punctuation, never a decimal point, separates distinct operative sentences.
         sentences = re.split(r'(?<=[。！？])',s)
+        unit_index = next((i for i, row in enumerate(units) if row is u), None)
         for pos,sentence in enumerate(sentences):
             if not reject(sentence) or VAGUE.search(sentence):
                 continue
@@ -243,6 +326,10 @@ def grounds(units, stars):
                 continue
             if pos and re.match(r'^(?:采购人|招标人|评标委员会)(?:有权|可以)?将其',sentence):
                 sentence=sentences[pos-1]+sentence
+            sentence = with_condition(sentence, sentences, pos, unit=u, units=units, index=unit_index)
+            # 并回前句后若仍只剩空壳后果，丢掉，避免列表出现「否则…无效」。
+            if CONSEQUENCE_TAIL.match(stripped(sentence)) and len(compact(stripped(sentence))) < 28:
+                continue
             yield hit('redline',sentence,u)
 
 

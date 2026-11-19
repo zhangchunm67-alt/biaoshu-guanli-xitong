@@ -4,3 +4,5 @@ openpyxl==3.1.5
 olefile==0.47
 pypdf==6.10.0
 pypdfium2==5.14.0
+
+docxcompose==2.2.0

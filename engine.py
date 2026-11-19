@@ -42,7 +42,7 @@ _TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 SPECIAL_LOCATOR_VERSION = 9
-COMMON_LOCATOR_VERSION = 12
+COMMON_LOCATOR_VERSION = 16
 
 
 def _common_title(text):
@@ -158,7 +158,10 @@ def _years(text):
 def _normal(text, remove_years=False):
     value = str(text or "").strip()
     if not re.match(r"^20\d{2}(?:\D|$)", value):
-        value = re.sub(r"^\d+(?:[.．]\d+)*(?:[.．、]|\s+)\s*", "", value)
+        # Recognize compact decimal headings before the ordinary separator rule.
+        # A four-digit year is part of the title in 4.3.2023-2024年财务审计报告.
+        value = re.sub(r"^\d{1,3}(?:[.．]\d{1,3})+(?=[^\d\s.．、年月日%万元\-—–~])|"
+                       r"^\d+(?:[.．]\d+)*(?:[.．、]|\s+)\s*", "", value)
     value = re.sub(r"^(?:第[一二三四五六七八九十百\d]+(?:章|节|部分|篇)|[一二三四五六七八九十百]+[、.．]|[（(][一二三四五六七八九十\d]+[）)])\s*", "", value)
     value = re.sub(r"\s+", "", value).rstrip("：:")
     value = value.replace("（负责人）", "").replace("(负责人)", "")
@@ -264,7 +267,7 @@ def _page_size(document, top_index):
     return int(section.page_width - section.left_margin - section.right_margin), int(section.page_height - section.top_margin - section.bottom_margin)
 
 
-def _inspect(document, categories, toc_elements=None):
+def _inspect(document, categories, toc_elements=None, *, procurement_audit=None):
     """Private records retain XML objects; public headings are JSON-only."""
     import recognition
     from document_toc import excluded_paragraphs
@@ -272,10 +275,16 @@ def _inspect(document, categories, toc_elements=None):
     if toc_elements is None:
         toc_elements = excluded_paragraphs(document)
     records = []
+    chapter_id = ''
+    chapter_path = []
+    bookmarked = any(re.fullmatch(r'BidSection[1-9]\d*', mark.get(qn('w:name'), ''))
+                     for mark in body.iter(qn('w:bookmarkStart')))
     common = [c for c in categories if c.get('layer', 'common') != 'special']
     special = [c for c in categories if c.get('layer') == 'special']
     skipped_toc = 0
     for element in body.iter(qn("w:p")):
+        bookmark = next((mark.get(qn('w:name')) for mark in element.findall(qn('w:bookmarkStart'))
+                         if re.fullmatch(r'BidSection[1-9]\d*', mark.get(qn('w:name'), ''))), None)
         paragraph = Paragraph(element, document._body)
         title = _text(element).strip()
         if not title:
@@ -292,11 +301,20 @@ def _inspect(document, categories, toc_elements=None):
         cats = _category_ids(title, common) if len(title) <= 160 and not inside_table else []
         special_title = not inside_table and (any(_special_score(title, c)[0] for c in special) or bool(recognition.title_topics(title)))
         locator = "p:" + ".".join(map(str, path)) + ":" + _digest(element)
+        section_start = not inside_table and bool(bookmark or (not bookmarked and style_level))
+        if section_start:
+            chapter_id = bookmark or locator
+            depth = style_level or 1
+            while chapter_path and chapter_path[-1][0] >= depth:
+                chapter_path.pop()
+            chapter_path.append((depth, title))
         base = {"id": locator, "title": title, "level": level or 9,
                 "preview": "", "kind": "heading" if level else "paragraph",
-                "category_ids": cats, "existing_content": False,
+                "category_ids": cats, "existing_content": False, 'chapter_id': chapter_id,
+                'chapter_path': ' / '.join(title for _, title in chapter_path),
                 "legal_body_present": False, "authorization_body_present": False,
                 "_element": element, "_path": path, "_inside_table": inside_table,
+                "_section_start": section_start,
                 "_special_scores": {},
                 "_raw_categories": list(cats),
                 "_structural": recognition.structural(title, bool(style_level)),
@@ -310,9 +328,28 @@ def _inspect(document, categories, toc_elements=None):
                           _token=token.group(0), _occurrence=occurrence, _public=True)
             records.append(record)
     recognition.resolve(document, records, categories, toc_elements)
+    if procurement_audit:
+        targets = [r for r in records if 'audit_report' in r['category_ids']
+                   and r.get('chapter_id') and '资格证明' in r.get('chapter_path', '')]
+        # Do not apply one project-wide year across multiple lot responses.
+        if len({r['chapter_id'] for r in targets}) == 1:
+            current = records[0]['_requirements']['audit_report']
+            if not current.get('required_years') and not current.get('year_options'):
+                enriched = {**current, 'required_years': procurement_audit['required_years'],
+                            'procurement_source': procurement_audit['source'],
+                            'bank_credit_months': procurement_audit['bank_credit_months']}
+                records[0]['_requirements']['audit_report'] = enriched
+                for target in targets:
+                    requirement = target.get('requirement', {})
+                    if not requirement.get('required_years') and not requirement.get('year_options'):
+                        target['requirement'] = {**enriched, 'evidence': requirement.get('evidence', current['evidence'])}
     # A token and a role-specific attachment retain their enclosing original
     # authorization text for name checks, without moving their write-back anchor.
     for record in records:
+        drawing_blocks = [node for node in record.get('_own', [])
+                          if node.tag == qn('w:p') and _drawing(node) and not _text(node).strip()]
+        record['_replaceable'] = drawing_blocks
+        record['existing_images'] = bool(drawing_blocks)
         if record['kind'] == 'placeholder' or record.get('_attachment'):
             parents = [r for r in records if r is not record and r['kind'] not in {'placeholder','attachment','common_appendix'}
                        and len(r['_path']) == 1 and r['_path'][0] <= record['_path'][0]
@@ -358,7 +395,8 @@ def _document_warnings(document, records, skipped_toc):
     return warnings
 
 
-def scan_document(template_path, categories, materials, special_category_ids=(), *, preserve_forms=False):
+def scan_document(template_path, categories, materials, special_category_ids=(), *, preserve_forms=False,
+                  procurement_audit=None):
     from recognition import family
     from document_toc import excluded_paragraphs, excluded_locator_ids
     selected = set(special_category_ids)
@@ -368,7 +406,7 @@ def scan_document(template_path, categories, materials, special_category_ids=(),
                and c.get("enabled", True)]
     document = _read_template(template_path)
     toc_elements = excluded_paragraphs(document)
-    records, skipped = _inspect(document, enabled, toc_elements)
+    records, skipped = _inspect(document, enabled, toc_elements, procurement_audit=procurement_audit)
     requirements = records[0].get('_requirements', {}) if records else {}
     headings = [_public(r) for r in records if r["_public"]]
     mappings = []
@@ -653,6 +691,7 @@ def validate_mappings(mappings, materials, headings, categories=None, *, context
     by_heading = {h["id"]: h for h in headings}
     by_category = {c["id"]: c for c in categories} if categories is not None else None
     seen_ids, used_locations = set(), {}
+    used_chapter_materials = set()
     result = []
     for original in mappings:
         row = copy.deepcopy(original)
@@ -701,6 +740,10 @@ def validate_mappings(mappings, materials, headings, categories=None, *, context
             if period_issue(heading):
                 warnings.append(period_issue(heading))
         action = row.get("action")
+        row.pop('content_conflict', None)
+        row.pop('retains_content', None)
+        row['chapter_id'] = (heading or {}).get('chapter_id', '')
+        row['replaceable_content'] = bool(heading and heading.get('existing_images') and not preserve_forms)
         if action not in {"fill", "missing", "skip"}:
             errors.append("处理方式无效。")
         if action == "fill":
@@ -795,7 +838,36 @@ def validate_mappings(mappings, materials, headings, categories=None, *, context
             errors.append("本栏目待补材料。" if heading else "模板未识别到本栏目位置，需人工核对；初稿将在末尾列出。")
         if category_id == "audit_report" and not row["required_years"] and not year_options:
             warnings.append("原文未明确审计年度，请核对。")
-        if row.get("existing_content") and not row.get('preserve_original'):
+        if row.get('conflict_review') and action == 'fill' and heading and row['status'] == 'ready':
+            keys = set()
+            duplicate = False
+            if row['chapter_id']:
+                for material in valid_materials:
+                    chapter = row['chapter_id']
+                    material_keys = {(chapter, 'id', material['id'])}
+                    if material.get('mode') == 'text':
+                        material_keys.add((chapter, 'text', hashlib.sha256(material['content'].strip().encode()).hexdigest()))
+                    material_keys.update((chapter, 'file', item['sha256'])
+                                         for item in material.get('files', []) if item.get('sha256'))
+                    duplicate = duplicate or bool(keys & material_keys)
+                    keys.update(material_keys)
+            duplicate = duplicate or bool(keys & used_chapter_materials)
+            existing = row.get('existing_content') and not row.get('preserve_original')
+            decision = row.get('existing_handling')
+            if existing or duplicate:
+                row['content_conflict'] = 'existing' if existing else 'duplicate'
+                if decision == 'keep':
+                    row['retains_content'] = True
+                    row['status'] = 'ready' if heading.get('existing_images') else 'skipped'
+                elif decision == 'replace' and not row['replaceable_content']:
+                    errors.append('当前位置包含采购原表或无法安全定位的内容，请保留、追加或跳过。', 'content_conflict')
+                    row['status'] = 'blocked'
+                elif decision not in {'append', 'replace'}:
+                    errors.append('当前位置已有内容或同章已选择相同材料，请确认处理方式。', 'content_conflict')
+                    row['status'] = 'blocked'
+            if row['status'] == 'ready' and not row.get('retains_content'):
+                used_chapter_materials.update(keys)
+        elif row.get("existing_content") and not row.get('preserve_original') and not row.get('conflict_review'):
             warnings.append("本节已有内容，将保留并追加，请检查旧版或重复材料。")
         row["issues"], row["warnings"] = _unique(errors), _unique(warnings)
         row['issue_types'] = _unique(errors.types)
@@ -975,12 +1047,13 @@ def _update_fields(document):
     element.set(qn("w:val"), "true")
 
 
-def export_document(template_path, output_path, mappings, materials, mode="draft", categories=None, progress=None, framework_drafts=None):
-    if mode not in {"draft", "reviewed"}:
+def export_document(template_path, output_path, mappings, materials, mode="draft", categories=None, progress=None,
+                    framework_drafts=None, procurement_audit=None, chapter_visuals=None, resolve_image=None):
+    if mode not in {"stage", "draft", "reviewed"}:
         raise ValueError("导出模式无效。")
     if Path(template_path).resolve() == Path(output_path).resolve():
         raise ValueError("不能覆盖原始 Word 模板。")
-    if not mappings and not (framework_drafts is not None and mode == "draft"):
+    if not mappings and not (framework_drafts is not None and mode in {"draft", "stage"}):
         raise ValueError("没有可导出的栏目，请先扫描模板。")
     if mode == "reviewed" and any(row.get("confirmed") is not True for row in mappings):
         raise ValueError("所有栏目必须先逐项确认后才能导出。")
@@ -999,7 +1072,7 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
     enabled = [c for c in categories if
                (c.get("layer", "common") == "common" or c["id"] in mapping_categories)
                and c.get("enabled", True)]
-    records, skipped = _inspect(document, enabled)
+    records, skipped = _inspect(document, enabled, procurement_audit=procurement_audit)
     by_locator = {r["id"]: r for r in records}
     public = [_public(r) for r in records]
     checked = validate_mappings(mappings, materials, public, categories,
@@ -1054,10 +1127,16 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
     for index, row in enumerate(ordered):
         report(20 + int(65 * index / max(1, len(ordered))), f"正在填入材料 {index + 1}/{len(ordered)}")
         record = by_locator.get(row.get("locator_id"))
-        selected = [by_material[i] for i in row.get("material_ids", [])] if row["action"] == "fill" else []
-        if row.get('preserve_original'):
+        kept = row.get('preserve_original') or row.get('retains_content')
+        selected = [by_material[i] for i in row.get("material_ids", [])] if row["action"] == "fill" and not kept else []
+        if kept:
             pass
         elif row["status"] == "ready":
+            if row.get('content_conflict') == 'existing' and row.get('existing_handling') == 'replace':
+                for element in record['_replaceable']:
+                    element.getparent().remove(element)
+                record = dict(record, _anchor=record['_element'],
+                              _own=[e for e in record['_own'] if e.getparent() is not None])
             if record.get('authorization_source'):
                 selected = sorted(selected, key=lambda m: m['category_id'] != 'legal_identity')
                 selected = [dict(m, mode='side_by_side') for m in selected]
@@ -1066,7 +1145,7 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
             for target in records:
                 if target.get('authorization_source') == row.get('locator_id'):
                     target['_anchor'] = anchor
-        elif not row.get('preserve_original'):
+        elif mode != 'stage':
             label = "待补" if row["status"] == "missing" else "人工跳过"
             text = f"【{label}：{row['title']}】" + (" " + row["note"] if row.get("note") else "")
             if record:
@@ -1085,15 +1164,18 @@ def export_document(template_path, output_path, mappings, materials, mode="draft
                         "material_ids": [m["id"] for m in selected], "material_names": [m["name"] for m in selected],
                         "file_count": sum(len(m.get("files", [])) for m in selected if m["mode"] != "text"),
                         "issues": row["issues"], "warnings": row.get("warnings", []), "note": row.get("note", "")})
-    if mode == "draft":
+    if mode in {'draft', 'stage'}:
         notice = OxmlElement("w:p")
         document.element.body.insert(0, notice)
-        run = Paragraph(notice, document._body).add_run("待补初稿｜仅供内部核对，不可直接投标。请处理红色标记并检查原模板残留信息、签章及页码。")
+        label = '阶段预览｜仅供内部核对，禁止投标。请按预览清单补齐未完成章节及红线。' if mode == 'stage' else '待补初稿｜仅供内部核对，不可直接投标。请处理红色标记并检查原模板残留信息、签章及页码。'
+        run = Paragraph(notice, document._body).add_run(label)
         run.font.color.rgb = RGBColor(192, 0, 0)
         run.font.bold = True
-    if framework_drafts:
-        from chapter_drafts import insert_responses
-        insert_responses(document, framework_drafts)
+    if framework_drafts is not None:
+        from chapter_drafts import apply_decimal_numbering, insert_responses
+        apply_decimal_numbering(document)
+        if framework_drafts:
+            insert_responses(document, framework_drafts, chapter_visuals, resolve_image)
     report(88, "正在保存 Word 文件")
     _update_fields(document)
     destination = Path(output_path)

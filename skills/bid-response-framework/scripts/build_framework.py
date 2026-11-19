@@ -691,6 +691,17 @@ def build(source, plan, output):
                     previous_source_index=n
                     previous = words(original[n-1]).strip() if n else ''
                     selected=source_copy(original[n],last_heading,width,previous,block.get('preserve_format',False))
+                    if block.get('plain_heading'):
+                        for element in selected:
+                            if element.tag == w('p'):
+                                props = element.find(w('pPr'))
+                                if props is None:
+                                    props = node('pPr')
+                                    element.insert(0, props)
+                                outline = props.find(w('outlineLvl'))
+                                if outline is None:
+                                    outline = node('outlineLvl', props)
+                                outline.set(w('val'), '9')
                     if n in landscape_indices:
                         landscape_tables.update(e for e in selected if e.tag==w('tbl'))
                     produced.extend(selected)

@@ -14,6 +14,7 @@ from docx.oxml.ns import qn
 
 import chapter_drafts
 import engine
+import writing_chat
 from server import Store
 
 
@@ -94,7 +95,7 @@ class WritingServiceTests(unittest.TestCase):
         return self.store.writing.upload(key, self.request(key, files=[{
             'name': '项目案例.txt', 'data': base64.b64encode(raw).decode()}]))
 
-    def model_result(self, context):
+    def model_result(self, context, model=None):
         return dict(chapters=[dict(chapter_id=row['id'], text='候选正文：' + row['id'],
                                    requirement_ids=row['requirement_ids'],
                                    source_refs=[context['case_sources'][0]['id']],
@@ -127,6 +128,73 @@ class WritingServiceTests(unittest.TestCase):
         stale_request['case_revision'] = 0
         with self.assertRaisesRegex(ValueError, '案例资料已更新'):
             self.store.writing.upload('project-a', stale_request)
+
+    def test_full_project_rejects_new_chapter_before_queueing(self):
+        self.upload()
+        project = self.store.require('project', 'project-a')
+        project['chapter_texts'] = {f'Other{i}': '甲' * 40000 for i in range(25)}
+        self.store.put('project', project)
+        self.store.db.commit()
+        with patch('writing_model.configuration', return_value={'ready': True}), patch(
+                'writing_model.resolve_model', return_value='test'):
+            with self.assertRaisesRegex(ValueError, '容量不足'):
+                self.store.writing.start('project-a', self.request(chapter_ids=['BidSection1']))
+        self.assertEqual([], self.store.all('writing_job'))
+
+    def test_accepted_images_survive_case_replacement_edit_and_outline_migration(self):
+        import io
+        from PIL import Image
+        import writing_visuals
+
+        picture = io.BytesIO()
+        Image.new('RGB', (80, 60), 'blue').save(picture, format='PNG')
+        uploaded = {'name': '案例图.png', 'data': base64.b64encode(picture.getvalue()).decode()}
+        with patch('case_ocr.available', return_value=False):
+            with self.assertRaisesRegex(ValueError, '可用文字'):
+                self.store.writing.upload('project-a', self.request(files=[uploaded]))
+            text = {'name':'说明.txt', 'data':base64.b64encode('项目实施说明。'.encode()).decode()}
+            pack = self.store.writing.upload('project-a', self.request(files=[uploaded, text]))
+        source = next(row for row in pack['case_sources'] if row.get('image_id'))
+        self.assertEqual('', source['text'])
+        def model(context, model=None):
+            result = self.model_result(context)
+            row = result['chapters'][0]
+            row['visuals'] = [dict(kind='image', after=1, caption='项目样张', image_id=source['id'])]
+            writing_visuals.prepare(row, {source['id']: source})
+            return result
+        job, _ = self.generate(side_effect=model, chapter_ids=['BidSection1'])
+        saved = self.accept(job, ['BidSection1'])['editor']['chapters'][0]
+        self.upload(text='另一个案例。')
+        self.assertEqual(picture.getvalue(), writing_visuals.image_path(
+            self.store, 'project-a', source['id']).read_bytes())
+        edited = chapter_drafts.save_chapters(self.store, 'project-a', self.request(chapters=[
+            {'id':'BidSection1', 'text':'新增段落。\n' + saved['text']}]))['chapters'][0]
+        self.assertEqual(saved['visuals'][0]['start'] + 1, edited['visuals'][0]['start'])
+        project = self.store.require('project', 'project-a')
+        new = self.make_project('project-b')
+        with self.assertRaises(ValueError):
+            writing_visuals.image_path(self.store, new['id'], source['id'])
+        writing_visuals.inherit_chapters(new, project, {'BidSection1':'BidSection2'})
+        self.store.put('project', new)
+        self.assertEqual(picture.getvalue(), writing_visuals.image_path(
+            self.store, new['id'], source['id']).read_bytes())
+
+    def test_chat_generated_supplement_requires_exact_case_evidence(self):
+        scan = {'items': [dict(id='red-1', status='risk', text='交付验收',
+                               findings=['缺少交付检查'], linked_chapter_ids=['BidSection1'])]}
+        texts = {'BidSection1': '现有正文。'}
+        generated = [{'chapter_id': 'BidSection1'}]
+        source = {'id': 'case-1', 'text': '历史案例按清单逐项验收。'}
+        reply = dict(issue_id='red-1', chapter_id='BidSection1', source_id='case-1',
+                     quote='未出现的项目承诺', addition='历史案例按清单逐项验收。')
+        with patch('writing_model.complete_json', return_value={'items': [reply]}):
+            self.assertEqual([], writing_chat.repair(texts, generated, scan, {}, [source], 'mock-model'))
+        self.assertEqual('现有正文。', texts['BidSection1'])
+        reply['quote'] = '历史案例按清单逐项验收'
+        with patch('writing_model.complete_json', return_value={'items': [reply]}):
+            self.assertEqual([('BidSection1', 'case-1')],
+                writing_chat.repair(texts, generated, scan, {}, [source], 'mock-model'))
+        self.assertIn('历史案例按清单逐项验收', texts['BidSection1'])
 
     def test_generation_is_candidate_only_and_skips_original_forms(self):
         self.upload()
@@ -175,6 +243,24 @@ class WritingServiceTests(unittest.TestCase):
         self.assertIn('公司具备项目现场支持经验。', sent)
         self.assertIn('授权委托书模板', sent)
 
+    def test_outbound_and_generate_use_selected_allowlisted_model(self):
+        self.upload()
+        with patch('writing_model.resolve_model', side_effect=lambda requested=None: requested or 'mock-model') as resolve, \
+                patch('writing_model.generate', side_effect=self.model_result) as model:
+            preview = self.store.writing.outbound(
+                'project-a', self.request(business_notes='交付日期待确认。', model='chosen-model'))
+            self.assertEqual('chosen-model', preview['model'])
+            resolve.assert_called_with('chosen-model')
+            self.store.writing.start(
+                'project-a', self.request(business_notes='交付日期待确认。', model='chosen-model'))
+        job = self.store.writing.describe('project-a')['job']
+        self.assertEqual('completed', job['status'], job)
+        self.assertEqual('chosen-model', job['model'])
+        self.assertEqual('chosen-model', model.call_args.kwargs.get('model'))
+        with patch('writing_model.resolve_model', side_effect=ValueError('所选写作模型不在允许名单中，请重新选择。')):
+            with self.assertRaisesRegex(ValueError, '允许名单'):
+                self.store.writing.outbound('project-a', self.request(model='blocked-model'))
+
     def test_partial_adoption_preserves_other_chapters_and_allows_second_adoption(self):
         uploaded = self.upload()
         job, _ = self.generate()
@@ -193,6 +279,33 @@ class WritingServiceTests(unittest.TestCase):
         self.assertFalse(second['writing']['job']['stale'])
         with self.assertRaisesRegex(ValueError, '已采纳'):
             self.accept(job, ['BidSection2'])
+
+    def test_writing_editions_and_body_edition_track_generations(self):
+        self.upload()
+        first, _ = self.generate()
+        self.assertEqual('正文批次 1', first['label'])
+        self.assertEqual('completed', first['status'])
+        self.assertTrue(first.get('completed_at'))
+        self.accept(first, ['BidSection1'])
+        second, _ = self.generate()
+        self.assertEqual('正文批次 2', second['label'])
+        self.assertNotEqual(first['id'], second['id'])
+        state = self.store.writing.describe('project-a')
+        editions = state['writing_editions']
+        self.assertGreaterEqual(len(editions), 2)
+        self.assertEqual(['正文批次 2', '正文批次 1'], [row['label'] for row in editions[:2]])
+        self.assertTrue(editions[0]['is_current'])
+        self.assertFalse(editions[1]['is_current'])
+        body = state['body_edition']
+        self.assertEqual(2, body['chapter_revision'])
+        self.assertEqual(first['id'], body['latest_accept']['job_id'])
+        self.assertEqual('正文批次 1', body['latest_accept']['label'])
+        self.assertTrue(body['has_unaccepted_candidates'])
+        history = self.store.writing.describe('project-a', edition_id=first['id'])
+        self.assertEqual(first['id'], history['edition_job']['id'])
+        self.assertEqual(second['id'], history['job']['id'])
+        self.assertIn('BidSection1', history['edition_job']['accepted_chapter_ids'])
+        self.assertTrue(history['body_edition']['has_unaccepted_candidates'])
 
     def test_case_material_and_manual_body_changes_expire_candidates(self):
         for change in ['case', 'material', 'body', 'framework']:
@@ -227,10 +340,10 @@ class WritingServiceTests(unittest.TestCase):
         self.upload()
         before = self.store.require('project', 'project-a')['chapter_texts']
 
-        def model_with_concurrent_edit(context):
+        def model_with_concurrent_edit(context, model=None):
             chapter_drafts.save_chapters(self.store, 'project-a', dict(revision=1,
                 chapters=[dict(id='BidSection2', text='生成期间保存的人工正文')]))
-            return self.model_result(context)
+            return self.model_result(context, model=model)
 
         job, _ = self.generate(side_effect=model_with_concurrent_edit)
         self.assertEqual('failed', job['status'])
@@ -325,12 +438,12 @@ class WritingServiceTests(unittest.TestCase):
         self.upload()
         self.generate()
 
-        def generate_while_editing(context):
+        def generate_while_editing(context, model=None):
             # A different chapter's saved prose must neither abort this task nor
             # be overwritten when this chapter's result is published.
             chapter_drafts.save_chapters(self.store, 'project-a', dict(revision=1,
                 chapters=[dict(id='BidSection2', text='第二章独立人工修改。')]))
-            return self.model_result(context)
+            return self.model_result(context, model=model)
 
         job, _ = self.generate(chapter_ids=['BidSection1'], side_effect=generate_while_editing)
         self.assertEqual('completed', job['status'])

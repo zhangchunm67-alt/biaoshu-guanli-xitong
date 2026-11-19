@@ -108,6 +108,7 @@ class FrameworkPipelineTests(unittest.TestCase):
         record = self.create()
         handler = Handler.__new__(Handler)
         handler.server = SimpleNamespace(store=self.store, server_port=8766)
+        handler.client_address = ('127.0.0.1', 0)
         handler.command = 'POST'
         handler.path = '/api/frameworks/' + record['id'] + '/model-review'
         body = json.dumps({'revision': record['revision']}).encode()

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>废标红线评测台 · 本地</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="toast" class="toast" hidden></div>
+<div id="busy" class="busy" hidden><span class="spinner"></span><span id="busyText">处理中…</span></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">红</span>
+    <div class="brand-text">
+      <h1>废标红线评测台</h1>
+      <p>人工标注 · 精确率 / 召回率</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span class="local-badge" title="只在 127.0.0.1 运行，不对外提供服务">仅本机 · 不上线</span>
+    <button id="helpBtn" class="ghost">使用说明</button>
+    <button id="overviewBtn" class="ghost">全部评测</button>
+    <button id="uploadBtn" class="primary">＋ 导入招标文件</button>
+    <input id="fileInput" type="file" accept=".docx,.doc" hidden>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="side-head">
+      <span>评测集</span>
+      <button id="refreshBtn" class="icon" title="刷新列表">↻</button>
+    </div>
+    <nav id="docList" class="doc-list" aria-label="招标文件列表"></nav>
+    <div class="corpus-path">
+      <span>存放目录</span>
+      <code id="corpusPath">…</code>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section id="welcome" class="welcome">
+      <div class="welcome-card">
+        <h2>先数清楚，再算准确</h2>
+        <p>导入招标文件 → 在原文里逐句标出废标红线 → 一键对照系统识别结果，算出精确率与召回率。标注和原件都只留在本机。</p>
+        <ol class="steps">
+          <li><b>导入</b> 右上角「＋ 导入招标文件」，支持 .docx / .doc。</li>
+          <li><b>标注</b> 左侧选中原文里的触发条件，点「标为红线」；整段也可直接标。</li>
+          <li><b>计算</b> 点「计算指标」，查看命中、漏报、误报和 P / R / F1。</li>
+          <li><b>归档</b> 导出标注表，或「全部评测」汇总多份文件并下载报告。</li>
+        </ol>
+        <p class="muted small">口径说明见 <code>REDLINE_EVAL.md</code>；建议先盲标，再看系统结果。</p>
+      </div>
+    </section>
+
+    <section id="docView" hidden>
+      <div class="doc-head">
+        <div class="doc-title">
+          <h2 id="docTitle"></h2>
+          <p id="docMeta" class="muted"></p>
+        </div>
+        <div class="doc-actions">
+          <label class="switch" title="开启后显示系统识别到的红线，便于对照">
+            <input type="checkbox" id="showSystem"> 显示系统结果
+          </label>
+          <button id="calcBtn" class="primary">计算指标</button>
+          <button id="xlsxBtn" class="ghost">导出标注表</button>
+          <button id="deleteBtn" class="ghost danger">移入回收站</button>
+        </div>
+      </div>
+
+      <div id="alert" class="alert" hidden></div>
+      <div id="metrics" class="metrics" hidden></div>
+
+      <div class="panes">
+        <section class="pane source-pane">
+          <div class="pane-head">
+            <div><strong>采购原文</strong> <span id="unitCount" class="muted"></span></div>
+            <input id="searchInput" class="search" type="search" placeholder="搜索原文…">
+          </div>
+          <p class="hint">可先在原文里选中一句话，再点「标为红线」，只标注选中的部分。</p>
+          <div id="units" class="scroll"></div>
+        </section>
+
+        <section class="pane gold-pane">
+          <div class="pane-head">
+            <div><strong>人工金标</strong> <span id="goldSummary" class="muted"></span></div>
+            <button id="addGoldBtn" class="ghost small">＋ 手动新增</button>
+          </div>
+          <div id="goldList" class="scroll"></div>
+        </section>
+      </div>
+
+      <section id="systemSection" class="panel" hidden>
+        <div class="panel-head">
+          <h3>系统识别结果 <span id="sysCount" class="muted"></span></h3>
+          <span id="sysNote" class="muted small"></span>
+        </div>
+        <div id="systemList" class="system-list"></div>
+      </section>
+
+      <section id="resultSection" class="panel" hidden>
+        <div class="panel-head">
+          <h3>逐条对照</h3>
+          <div id="reasons" class="reasons"></div>
+        </div>
+        <div id="staleNote" class="stale" hidden>标注已修改，下面的指标和对照基于修改前的版本，请重新点「计算指标」。</div>
+        <div class="table-wrap">
+          <table id="detailTable">
+            <thead>
+              <tr><th>判定</th><th>金标条款</th><th>系统条款</th><th>原因</th><th>覆盖</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="muted small">「覆盖」为金标文字在系统条目中的连续覆盖率，≥0.8 才算命中。重复、片段、忽略不计入误报。</p>
+      </section>
+    </section>
+  </main>
+</div>
+
+<div id="overlay" class="overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h2 id="modalTitle"></h2>
+      <button id="modalClose" class="icon" aria-label="关闭">×</button>
+    </div>
+    <div id="modalBody" class="modal-body"></div>
+    <div id="modalActions" class="modal-actions"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

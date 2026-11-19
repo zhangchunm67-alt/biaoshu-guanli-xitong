@@ -14,6 +14,8 @@ _ATTACHMENT = re.compile(r'^[（(]?(?:附件|附表|格式)\s*' + _NUMBER + r'(?
 _REQUEST = re.compile(r'提供|提交|出具|附[上后：:]?|后附|须附|应附|需附|复印|扫描|电子件|影印|粘贴|填写|填报|列举|列明|列出|说明|介绍|展示|证明|证书|简历|一览表|汇总表')
 _IMAGE = re.compile(r'复印件|扫描件|影印件|电子件|正反面|双面|照片|粘贴|证书|合同.{0,16}(?:证明|关键页)|证明材料')
 _COPY = re.compile(r'后附|附[：:]|附上|须附|应附|需附|粘贴|复印件|扫描件|影印件|电子件')
+_SUBMIT = re.compile(r'^(?:注[：:]|说明[：:])?(?:(?:投标人|供应商)(?:须|应|需)?|请|须|应|需)?'
+                     r'(?:提供|提交|出具|后附|附上|须附|应附|需附)')
 _SIGNATURE = re.compile(r'^(?:投标人|供应商|法定代表人|委托代理人|日期|年月日|年\s*月\s*日)')
 # An evaluation-method title leaves the format chapter; review criteria inside it do not.
 _METHOD = re.compile(r'(?:评标|评审|评分)(?:办法|方法|细则|程序)')
@@ -170,6 +172,10 @@ def title_topics(title):
     return keys
 
 
+def _tax_submission_note(text):
+    return bool(_SUBMIT.match(compact(text)) and _matches(text, 'tax_social'))
+
+
 def entry_score(title, category):
     """Match a material entry by meaning, without requiring a formal response area.
 
@@ -205,7 +211,10 @@ def entry_score(title, category):
         'legal_identity': r'(?:法定代表人|法人代表|法人|单位负责人)(?:身份证(?:明书?)?|证明书|护照)',
         'authorization': r'(?:(?:法定代表人|法人代表|法人|单位负责人)的?)?授权(?:委托)?书|(?:委托代理人|授权代理人|被授权人|授权代表)的?(?:身份证(?:明)?|护照)(?:[/／或及和、](?:身份证|护照))?',
         'audit_report': r'(?:近?[一二三\d-]+年)?(?:公司|企业|年度)?(?:财务(?:会计)?审计报告|年度审计报告|审计报告|财务(?:会计)?(?:报告|报表))',
-        'tax_social': r'(?:依法)?(?:(?:税收|纳税|税款)(?:和|及|与)?(?:社会保障资金|社会保险|社保)?|社会保障资金|社会保险|社保)(?:缴纳|缴费)?(?:证明(?:材料)?|凭证|记录)|完税(?:证明|凭证)',
+        'tax_social': (r'(?:(?:投标人|投标方|供应商|企业|公司|单位)的?)?(?:依法)?'
+                       r'(?:(?:税收|纳税|税款)(?:(?:和|及|与)(?:社会保障资金|社会保险|社保))?'
+                       r'|社会保障资金|社会保险|社保)(?:缴纳|缴费)?(?:证明(?:材料)?|凭证|记录)'
+                       r'|完税(?:证明|凭证)'),
         'company_profile': r'(?:公司|企业|单位|供应商|投标人)(?:基本)?(?:简介|介绍|概况|情况介绍|情况表|信息表|情况)',
         'iso_cert': r'(?:iso[\w/-]*|质量管理体系|环境管理体系|信息安全管理体系|职业健康安全管理体系)(?:认证)?(?:资质)?(?:证书|证明)',
         'case': r'(?:以往|既往|过往|历史|同类|类似|项目|服务|成功|典型|执行|企业|公司|客户)*(?:项目)?(?:业绩|案例|经验)(?:情况|实施经验|说明|介绍|展示|罗列|清单|汇总表|一览表|证明材料|证明|表)?',
@@ -373,6 +382,8 @@ def resolve(document, records, categories, toc_elements=()):
         r['_topics'] = {family(c) for c in categories if _matches(r['title'],family(c))}
         r['_title_topics'] = title_topics(r['title'])
         r['_entry_topics'] = {family(c) for c in categories if entry_score(r['title'],c)}
+        r['_tax_response_heading'] = (not r['_inside_table'] and 'tax_social' in r['_entry_topics']
+                                      and (r['_section_start'] or (mode == 'form' and r['_structural'])))
         if not r['_inside_table'] and (r['_structural'] or r['_title_topics']):
             section_title = r['title']
         r['_section_title'] = section_title
@@ -418,7 +429,9 @@ def resolve(document, records, categories, toc_elements=()):
             next_requirement = bool(other and r['_region']=='form' and
                 re.match(r'^(?:附[：:]\s*)?\d+[.．、]', compact(other['title'])) and
                 (next_peer or (other['_topics'] and not other['_topics'].intersection(r['_title_topics'] or r['_topics']))))
-            if other and (other['_structural'] or other.get('_raw_categories') or
+            own_tax_note = (other and r['_tax_response_heading'] and not other['_section_start']
+                            and not other['_structural'] and _tax_submission_note(other['title']))
+            if other and not own_tax_note and (other['_structural'] or other.get('_raw_categories') or
                           other['_title_topics'] or other['_entry_topics'] or next_requirement or
                           (other['_public'] and not _REQUEST.search(other['title']))):
                 break
@@ -482,7 +495,13 @@ def resolve(document, records, categories, toc_elements=()):
                 continue
             aliases = cid in engine._category_ids(r['title'], [category])
             score, reason = engine._special_score(r['title'], category) if category.get('layer')=='special' else (130 if aliases else 0, '栏目名称或别名')
-            form = (r['_region'] == 'form' or any(_form_table(e) for e in r['_own']) or r['legal_body_present']
+            # A generated response framework can carry source forms beneath
+            # section bookmarks without copying the buyer's format-chapter label.
+            bookmarked_qualification = (key in {'business_license', 'audit_report'}
+                and re.fullmatch(r'BidSection[1-9]\d*', r.get('chapter_id', ''))
+                and '资格证明' in r.get('chapter_path', ''))
+            form = (r['_region'] == 'form' or bookmarked_qualification
+                    or any(_form_table(e) for e in r['_own']) or r['legal_body_present']
                     or r['authorization_body_present'] or (key == 'authorization' and r.get('_after_letter')))
             # Table clauses identify requirements. An empty adjacent answer/score
             # cell alone does not authorize inserting images into that cell.
@@ -491,10 +510,26 @@ def resolve(document, records, categories, toc_elements=()):
             if re.search(r'格式见|见附件|详见|应包括|包括以下|提交下述', title):
                 continue
             request = _requirement(r, category, aliases)
+            if key == 'tax_social' and r['_tax_response_heading']:
+                # A body heading names the required evidence and owns its insertion
+                # point. Adjacent submission instructions are part of that slot.
+                if all(e.tag == qn('w:p') and not engine._drawing(e) and (
+                        not engine._text(e).strip() or _tax_submission_note(engine._text(e)))
+                        for e in r['_own']):
+                    r['existing_content'] = False
+                candidates.append((r, 135, '正文小节标题明确对应税收或社保缴纳凭证'))
+                continue
             attachment = bool(request and form and _COPY.search(title))
             # Financial/general form titles can be identified from their owned request.
             contextual = (form and key in r['_title_topics'] and len(title)<=65 and (
                 key=='company_profile' or any(_matches(engine._text(e), key) for e in r['_own'])))
+            if (bookmarked_qualification and key == 'audit_report' and contextual and r.get('_own')
+                    and all(e.tag == qn('w:p') and not engine._drawing(e) and (
+                        not engine._text(e).strip() or (_matches(engine._text(e), key)
+                        and re.search(r'提供|须附|应附', engine._text(e)))) for e in r['_own'])):
+                # The buyer's explanatory paragraph supplies the anchor,
+                # but it is not an already-filled audit artifact.
+                r['existing_content'] = False
             if request and form and key in {'audit_report','tax_social'} and re.search(r'提供|须附|应附',title):
                 attachment = True
             if not score and not attachment and not contextual:
@@ -638,9 +673,10 @@ def resolve(document, records, categories, toc_elements=()):
         # Agent ID copies without a labelled slot stay missing, not appended.
         if (not filtered and not has_token and reqs[cid]['status']!='not_detected'
                 and category.get('layer','common')=='common' and key != 'authorization'):
-            digest = hashlib.sha256(document.element.body.xml.encode()).hexdigest()[:16]
+            # Stable per-category id: body digests churned on every rescan and
+            # left projects pointing at dead ca:…:digest locators in preview.
             name = '法定代表人身份证附件（证明正文另行核对）' if cid=='legal_identity' else category['name']
-            extra.append({'id':f'ca:{cid}:{digest}','title':'文末新增材料区 · '+name,
+            extra.append({'id':f'ca:{cid}','title':'文末新增材料区 · '+name,
                 'level':2,'kind':'common_appendix','preview':'原文已识别材料要求，未找到可靠的独立图片位置。',
                 'category_ids':[cid],'existing_content':False,'legal_body_present':False,'authorization_body_present':False,
                 'identity_attachment_target':cid=='legal_identity','requirement':copy.deepcopy(reqs[cid]),

@@ -5,6 +5,7 @@ import json
 import socket
 from pathlib import Path
 import sys
+import sqlite3
 import tempfile
 import threading
 import time
@@ -251,12 +252,12 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn('Access-Control-Allow-Origin', response_headers)
         self.request('POST', '/api/industries', {'name': '证券'})
         self.httpd.store.db.commit()
-        reopened = server.Store(self.tmp.name)
-        try:
-            count = reopened.db.execute("SELECT count(*) FROM objects WHERE kind='material'").fetchone()[0]
+        with self.assertRaisesRegex(ValueError, '另一实例'):
+            server.Store(self.tmp.name)
+        with sqlite3.connect(f'file:{self.tmp.name}/store.sqlite3?mode=ro', uri=True) as reopened:
+            count = reopened.execute("SELECT count(*) FROM objects WHERE kind='material'").fetchone()[0]
             self.assertEqual(1, count)
-        finally:
-            reopened.close()
+        reopened.close()
         material, _ = self.request('PATCH', '/api/materials/' + material['id'], {'removed_file_ids': [first]})
         self.assertEqual([second], [file['id'] for file in material['files']])
         self.assertIsNotNone(self.httpd.store.get('file', first))

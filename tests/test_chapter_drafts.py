@@ -48,8 +48,8 @@ class ChapterDraftTests(unittest.TestCase):
                 result = Path(directory) / 'draft.docx'
                 engine.export_document(template, result, [], [], framework_drafts=store.require('project','p')['chapter_texts'])
                 exported = Document(result)
-                self.assertEqual(['专项方案', '专项方案', '采购范围说明', '【待编】填写本节的方案。',
-                                  '专项方案', '采购范围说明', '第一段', '第二段'],
+                self.assertEqual(['专项方案', '1. 专项方案', '采购范围说明', '【待编】填写本节的方案。',
+                                  '2. 专项方案', '采购范围说明', '第一段', '第二段'],
                                  [p.text for p in exported.paragraphs][1:])
                 self.assertEqual(2, len(exported.tables))
                 self.assertEqual(before, template.read_bytes())

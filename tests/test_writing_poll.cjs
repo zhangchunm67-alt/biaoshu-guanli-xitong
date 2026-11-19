@@ -54,7 +54,7 @@ test('delayed job refresh cannot undo adoption of an unrelated chapter during ge
   const adopted=job({...current,version:3,accepted_chapter_ids:['BidSection1'],chapter_revisions:{BidSection1:1,BidSection2:0}});
   const h=harness((url,options)=>{
     if(url.endsWith('?view=status'))return {case_revision:1,source_revision:[1,1],state_revision:2,job:{id:'old',status:'running',version:2}};
-    if(url.endsWith('?view=job')){requested.resolve();return old.promise;}
+    if(url.includes('?view=job')){requested.resolve();return old.promise;}
     if(options?.method==='POST')return {writing:writing(adopted),editor:{revision:1,mapping_revision:'mapping-2',
       chapters:[{id:'BidSection1',text:'第一章候选',revision:1},{id:'BidSection2',text:'',revision:0}]}};
     assert.fail('unexpected request '+url);

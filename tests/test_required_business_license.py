@@ -56,7 +56,10 @@ class BusinessLicenseTests(unittest.TestCase):
         self.assertEqual(1, sum(r['text'] == '营业执照' for r in revised['outline']))
         page = html.parse(str(service.asset(store, record['id'], 'html')[0]))
         titles = page.xpath('//ul[@class="outline"]/li/text()')
-        self.assertEqual('营业执照', titles[titles.index('公司介绍') - 1])
+        from outline_check import decimal_headings
+        expected = [f'{number} {title}' for number, title in decimal_headings(revised['outline'])]
+        index = next(i for i, title in enumerate(expected) if title.endswith('公司介绍'))
+        self.assertEqual(expected[index-1:index+1], titles[index-1:index+1])
         doc = Document(service.asset(store, record['id'], 'word')[0])
         headings = [p.text for p in doc.paragraphs if p._p.xpath('.//w:bookmarkStart')]
         self.assertEqual(1, sum(t.endswith('营业执照') for t in headings))

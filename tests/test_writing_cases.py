@@ -85,14 +85,40 @@ class WritingCasesTests(unittest.TestCase):
         self.assertIn('客户：某单位 | 服务范围：现场支持', result['sources'][1]['text'])
         self.assertEqual('第 2 行', result['sources'][3]['location'])
         self.assertEqual(4, len({s['id'] for s in result['sources']}))
-        self.assertTrue(any('附图.png' in w and '不支持' in w for w in result['warnings']))
+        self.assertTrue(any('附图.png' in w and ('OCR' in w or 'requirements-ocr' in w) for w in result['warnings']))
         json.dumps(result, ensure_ascii=False)
 
     def test_pdf_pages_and_empty_page_warning(self):
         result = cases.parse_uploads([upload('case.pdf', pdf(['Page one', '', 'Page three']))])
         self.assertEqual(['第 1 页', '第 3 页'], [s['location'] for s in result['sources']])
         self.assertEqual(['Page one', 'Page three'], [s['text'] for s in result['sources']])
-        self.assertTrue(any('第 2' in w and 'OCR' in w for w in result['warnings']))
+        self.assertTrue(any('第 2' in w for w in result['warnings']))
+
+    def test_docx_media_and_pdf_blank_pages_use_paddle_ocr(self):
+        from PIL import Image
+        image = io.BytesIO()
+        Image.new('RGB', (40, 20), 'white').save(image, format='PNG')
+        media = image.getvalue()
+        document = Document()
+        document.add_paragraph('封面说明')
+        output = io.BytesIO()
+        document.save(output)
+        packed = io.BytesIO(output.getvalue())
+        # Inject a media part so the office parser discovers an embedded image.
+        with zipfile.ZipFile(packed, 'a') as zf:
+            zf.writestr('word/media/image1.png', media)
+        raw = packed.getvalue()
+        with patch('case_ocr.available', return_value=True), \
+             patch('case_ocr.recognize_image', return_value='项目名称：城北运维') as recognize:
+            result = cases.parse_uploads([upload('业绩册.docx', raw)])
+        self.assertTrue(any(s['location'].startswith('图片 OCR') and '城北运维' in s['text'] for s in result['sources']))
+        recognize.assert_called()
+        with patch('case_ocr.available', return_value=True), \
+             patch('case_ocr.recognize_pdf_page', return_value='扫描页合同金额') as page_ocr:
+            scanned = cases.parse_uploads([upload('scan.pdf', pdf(['', 'Visible']))])
+        self.assertEqual(['第 1 页 OCR', '第 2 页'], [s['location'] for s in scanned['sources']])
+        self.assertEqual('扫描页合同金额', scanned['sources'][0]['text'])
+        page_ocr.assert_called_once()
 
     def test_pptx_uses_presentation_order(self):
         result = cases.parse_uploads([upload('项目案例.pptx', slides())])

@@ -57,10 +57,15 @@ class ExportJobTests(unittest.TestCase):
                 self.store.put('project',p);self.store.db.commit()
                 active=self.store.export_jobs.list()[0]
             self.assertEqual('running',active['status']);self.assertGreater(active['remaining_seconds'],0)
+            from errors import ConflictError
+            with self.assertRaisesRegex(ConflictError, '旧版本'):
+                self.start()
             release.set();job=self.wait()
         self.assertEqual('completed',job['status']);self.assertEqual(100,job['progress'])
         self.assertTrue(self.store.path('exports/'+job['result']['id']+'.docx').is_file())
-        self.assertEqual('导出期间新增备注',self.store.require('project',self.key)['mappings'][0]['note'])
+        project = self.store.require('project', self.key)
+        self.assertEqual('导出期间新增备注', project['mappings'][0]['note'])
+        self.assertNotEqual('已导出', project['status'])
         self.store.close();self.store=Store(self.temp.name)
         self.assertEqual(job['result'],self.store.export_jobs.list()[0]['result'])
     def test_failure_and_service_restart_recovery(self):
