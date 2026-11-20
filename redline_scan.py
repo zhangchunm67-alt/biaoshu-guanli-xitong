@@ -112,9 +112,11 @@ def _descendant_ids(outline):
     return result
 
 
-def scan(requirements, chapter_texts, mappings, outline=None, versions=None):
+def scan(requirements, chapter_texts, mappings, outline=None, versions=None, imported=None):
     redlines = [row for row in requirements if row.get('category') == 'redline']
-    texts = chapter_texts or {}
+    # Imported custom-outline content counts as present for the empty-chapter check only;
+    # the input token keeps using saved text so existing confirmations stay valid.
+    texts = {**(imported or {}), **{k: v for k, v in (chapter_texts or {}).items() if str(v or '').strip()}}
     outline = outline or []
     versions = versions or {}
     descendants = _descendant_ids(outline)
@@ -270,7 +272,9 @@ def evaluate(project, framework, versions=None):
     requirements = framework.get('requirements') or []
     chapter_texts = project.get('chapter_texts', {})
     mappings = project.get('mappings', [])
-    result = scan(requirements, chapter_texts, mappings, framework.get('outline') or [], versions)
+    import writing_chat
+    result = scan(requirements, chapter_texts, mappings, framework.get('outline') or [], versions,
+                  imported=writing_chat.imported_texts(project, framework))
     legacy_token = _legacy_input_token(requirements, chapter_texts, mappings)
     saved = _saved_acks(project.get('redline_review') or {}, result, legacy_token)
     ai, _ = _fresh_ai(project, result['input_token'])

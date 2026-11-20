@@ -4,7 +4,7 @@
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {spawn,spawnSync}=require('node:child_process');
-let pw;try{pw=require('playwright');}catch{pw=require('/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');}
+const pw=require('playwright');
 const app=path.resolve(__dirname,'..'),python=process.env.BID_TEST_PYTHON||path.join(app,'.venv/bin/python');
 const root=process.env.BID_CHAIN_QA_DIR||fs.mkdtempSync(path.join(os.tmpdir(),'bid-chain-'));
 fs.mkdirSync(root,{recursive:true});
@@ -45,7 +45,7 @@ if(fixture.status!==0)throw Error(fixture.stderr);
 const ids=JSON.parse(fixture.stdout);
 async function stop(server){if(!server||server.exitCode!==null)return;server.kill('SIGTERM');await new Promise(resolve=>server.once('exit',resolve));}
 async function start(){
- const child=spawn(python,['-B','-u','-c','from server import create_server\nimport sys, writing_model\nwriting_model.complete_json=lambda rules, context, schema: {"items":[dict(id=row["id"],verdict="unclear",reason="请人工核对",evidence="",chapter_ids=[],suggestion="") for row in context["redlines"]]}\ns=create_server(0,sys.argv[1],seed=False);print(s.server_port,flush=True)\ntry:s.serve_forever()\nfinally:s.server_close();s.store.close()',path.join(root,'data')],{cwd:app,env,stdio:['ignore','pipe','pipe']});
+ const child=spawn(python,['-B','-u','-c','from server import create_server\nimport sys, writing_model\nwriting_model.complete_json=lambda rules, context, schema, **kwargs: {"items":[dict(id=row["id"],verdict="unclear",reason="请人工核对",evidence="",chapter_ids=[],suggestion="") for row in context["redlines"]]}\ns=create_server(0,sys.argv[1],seed=False);print(s.server_port,flush=True)\ntry:s.serve_forever()\nfinally:s.server_close();s.store.close()',path.join(root,'data')],{cwd:app,env,stdio:['ignore','pipe','pipe']});
  child.stderr.on('data',data=>fs.appendFileSync(path.join(root,'server-test.log'),data));
  const port=await new Promise((resolve,reject)=>{child.stdout.once('data',b=>resolve(Number(b.toString().trim())));child.once('exit',code=>reject(Error('server exit '+code)));});
  return {child,base:'http://127.0.0.1:'+port};

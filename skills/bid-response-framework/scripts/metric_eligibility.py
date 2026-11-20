@@ -32,7 +32,7 @@ ACTOR_GATE = re.compile(ACTOR + r'.{0,9}(?:必须|应当|需要|须|应具|应�
 REFER = re.compile(r'^(?:详见|见第|符合第.{0,20}章|按.{0,12}(?:公告|须知前附表)|详参)|由招标人在资格预审中确定')
 STAR_POLICY = re.compile(r'标识|标注|标记|标有|带[有“「]?|加[注“]|(?:任一|任何|所有)[“「]?★|★[”」]?号?条款')
 META = re.compile(
-    r'具体条款是否实施|否决投标的情况说明|(?:废标|否决投标)(?:情况|情形)(?:报告|汇总)|'
+    r'具体条款是否实施|否决投标的?情况说明|(?:废标|否决投标)(?:情况|情形)(?:报告|汇总)|'
     r'(?:评标委员会|招标人|采购人|代理机构).{0,20}对否决(?:投标|响应).{0,12}作出.{0,8}(?:书面)?说明|'
     r'招标人.{0,15}以显著的方式标明|[投应]标文件中?是否存在.{0,15}无效|评审标准和内容见|将可能被拒绝[：:]?[（(]详见|'
     r'不得(?:以.{0,26})?(?:认定|视为|判定|作|作为).{0,4}(?:无效|废标)|不(?:能|会|应)导致.{0,8}(?:废标|被否决)|'
@@ -103,6 +103,25 @@ def reject(s):
 
 def review_table_consequence(text):
     return bool(REVIEW_TABLE_CONSEQUENCE.search(text) or REVIEW_TABLE_CONSEQUENCE.search(compact(text)))
+
+
+def summary_rejection(cells):
+    """A summary row such as “第四章 | 合同条款 | 未能完全响应任一★条款的投标将被否决”.
+
+    Returns None for an ordinary review row. For a summary row returns its rejection sentence when it is a
+    single short rule, or '' when the cell restates a long body passage that is extracted from the body.
+    The short labels before it are section names, never triggers."""
+    values = [v.strip() for v in cells if v and v.strip()]
+    rules = [v for v in values if reject(v)]
+    labels = [v for v in values if v not in rules]
+    if len(rules) != 1 or not labels or any(len(compact(v)) > 12 for v in labels):
+        return None
+    rule = rules[0]
+    if '★' in rule and STAR_POLICY.search(rule):
+        # A star legend points at the concrete ★ clauses; it is not a separate trigger.
+        return ''
+    sentences = [x for x in re.split(r'(?<=[。！？；;])', rule) if compact(x)]
+    return rule if len(compact(rule)) <= 80 and len(sentences) == 1 else ''
 
 
 def review_criterion_cells(cells):
@@ -252,6 +271,11 @@ def grounds(units, stars):
             # always arm the following review-table rows.
             review_table = u
         if review_table and u.kind == 'row':
+            summary = summary_rejection(u.cells)
+            if summary is not None:
+                if summary:
+                    yield hit('redline', summary, u, [review_table], '否决情形汇总表列明')
+                continue
             criterion = review_criterion_cells(u.cells if u.kind == 'row' else vals)
             if criterion and not review_table_consequence(criterion):
                 yield hit('redline', criterion, u, [review_table], '审查表：一项不符合即触发原件规定的否决后果')

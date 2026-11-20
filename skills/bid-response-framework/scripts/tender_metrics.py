@@ -59,6 +59,9 @@ def source_record(unit):
             'is_heading': unit.is_heading, 'selection_uncertain': unit.selection_uncertain}
 
 
+NOT_APPLICABLE_FORM = re.compile(r'[（(]\s*本项目\s*(?:不涉及|不适用|无需提供|无须提供|不要求)\s*[)）]')
+
+
 def format_items(source, units, plan=None, source_document=None):
     # Reuse the planner's actual-form boundaries so the fifth group and copied
     # original forms point to the same source blocks, not an attachment catalog.
@@ -94,6 +97,9 @@ def format_items(source, units, plan=None, source_document=None):
         if not matches:
             continue
         unit = matches[0]
+        # A form under “十五、其他材料（本项目不涉及）” or titled “…（不适用）” is not part of this response.
+        if NOT_APPLICABLE_FORM.search(form.get('title') or '') or NOT_APPLICABLE_FORM.search(unit.context or ''):
+            continue
         # The title is the review unit; the full source block is copied by the
         # planner. Relevant table evidence can be reached via the source range.
         yield {'category': 'format', 'unit': unit, 'text': unit.text,

@@ -782,7 +782,12 @@ def validate_mappings(mappings, materials, headings, categories=None, *, context
             if len(ids) != len(set(ids)):
                 errors.append("同一栏目重复选择同一材料。")
             if not ids:
-                errors.append("存在多个材料版本，请人工选择。" if sum(m.get("category_id") == category_id for m in materials) > 1 else "尚未选择材料。")
+                from material_rules import period_issue
+                if category_id == 'tax_social' and heading and period_issue(heading):
+                    # The period cannot be checked automatically, so nothing was preselected.
+                    errors.append("原文缴费期限须按投标截止日核对，系统未自动选择；请人工选择符合期限的纳税和社保凭证。")
+                else:
+                    errors.append("存在多个材料版本，请人工选择。" if sum(m.get("category_id") == category_id for m in materials) > 1 else "尚未选择材料。")
             if category_id == 'authorization' and heading and heading.get('authorization_has_images'):
                 errors.append('原授权书已含证件图片，系统保留原件；请先核对已有附件，避免重复或混用人员。')
             covered = set()

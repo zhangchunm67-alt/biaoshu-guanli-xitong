@@ -131,6 +131,9 @@ def _matches(text, key):
         return bool(re.search(r'(?:缴纳|缴费|完税|社会保险权益记录).{0,40}(?:税|社保|社会保障|社会保险|证明|凭证)|(?:税收|税款|纳税).{0,12}(?:缴纳|缴费|完税|凭证)|(?:社保|社会保险|社会保障资金).{0,20}(?:缴纳|缴费|证明|凭证)|纳税证明', v)
                     and (not personal or corporate) and not re.search(r'纳税信用|税务登记证|一般纳税人', v) and _REQUEST.search(v))
     if key == 'company_profile':
+        # “投标人基本情况表/信息表” is a fill-in form, not a company introduction to insert.
+        if re.search(r'(?:情况|信息|概况)(?:信息|登记)?表[；;。：:）)]*$', compact(v)):
+            return False
         return bool(re.search(r'(?:公司|企业|供应商|投标人)(?:基本)?(?:情况表|情况介绍|信息表|介绍|简介|概况)|贵公司.{0,12}基本情况|(?:公司|企业|供应商|投标人)基本(?:情况|信息)', v))
     if key == 'iso_cert':
         return bool(re.search(r'ISO\s*[-/\w]*|质量管理体系|环境管理体系|信息安全管理体系|职业健康安全管理体系', v, re.I)
@@ -170,6 +173,16 @@ def title_topics(title):
     if re.fullmatch(r'(?:行业|同类|类似|项目|服务|合作)(?:经验|案例|业绩)(?:情况|介绍|展示)?',v):keys.add('case')
     if re.fullmatch(r'(?:企业|公司|供应商|投标人)(?:基本)?(?:情况|信息)(?:表|介绍)?',v):keys.add('company_profile')
     return keys
+
+
+_PERSONNEL_SECTION = re.compile(r'团队|人员|成员|简历|项目负责人|项目经理|员工')
+
+
+def _personnel_social_heading(r):
+    """“9.9.4 社保缴纳证明” under “9.9 团队及人员配置” proves staff employment, not the bidder's payments."""
+    title = r.get('title', '')
+    parents = (r.get('chapter_path') or '').replace(title, '')
+    return bool(_PERSONNEL_SECTION.search(parents) and not re.search(r'企业|公司|单位|投标人|供应商|税', title))
 
 
 def _tax_submission_note(text):
@@ -383,7 +396,8 @@ def resolve(document, records, categories, toc_elements=()):
         r['_title_topics'] = title_topics(r['title'])
         r['_entry_topics'] = {family(c) for c in categories if entry_score(r['title'],c)}
         r['_tax_response_heading'] = (not r['_inside_table'] and 'tax_social' in r['_entry_topics']
-                                      and (r['_section_start'] or (mode == 'form' and r['_structural'])))
+                                      and (r['_section_start'] or (mode == 'form' and r['_structural']))
+                                      and not _personnel_social_heading(r))
         if not r['_inside_table'] and (r['_structural'] or r['_title_topics']):
             section_title = r['title']
         r['_section_title'] = section_title
@@ -489,6 +503,8 @@ def resolve(document, records, categories, toc_elements=()):
                     r['_special_scores'][cid] = (score, reason)
                 continue
             if r['_region'] in {'contract','scoring','instructions'}:
+                continue
+            if key == 'tax_social' and _personnel_social_heading(r):
                 continue
             title = compact(r['title'])
             if region_title(title) or re.fullmatch(r'[（(]?(?:附件|附表|格式)\s*' + _NUMBER + r'[）)\s:：、.．-]*', title):

@@ -150,9 +150,18 @@ def available_models():
     return [{'id': model_id, 'label': model_label(model_id)} for model_id in ids]
 
 
+# 红线逐条核对与按红线修正固定使用 Kimi，与编写正文所选模型无关；可用 BID_REDLINE_MODEL 覆盖。
+KIMI_MODEL = 'moonshotai/kimi-k3.1-pro'
+
+
+def redline_model():
+    return os.environ.get('BID_REDLINE_MODEL', '').strip() or KIMI_MODEL
+
+
 def resolve_model(requested=None):
     """Return an allowlisted model id; empty requested uses the configured default."""
-    allowed = {row['id'] for row in available_models()}
+    # System-chosen models (outline, redline) are always allowed; the UI list stays the writing allowlist.
+    allowed = {row['id'] for row in available_models()} | {KIMI_MODEL, redline_model()}
     default = default_model_id()
     if requested is None or (isinstance(requested, str) and not requested.strip()):
         return default

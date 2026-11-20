@@ -7,9 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const {spawn} = require('node:child_process');
-let playwright;
-try { playwright = require('playwright'); }
-catch { playwright = require('/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'); }
+const playwright = require('playwright');
 const app=path.resolve(__dirname,'..');
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'bid-review-ui-'));
 const python=process.env.BID_TEST_PYTHON||path.join(app,'.venv/bin/python');

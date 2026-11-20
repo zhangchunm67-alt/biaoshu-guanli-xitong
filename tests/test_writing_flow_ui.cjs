@@ -4,9 +4,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const {spawn, spawnSync} = require('node:child_process');
-let playwright;
-try { playwright = require('playwright'); }
-catch { playwright = require('/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'); }
+const playwright = require('playwright');
 const app = path.resolve(__dirname, '..');
 const python = process.env.BID_TEST_PYTHON || path.join(app, '.venv/bin/python');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bid-writing-ui-'));
@@ -61,12 +59,15 @@ def generate(context, model=None):
     return dict(chapters=rows,notes=['模型为确定性测试替身；业务事实不可用于真实投标。'])
 writing_model.generate=generate
 def complete(system, context, schema, **kwargs):
+    # Redline checks and redline rewrites always use Kimi, whichever model wrote the body.
+    assert kwargs['model'] == 'moonshotai/kimi-k3.1-pro', kwargs.get('model')
     if 'redlines' not in context:
         first=context['issues'][0]
         source=next((r for r in context['cases'] if '曾按里程碑完成测试服务' in r['text']),None)
-        return {'items': [] if not source else [dict(issue_id=first['id'], chapter_id=first['chapters'][0],
-            source_id=source['id'], quote='曾按里程碑完成测试服务', addition='历史案例曾按里程碑完成测试服务。')]}
-    assert kwargs['model'] == 'alternate-model'
+        chapter=next(r for r in context['chapters'] if r['id']==first['chapters'][0])
+        return {'items': [] if not source else [dict(chapter_id=chapter['id'], issue_ids=[first['id']],
+            source_ids=[source['id']], summary='按红线补充历史经验',
+            text=chapter['text']+'\n历史案例曾按里程碑完成测试服务。')]}
     assert any('保留原始技术段落' in row['text'] for row in context['chapters'])
     target=next((r for r in context['chapters'] if '测试实施计划' in r['path']),None)
     return {'items': [dict(id=row['id'], verdict='unclear', reason='案例不足', evidence='',

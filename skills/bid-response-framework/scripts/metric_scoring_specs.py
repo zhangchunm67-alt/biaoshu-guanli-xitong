@@ -116,7 +116,7 @@ def table_factors(group):
             else:
                 value = pval + '分'
         if details and not GRADE.match(details) and label in ('综合实力', '服务方案', '项目实施与管理'):
-            excerpt = re.split(r'[。；;\n]', details, 1)[0]
+            excerpt = re.split(r'[。；;\n]', details, maxsplit=1)[0]
             display = label + ' · ' + excerpt[:42]
         title = display[:110] + ('（'+value+'）' if value else '')
         previous = item('score', unit, title)
@@ -287,7 +287,7 @@ def response_matrices(units):
 
 def submission_paragraph(unit):
     """Literal submission/format obligations, including typography-split Chinese."""
-    s = re.split(r'招标经办联系人[：:]|(?:联系电话|联系邮箱)[：:]', unit.text.strip(), 1)[0].strip()
+    s = re.split(r'招标经办联系人[：:]|(?:联系电话|联系邮箱)[：:]', unit.text.strip(), maxsplit=1)[0].strip()
     n = norm(s)
     if FORMAT_AREA.search(unit.context) or QUAL_LABEL.search(unit.context):
         return
@@ -369,7 +369,7 @@ def choice_excerpt(name,value):
 def substantive_paragraph(unit, authoritative):
     # A locally annotated buyer document sometimes appends a bidder-side example after the printed clause.
     # The locator still exposes the raw unit; the counted excerpt ends before the example.
-    s = re.split(r'(?<=[。；;])[（(](?:案例[：:]|公司介绍[-－]|内部备注[：:]|业务批注[：:])', unit.text.strip(), 1)[0]
+    s = re.split(r'(?<=[。；;])[（(](?:案例[：:]|公司介绍[-－]|内部备注[：:]|业务批注[：:])', unit.text.strip(), maxsplit=1)[0]
     declared = scope_item(s)
     if unit.is_heading and declared and declared[2]:
         return

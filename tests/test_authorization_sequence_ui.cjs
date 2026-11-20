@@ -1,7 +1,7 @@
 /* Real server + browser: reviewed authorization text, then both identity images. */
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const {spawn,spawnSync}=require('node:child_process');
-let pw;try{pw=require('playwright');}catch{pw=require('/Users/mac/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');}
+const pw=require('playwright');
 const app=path.resolve(__dirname,'..'),python=process.env.BID_TEST_PYTHON||path.join(app,'.venv/bin/python');
 (async()=>{let server,browser,fixtureRoot;try{
 server=spawn(python,['-B','-u','-c',`import sys,json,signal

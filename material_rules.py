@@ -5,6 +5,7 @@ date or an unrelated date in a description. Unknown metadata cannot prove a
 specific month requirement.
 """
 import re
+import unicodedata
 
 
 PARTIAL_ISSUE_TYPES = frozenset({'missing_years', 'missing_evidence_kind', 'missing_months'})
@@ -50,13 +51,59 @@ _SPAN = re.compile(r'(20\d{2})年(\d{1,2})月?' + _RANGE + r'(?:(20\d{2})年)?(\
 # first, so "自2025年1月至2025年6月截止" keeps its end month.
 _DEADLINE = re.compile(r'(?:应于|须于|需于|于)?20\d{2}年\d{1,2}月(?:\d{1,2}日)?'
                        r'(?:前|之前|以前)?(?:提交|递交|报送|送达)')
-_RELATIVE = re.compile(r'(?:近|前|最近)[一二三四五六七八九十\d]+个?月|近半年')
+_RELATIVE = re.compile(r'(?:近|前|最近)[一二三四五六七八九十\d]+个?月|近半年|上一?个?(?:季度|月)')
 _TAX_WORD, _SOCIAL_WORD = r'税收|税款|纳税|完税', r'社保|社会保险|社会保障|职工缴费'
 _KIND_WORD = re.compile('(' + _TAX_WORD + ')|(' + _SOCIAL_WORD + ')')
 # A period written just before its evidence (2025年1月的纳税证明, 2025年2月份的
 # 社保缴费证明) names that evidence.
 _BEFORE_KIND = re.compile(r'(?:份|期间|所属期)?[）)]?(?:的|之)?(?:单位|企业|公司|依法)?(?:缴纳)?'
                           r'(?=' + _TAX_WORD + '|' + _SOCIAL_WORD + ')')
+
+
+_CN_DIGIT = {'〇': 0, '零': 0, '○': 0, 'O': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+             '六': 6, '七': 7, '八': 8, '九': 9}
+_CN_MONTH = r'(?:十[一二]?|[一二三四五六七八九])'
+_QUARTER = {'一': 1, '二': 2, '三': 3, '四': 4, '1': 1, '2': 2, '3': 3, '4': 4}
+_RANGE_MARK = r'(?:至|到|[-—–~～])'
+# Period-like wording that survives normalisation without being parsed. Its
+# presence means the requirement cannot be checked automatically.
+_UNPARSED = re.compile(r'季度|半年|20\d{2}[./-](?:0?[1-9]|1[0-2])(?!\d)')
+
+
+def _cn_month(value):
+    if value.startswith('十'):
+        return 10 + (_CN_DIGIT.get(value[1:], 0) if value[1:] else 0)
+    return _CN_DIGIT[value]
+
+
+def _compact(text):
+    """Rewrite common period spellings to the 2025年1月至2025年6月 form.
+
+    Covers full-width digits, Chinese numerals, 年度, quarters, halves, and
+    dotted/slashed dates, so the requirement and the material are read alike.
+    """
+    text = unicodedata.normalize('NFKC', re.sub(r'\s+', '', text or ''))
+    text = re.sub(r'二[〇零○O][〇零○O一二三四五六七八九]{2}(?=年)',
+                  lambda m: ''.join(str(_CN_DIGIT[c]) for c in m[0]), text)
+    text = re.sub(r'(?<=[年至到\-—–~～、,和及])(' + _CN_MONTH + r')(?=月|' + _RANGE_MARK + r'|[、,和及])',
+                  lambda m: str(_cn_month(m[1])), text)
+    text = re.sub(r'(20\d{2})年度(?=\d|第|[上下]半)', r'\1年', text)
+
+    def quarter(m):
+        q = _QUARTER[m[2]]
+        return f'{m[1]}年{q * 3 - 2}月至{m[1]}年{q * 3}月'
+    text = re.sub(r'(20\d{2})年度?第?([一二三四1-4])季度', quarter, text)
+    text = re.sub(r'(20\d{2})年度?([上下])半年度?',
+                  lambda m: f'{m[1]}年{1 if m[2] == "上" else 7}月至{m[1]}年{6 if m[2] == "上" else 12}月', text)
+
+    def dotted_range(m):
+        return f'{m[1]}年{int(m[2])}月至{m[3] or m[1]}年{int(m[4])}月'
+    text = re.sub(r'(20\d{2})[./](\d{1,2})' + _RANGE_MARK + r'(?:(20\d{2})[./])?(\d{1,2})(?![\d./])',
+                  dotted_range, text)
+    text = re.sub(r'(20\d{2})-(\d{1,2})(?:至|到|~|～)(20\d{2})-(\d{1,2})(?!\d)', dotted_range, text)
+    text = re.sub(r'(20\d{2})[./](0?[1-9]|1[0-2])[./](\d{1,2})(?!\d)', lambda m: f'{m[1]}年{int(m[2])}月{int(m[3])}日', text)
+    text = re.sub(r'(20\d{2})[./](0?[1-9]|1[0-2])(?![\d./])', lambda m: f'{m[1]}年{int(m[2])}月', text)
+    return text
 
 
 def _spans(text, deadlines=False):
@@ -74,15 +121,18 @@ def _spans(text, deadlines=False):
     rest = _SPAN.sub(mask, text)
     if deadlines:
         rest = _DEADLINE.sub(mask, rest)
-    for m in re.finditer(r'(20\d{2})年((?:\d{1,2}[、，,])*\d{1,2})月', rest):
-        found = {int(m[1]) * 12 + int(n) - 1 for n in re.split('[、，,]', m[2]) if 1 <= int(n) <= 12}
+    for m in re.finditer(r'(20\d{2})年((?:\d{1,2}月?[、，,和及])*\d{1,2})月', rest):
+        found = {int(m[1]) * 12 + int(n) - 1 for n in re.split('月?[、，,和及]', m[2]) if 1 <= int(n) <= 12}
         spans.append((m.start(), m.end(), found, True))
+    rest = re.sub(r'(20\d{2})年((?:\d{1,2}月?[、，,和及])*\d{1,2})月', mask, rest)
+    for m in _UNPARSED.finditer(rest):
+        spans.append((m.start(), m.end(), set(), False))
     return sorted(spans, key=lambda span: span[0])
 
 
 def _period(text, deadlines=False):
     """Months named by text, and whether a range in it is not a valid period."""
-    spans = _spans(re.sub(r'\s+', '', text or ''), deadlines)
+    spans = _spans(_compact(text), deadlines)
     return set().union(*(span[2] for span in spans)), not all(span[3] for span in spans)
 
 
@@ -121,7 +171,7 @@ def period_issue(heading):
 def _clause_periods(clause):
     """Months per kind by position: a period just before a kind names it; any
     other period continues the nearest kind before it, or else the next one."""
-    text = re.sub(r'\s+', '', clause)
+    text = _compact(clause)
     kinds = [(m.start(), m.end(), 'tax' if m.group(1) else 'social') for m in _KIND_WORD.finditer(text)]
     own, every = {}, set()
     for start, end, found, _ in _spans(text, deadlines=True):
