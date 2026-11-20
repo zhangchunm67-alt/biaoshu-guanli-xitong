@@ -261,32 +261,30 @@ class RedlineKimiLoopTests(unittest.TestCase):
         job = self.store.writing.describe(self.project['id'])['job']
         self.assertEqual('completed', job['status'], job.get('error'))
         kimi_id = 'moonshotai/kimi-k3.1-pro'
-        self.assertEqual([(kimi_id, 'review'), (kimi_id, 'repair'), (kimi_id, 'review')], calls)
+        # One Kimi check, one Kimi rewrite; the rewrite is rechecked by “AI 逐条核对” after adoption.
+        self.assertEqual([(kimi_id, 'review'), (kimi_id, 'repair')], calls)
         row = next(r for r in job['chapters'] if r['chapter_id'] == self.chapter)
         self.assertIn('我方承诺投标有效期为150天', row['text'])
         self.assertEqual([rid], row['redline_revisions'][0]['issue_ids'])
+        self.assertEqual([rid], self.store.require('writing_job', job['id'])['redline_result']['revised_ids'])
+        self.assertTrue(any('采纳后请用“AI 逐条核对”复核' in item for item in job['result']['pending']))
 
-    def test_repair_stops_after_two_rounds(self):
+    def test_no_rewrite_when_kimi_finds_every_redline_met(self):
         self.store.writing.upload(self.project['id'], self.request(files=[{
             'name': '案例.txt', 'data': base64.b64encode('历史项目按时提供服务保障。'.encode()).decode()}]))
         rid, calls = self.redline['id'], []
 
-        def stubborn(system, content, schema, model=None, **_):
+        def satisfied(system, content, schema, model=None, **_):
             calls.append('repair' if '修正员' in system else 'review')
-            if '修正员' in system:
-                chapter = next(row for row in content['chapters'] if row['id'] == self.chapter)
-                return {'items': [dict(chapter_id=self.chapter, issue_ids=[rid], source_ids=[], summary='再改',
-                                       text=chapter['text'] + '\n我方将按要求响应。')]}
-            return {'items': [dict(id=rid, verdict='risk', reason='仍未满足', evidence='',
-                                   chapter_ids=[self.chapter], suggestion='补充')]}
+            return {'items': [dict(id=rid, verdict='satisfied', reason='已响应', evidence='本节说明服务保障安排与响应流程。',
+                                   chapter_ids=[self.chapter], suggestion='')]}
 
-        with patch('writing_model.complete_json', side_effect=stubborn), \
+        with patch('writing_model.complete_json', side_effect=satisfied), \
                 patch('writing_model.generate', side_effect=self.draft):
             self.store.writing.start(self.project['id'], self.request(chat=True))
         job = self.store.writing.describe(self.project['id'])['job']
         self.assertEqual('completed', job['status'], job.get('error'))
-        self.assertEqual(['review', 'repair', 'review', 'repair', 'review'], calls)
-        self.assertTrue(job['result']['pending_count'] >= 1)
+        self.assertEqual(['review'], calls)
 
 
 class RelativeTaxPeriodMessageTests(unittest.TestCase):
