@@ -186,6 +186,27 @@ test('completion toast only appears for a background export',async()=>{
   await check(null);assert.equal(h.context.messages.length,1);
 });
 
+test('export submitted during an in-flight poll still refreshes when it completes',async()=>{
+  const h=harness();
+  vm.runInContext(`globalThis.refreshes=0;globalThis.reads=[];toast=()=>{};paintExportTasks=()=>{};render=()=>{};
+    refreshData=async()=>{refreshes++;};openExportTask=()=>{};
+    api=(url,options)=>options?.method==='POST'?Promise.resolve({id:'new',status:'queued',project_name:'p'})
+      :new Promise(resolve=>reads.push(resolve));`,h.context);
+  const timers=[];h.context.setTimeout=(fn,ms)=>{timers.push(ms);return timers.length;};
+  // A scheduled poll is in flight when the export is submitted; its answer predates the new job.
+  const scheduled=h.pollExportTasks();
+  const queued=h.context.queueExport('project','reviewed','rev');
+  await new Promise(resolve=>setImmediate(resolve));
+  h.context.reads.shift()([]);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.exportTasks.jobs.some(job=>job.id==='new'),true,'new job must not be dropped');
+  // The skipped poll runs again at once and sees the job completed.
+  h.context.reads.shift()([{id:'new',status:'completed',project_name:'p'}]);
+  await scheduled;await queued;
+  assert.equal(h.context.refreshes,1);
+  assert.equal(timers.at(-1),10000);
+});
+
 test('export dock hides earlier results and keeps a running task visible through completion',async()=>{
   const h=harness(),dock={hidden:true,innerHTML:''};
   h.nodes.set('#export-task-dock',dock);

@@ -252,7 +252,8 @@ function renderCreditEvidence(evidence) {
 }
 function toast(message, error = false) {
   // 新提示替换旧提示，避免过期的“尚未保存”“尚有 N 条未勾选”等消息叠在一起。
-  for (const old of document.querySelectorAll('#toast-root .toast')) old.remove();
+  // 但成功提示不能顶掉仍在显示的错误（如导出被红线拦截的原因），错误保留到自身到期或被新错误替换。
+  for (const old of document.querySelectorAll('#toast-root .toast')) if (error || !old.classList.contains('error')) old.remove();
   const el = document.createElement('div'); el.className = `toast${error ? ' error' : ''}`; el.setAttribute('role',error ? 'alert' : 'status');
   el.innerHTML = `${icon(error ? 'alert' : 'check')}<span>${esc(message)}</span>`;
   $('#toast-root').append(el); setTimeout(() => el.remove(),error ? 9000 : 4500);
@@ -924,7 +925,7 @@ async function changeFile(action) {
   catch(e){renderDrawer();throw e;}
 }
 let exportInFlight=false;
-const exportTasks={jobs:[],timer:null,modalId:null,polling:false,visibleIds:new Set(),error:''};
+const exportTasks={jobs:[],timer:null,modalId:null,polling:false,rerun:false,visibleIds:new Set(),error:''};
 function exportRemaining(job){
   if(job.status==='queued')return '排队中';
   if(job.status!=='running')return '';
@@ -956,10 +957,19 @@ function openExportTask(id){
   document.body.append(modal);modal.showModal();
 }
 async function pollExportTasks(){
-  if(exportTasks.polling)return;exportTasks.polling=true;
+  // A poll requested while another is in flight (e.g. right after submitting an export) runs again
+  // as soon as that one finishes, so a just-submitted job is never left waiting for the slow timer.
+  if(exportTasks.polling){exportTasks.rerun=true;return;}
+  exportTasks.polling=true;exportTasks.rerun=false;
   clearTimeout(exportTasks.timer);
   try{
     const jobs=await api('/api/export-jobs');
+    // A job submitted after this read was sent is missing from it; keep tracking it briefly
+    // so its completion still refreshes the project and shows the download link.
+    for(const old of exportTasks.jobs){
+      if(['queued','running'].includes(old.status)&&old.submittedAt&&Date.now()-old.submittedAt<60000
+          &&!jobs.some(job=>job.id===old.id))jobs.unshift(old);
+    }
     // Keep active jobs visible through completion. Earlier results stay in project history.
     for(const job of jobs){
       if(job.status==='queued'||job.status==='running')exportTasks.visibleIds.add(job.id);
@@ -972,6 +982,7 @@ async function pollExportTasks(){
     }
   }catch(error){exportTasks.error='暂时无法读取进度，正在重连；请勿重复提交。';paintExportTasks();}
   exportTasks.polling=false;
+  if(exportTasks.rerun){exportTasks.rerun=false;return pollExportTasks();}
   exportTasks.timer=setTimeout(pollExportTasks,exportTasks.jobs.some(j=>['queued','running'].includes(j.status))?1000:10000);
 }
 async function ensureProjectRedline(project){
@@ -1025,7 +1036,7 @@ async function showStagePreview(){
 }
 async function queueExport(id,mode,mapping_revision,stage_revision){
   const job=await api('/api/projects/'+encodeURIComponent(id)+'/export-jobs',{method:'POST',body:{mode,mapping_revision,stage_revision}});
-  exportTasks.visibleIds.add(job.id);exportTasks.jobs=[job,...exportTasks.jobs.filter(j=>j.id!==job.id)];
+  exportTasks.visibleIds.add(job.id);exportTasks.jobs=[{...job,submittedAt:Date.now()},...exportTasks.jobs.filter(j=>j.id!==job.id)];
   paintExportTasks();openExportTask(job.id);await pollExportTasks();
 }
 async function exportProject(sourceButton){
