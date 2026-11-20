@@ -47,7 +47,7 @@ const contributionUi={status:'pending',result:null,cases:null,caseArchived:false
 const MATERIAL_VIEWS=['materials','industries','cases','submissions'];
 function isRemote(){return !!state.data?.remote_access?.public;}
 // 远程入口不能维护材料库（服务端同样拒绝）；按钮被点到时给出去处说明。
-const LOCAL_ADMIN_ACTIONS=new Set(['new-material','edit-material','append-files','rotate-file','move-file-up','move-file-down','remove-file','batch-remove-files','new-category','edit-category','new-industry','credit-check','credit-archive']);
+const LOCAL_ADMIN_ACTIONS=new Set(['delete-export','new-material','edit-material','append-files','rotate-file','move-file-up','move-file-down','remove-file','batch-remove-files','new-category','edit-category','new-industry','credit-check','credit-archive']);
 const LOCAL_ADMIN_MESSAGE='材料库维护仅限服务器本机入口；如需新增或更新材料，请点“提交材料”，由本机审核后入库。';
 function remoteBanner(){return isRemote()?`<div class="remote-banner" role="note">${icon('info')}<span>远程入口 · 可编制标书、提交投稿；材料原件查看、材料库维护与含材料导出仅限服务器本机入口</span></div>`:'';}
 function fileSize(bytes){const n=Number(bytes)||0;return n>=1024*1024?`${(n/1024/1024).toFixed(n>=10*1024*1024?0:1)} MB`:`${Math.max(1,Math.round(n/1024))} KB`;}
@@ -571,7 +571,32 @@ function renderMappingPreview(mapping) {
   }).join('')}</div>`;
 }
 function renderExports(exports) {
-  return `<section class="panel export-panel"><div class="panel-heading"><h2>导出历史</h2><span class="count-label">${exports.length} 份记录</span></div>${exports.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>导出文件</th><th>类型</th><th>结果</th><th>导出时间</th><th>下载</th></tr></thead><tbody>${exports.map(e=>`<tr><td class="table-title">${esc(e.filename)}</td><td>${statusBadge(e.mode,e.mode==='stage'?'阶段预览':e.mode==='reviewed'?'核对版':'初稿')}</td><td class="muted">填入 ${e.filled_count||0} · 缺项 ${e.missing_count||0} · 跳过 ${e.skipped_count||0}</td><td class="muted">${date(e.created_at,true)}</td><td><a href="${esc(e.download_url || `/api/exports/${encodeURIComponent(e.id)}/download`)}" download>Word 文件</a> <span class="muted"> / </span> <a href="${esc(e.report_url || `/api/exports/${encodeURIComponent(e.id)}/report`)}" download>核对报告</a></td></tr>`).join('')}</tbody></table></div>`:emptyState('暂无导出记录','','',true,'download')}</section>`;
+  return `<section class="panel export-panel"><div class="panel-heading"><h2>导出历史</h2><span class="count-label">${exports.length} 份记录</span></div>${exports.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>导出文件</th><th>类型</th><th>结果</th><th>导出时间</th><th>下载</th>${isRemote()?'':'<th>操作</th>'}</tr></thead><tbody>${exports.map(e=>`<tr><td class="table-title">${esc(e.filename)}</td><td>${statusBadge(e.mode,e.mode==='stage'?'阶段预览':e.mode==='reviewed'?'核对版':'初稿')}</td><td class="muted">填入 ${e.filled_count||0} · 缺项 ${e.missing_count||0} · 跳过 ${e.skipped_count||0}</td><td class="muted">${date(e.created_at,true)}</td><td><a href="${esc(e.download_url || `/api/exports/${encodeURIComponent(e.id)}/download`)}" download>Word 文件</a> <span class="muted"> / </span> <a href="${esc(e.report_url || `/api/exports/${encodeURIComponent(e.id)}/report`)}" download>核对报告</a></td>${isRemote()?'':`<td>${deleteExportButton(e)}</td>`}</tr>`).join('')}</tbody></table></div>`:emptyState('暂无导出记录','','',true,'download')}</section>`;
+}
+function deleteExportButton(item){
+  return `<button type="button" class="btn small danger" data-action="delete-export" data-id="${esc(item.id)}" data-name="${esc(item.filename||'')}" aria-label="删除导出文件 ${esc(item.filename||'')}">删除</button>`;
+}
+function forgetExport(id){
+  // Drop the deleted export everywhere it is already loaded, so no stale download link remains.
+  const keep=list=>Array.isArray(list)?list.filter(item=>item.id!==id):list;
+  if(state.data)state.data.exports=keep(state.data.exports);
+  if(state.project)state.project.exports=keep(state.project.exports);
+  tenderFlow.forgetExport?.(id);
+  for(const job of exportTasks.jobs)if(job.result?.id===id){
+    const {download_url,report_url,...rest}=job.result;job.result={...rest,deleted:true};
+  }
+  paintExportTasks();
+}
+async function deleteExport(target){
+  const id=target.dataset.id,name=target.dataset.name||'该导出文件';
+  if(!window.confirm(`删除“${name}”？\n\n这份 Word 文件和对应的核对报告会从本机永久删除，无法恢复。原模板、材料、目录和正文不受影响，需要时可以重新导出。`))return;
+  target.disabled=true;
+  try{await api('/api/exports/'+encodeURIComponent(id)+'/delete',{method:'POST',body:{}});}
+  catch(err){target.disabled=false;throw err;}
+  forgetExport(id);
+  toast('已删除导出文件');
+  if(!state.dirty)await refreshData();
+  render();
 }
 
 function openModal(title, subtitle, content, formName, submitLabel, options = {}) {
@@ -908,7 +933,7 @@ function exportRemaining(job){
 function exportTaskContent(job){
   const active=['queued','running'].includes(job.status),result=job.result;
   const warnings=Array.isArray(result?.warnings)?result.warnings.filter(Boolean):[];
-  return `<div class="export-progress-heading"><strong role="status">${esc(job.stage)}</strong><span class="export-elapsed">${esc(exportRemaining(job))}</span></div><progress class="export-progress-bar" aria-label="导出进度" max="100" ${job.status==='queued'?'':`value="${job.progress}"`}></progress>${job.status==='failed'||active?`<p class="muted export-progress-detail">${esc(job.status==='failed'?job.error:'可继续处理其他项目。')}</p>`:''}${warnings.length?`<div class="warning-box export-warnings" role="status"><strong>导出提示</strong><ul>${warnings.map(note=>`<li>${esc(note)}</li>`).join('')}</ul></div>`:''}${result?`<div class="actions"><a class="btn primary" href="${esc(result.download_url)}" download>下载 Word 文件</a><a class="btn" href="${esc(result.report_url)}" download>下载核对报告</a></div>`:''}`;
+  return `<div class="export-progress-heading"><strong role="status">${esc(job.stage)}</strong><span class="export-elapsed">${esc(exportRemaining(job))}</span></div><progress class="export-progress-bar" aria-label="导出进度" max="100" ${job.status==='queued'?'':`value="${job.progress}"`}></progress>${job.status==='failed'||active?`<p class="muted export-progress-detail">${esc(job.status==='failed'?job.error:'可继续处理其他项目。')}</p>`:''}${warnings.length?`<div class="warning-box export-warnings" role="status"><strong>导出提示</strong><ul>${warnings.map(note=>`<li>${esc(note)}</li>`).join('')}</ul></div>`:''}${result?.deleted?'<p class="muted small" role="status">此次导出的 Word 文件已删除，可重新导出。</p>':result?`<div class="actions"><a class="btn primary" href="${esc(result.download_url)}" download>下载 Word 文件</a><a class="btn" href="${esc(result.report_url)}" download>下载核对报告</a></div>`:''}`;
 }
 function paintExportTasks(){
   let dock=$('#export-task-dock');
@@ -1030,6 +1055,7 @@ document.addEventListener('click',async e=>{
   try {
     if(isRemote()&&LOCAL_ADMIN_ACTIONS.has(action)){toast(LOCAL_ADMIN_MESSAGE,true);return;}
     if(action==='export-task-open')openExportTask(id);
+    else if(action==='delete-export')await deleteExport(target);
     else if(action==='export-task-dismiss'){exportTasks.visibleIds.delete(id);paintExportTasks();}
     else if(action==='navigate')await navigate(target.dataset.view);
     else if(action==='toggle-nav')$('.app-shell')?.classList.toggle('nav-open');

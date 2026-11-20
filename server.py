@@ -1558,6 +1558,35 @@ class Store(SpecialLibrary):
             raise
 
 
+    def delete_export(self, key):
+        """删除一份导出的 Word 及其核对报告；导出记录同时移除，原模板与材料不受影响。"""
+        item = self.require('export', key)
+        for job in self.all('export_job'):
+            # 右下角导出任务仍可查看结果摘要，但不再提供已删除文件的下载链接。
+            result = job.get('result')
+            if isinstance(result, dict) and result.get('id') == key:
+                job['result'] = {key_: value for key_, value in result.items()
+                                 if key_ not in {'download_url', 'report_url'}}
+                job['result']['deleted'] = True
+                self.put('export_job', job)
+        self.db.execute('DELETE FROM objects WHERE kind=? AND id=?', ('export', key))
+        project = self.get('project', item.get('project_id', ''))
+        if (project and project.get('status') == '已导出'
+                and not any(v['project_id'] == project['id'] for v in self.all('export'))):
+            # 该项目已没有导出文件，状态回到核对结果，避免列表仍显示“已导出”。
+            project['status'] = '已确认' if self.project_reviewed(project) else '待确认'
+            project['updated_at'] = now()
+            self.put('project', project)
+        self.db.commit()
+        # 数据库记录先移除，再删文件；文件删除失败时页面不再显示失效链接。
+        for suffix in ('.docx', '.json'):
+            try:
+                self.path(f'exports/{key}{suffix}').unlink(missing_ok=True)
+            except OSError:
+                pass
+        return {'id': key, 'project_id': item.get('project_id'), 'deleted': True}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'LocalBidManager/1.0'
     protocol_version = 'HTTP/1.1'
@@ -2112,6 +2141,10 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                     (method == 'POST' and len(bits) == 4 and bits[3] == 'files')):
                 self.require_local_admin()
                 store.require_material_revision(store.require('material', bits[2]), body)
+            if method == 'POST' and len(bits) == 4 and bits[:2] == ['api', 'exports'] and bits[3] == 'delete':
+                # 导出文件含营业执照、身份证等材料，只能在本机入口或门户管理员处管理。
+                self.require_intranet_files()
+                return self.json_response(store.delete_export(bits[2]))
             if method == 'POST' and len(bits) == 4 and bits[:2] == ['api', 'submissions'] and bits[3] in {'accept', 'reject'}:
                 self.require_reviewer()
                 decide = store.contributions.accept if bits[3] == 'accept' else store.contributions.reject

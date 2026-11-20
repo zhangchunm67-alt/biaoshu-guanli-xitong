@@ -882,3 +882,4 @@
 .wf-delivery-table table { border-collapse: collapse; width: 100%; }
 .wf-delivery-table th, .wf-delivery-table td { padding: .4rem; border: 1px solid #cedae0; text-align: left; }
 .wf-delivery-table th { background: #274d62; color: white; }
+.wf-export-list li{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin:6px 0}

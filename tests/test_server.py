@@ -430,6 +430,88 @@ class BootstrapSizeTests(unittest.TestCase):
                 store.close()
 
 
+class ExportDeletionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='bid-export-delete-')
+        self.store = server.Store(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.store.close)
+
+    def seed(self, export_id, project_id='project_x'):
+        self.store.put('export', {'id': export_id, 'project_id': project_id, 'filename': f'{export_id}.docx',
+                                  'mode': 'draft', 'created_at': server.now(),
+                                  'download_url': f'/api/exports/{export_id}/download',
+                                  'report_url': f'/api/exports/{export_id}/report'})
+        for suffix in ('.docx', '.json'):
+            (Path(self.tmp.name) / 'exports' / (export_id + suffix)).write_bytes(b'x')
+
+    def test_delete_removes_files_record_and_task_links_and_resets_status(self):
+        self.store.put('project', {'id': 'project_x', 'name': '项目', 'status': '已导出', 'mappings': [],
+                                   'headings': [], 'special_selection_confirmed': True})
+        self.seed('export_a')
+        self.seed('export_b')
+        self.store.put('export_job', {'id': 'export_job_1', 'project_id': 'project_x', 'status': 'completed',
+                                      'result': {'id': 'export_a', 'filename': 'a.docx', 'warnings': [],
+                                                 'download_url': '/api/exports/export_a/download',
+                                                 'report_url': '/api/exports/export_a/report'}})
+        self.store.db.commit()
+        result = self.store.delete_export('export_a')
+        self.assertEqual({'id': 'export_a', 'project_id': 'project_x', 'deleted': True}, result)
+        exports = Path(self.tmp.name) / 'exports'
+        self.assertFalse((exports / 'export_a.docx').exists())
+        self.assertFalse((exports / 'export_a.json').exists())
+        self.assertTrue((exports / 'export_b.docx').exists())
+        self.assertIsNone(self.store.get('export', 'export_a'))
+        job = self.store.get('export_job', 'export_job_1')['result']
+        self.assertTrue(job['deleted'])
+        self.assertNotIn('download_url', job)
+        self.assertNotIn('report_url', job)
+        # Another export remains, so the project is still marked exported.
+        self.assertEqual('已导出', self.store.get('project', 'project_x')['status'])
+        self.store.delete_export('export_b')
+        self.assertNotEqual('已导出', self.store.get('project', 'project_x')['status'])
+        with self.assertRaises(LookupError):
+            self.store.delete_export('export_b')
+
+    def test_delete_endpoint_is_local_only_and_requires_json_post(self):
+        self.seed('export_a')
+        self.store.db.commit()
+        self.store.close()
+        remote, local = server.create_oray_servers(port=0, data_dir=self.tmp.name, seed=False,
+                                                   public_host='demo.imwork.net', access_token='test-access-token')
+        self.store = remote.store
+        threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (remote, local)]
+        for t in threads:
+            t.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def call(srv, host, path, data=b'{}', ctype='application/json'):
+            req = urllib.request.Request(f'http://127.0.0.1:{srv.server_port}{path}', data=data, method='POST',
+                                         headers={'Host': host, 'Content-Type': ctype,
+                                                  'Authorization': 'Bearer test-access-token'})
+            try:
+                with opener.open(req, timeout=10) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read())
+        try:
+            status, body = call(remote, 'demo.imwork.net', '/api/exports/export_a/delete')
+            self.assertEqual(403, status, body)
+            self.assertIsNotNone(self.store.get('export', 'export_a'))
+            local_host = f'127.0.0.1:{local.server_port}'
+            status, _ = call(local, local_host, '/api/exports/export_a/delete', b'x', 'text/plain')
+            self.assertEqual(400, status)
+            status, body = call(local, local_host, '/api/exports/export_a/delete')
+            self.assertEqual((200, True), (status, body['deleted']))
+            status, _ = call(local, local_host, '/api/exports/export_a/delete')
+            self.assertEqual(404, status)
+        finally:
+            for s in (remote, local):
+                s.shutdown()
+                s.server_close()
+            remote.store.close()
+
+
 class OrayRemoteAccessTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='bid-oray-test-')

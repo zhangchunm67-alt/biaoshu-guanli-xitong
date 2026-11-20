@@ -668,7 +668,7 @@ const tenderFlow = (() => {
           ${wfButton('查看内部阶段预览','stage-preview',{subtle:true})}
           ${wfButton('导出待补初稿','formal-export',{id:'draft',subtle:true})}
           ${wfButton('导出已核对版','formal-export',{id:'reviewed',primary:true})}
-        </div>${(state.project.exports||[]).length?`<ul>${state.project.exports.map(item=>`<li><a href="${esc(item.download_url)}" download>${esc(item.filename)}</a> <a href="${esc(item.report_url)}">核对报告</a></li>`).join('')}</ul>`:''}
+        </div>${(state.project.exports||[]).length?`<ul class="wf-export-list">${state.project.exports.map(item=>`<li><a href="${esc(item.download_url)}" download>${esc(item.filename)}</a> <a href="${esc(item.report_url)}">核对报告</a> ${deleteExportButton(item)}</li>`).join('')}</ul>`:''}
       </section>`:'');
   }
   let chatTimer=null;
@@ -1825,5 +1825,8 @@ const tenderFlow = (() => {
   function projectArchives() {
     return archiveLinks(ui.library.flatMap(r=>r.legacy_projects||[]));
   }
-  return {view,enter,url,resumeProject,beforeLeave,setStep,projectArchives,isPreview:()=>ui.step===3&&!ui.archive&&!ui.calibrationOpen,calibrationState,loadLibrary,calibrationProjects,openCalibration,ensureRedlineForExport};
+  function forgetExport(id){
+    if(ui.archive?.project?.exports)ui.archive.project.exports=ui.archive.project.exports.filter(item=>item.id!==id);
+  }
+  return {view,enter,url,resumeProject,beforeLeave,setStep,projectArchives,isPreview:()=>ui.step===3&&!ui.archive&&!ui.calibrationOpen,calibrationState,loadLibrary,calibrationProjects,openCalibration,ensureRedlineForExport,forgetExport};
 })();
