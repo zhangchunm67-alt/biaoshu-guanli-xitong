@@ -146,6 +146,31 @@ class RealTenderRegressionTests(unittest.TestCase):
             current['chapter_texts'] = {ident: '人工保存的新正文。'}
             self.assertNotIn(ident, self.store.imported_technical(current, framework)['sections'])
 
+    def test_ai_redline_review_uses_kimi_and_sees_custom_outline_content(self):
+        import redline_ai
+        import redline_scan
+        project = self.confirmed_project()
+        captured = {}
+
+        def kimi(system, content, schema, model=None, **_):
+            captured.update(model=model, content=content)
+            return {'items': []}
+
+        with patch('writing_model.complete_json', side_effect=kimi):
+            redline_ai.review(self.store, project['id'])  # no saved body text: imported content alone suffices
+        self.assertEqual('moonshotai/kimi-k3.1-pro', captured['model'])
+        joined = '\n'.join(row['text'] for row in captured['content']['chapters'])
+        self.assertIn('我方对项目背景的理解', joined)
+        self.assertIn('本章含自定义目录原有图片或表格', joined)
+        with self.store.lock:
+            current = self.store.require('project', project['id'])
+            framework = self.store.require('framework', current['framework_id'])
+            result = redline_scan.evaluate(current, framework)
+            # The input token still only follows saved text, so earlier confirmations stay valid.
+            plain = redline_scan.scan(framework['requirements'], current.get('chapter_texts', {}),
+                                      current['mappings'], framework['outline'])
+        self.assertEqual(plain['input_token'], result['input_token'])
+
     def test_team_social_security_and_info_form_are_not_company_material_slots(self):
         project = self.confirmed_project()
         with self.store.lock:
@@ -153,6 +178,115 @@ class RealTenderRegressionTests(unittest.TestCase):
         titles = {(row['category_id'], row['title']) for row in mappings}
         self.assertFalse(any(cid == 'tax_social' and '9.9.4' in title for cid, title in titles), titles)
         self.assertFalse(any(cid == 'company_profile' for cid, _ in titles), titles)
+
+
+class RedlineKimiLoopTests(unittest.TestCase):
+    """Step 4: saved redlines are checked by Kimi against the AI draft, which Kimi rewrites until met."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = Store(Path(directory.name), seed=False)
+        self.addCleanup(self.store.close)
+        for target, value in [('outline_workflow.model_call', ValueError('model disabled')),
+                              ('writing_model.configuration', None)]:
+            stub = (patch(target, side_effect=value) if value is not None else patch(target, return_value={
+                'ready': True, 'status': 'ready', 'model': 'mock-writer', 'message': '已配置'}))
+            stub.start()
+            self.addCleanup(stub.stop)
+        submit = patch.object(self.store.writing.pool, 'submit', side_effect=lambda fn, *a: fn(*a))
+        submit.start()
+        self.addCleanup(submit.stop)
+        document = Document()
+        document.add_heading('第二章 投标人须知', 1)
+        document.add_paragraph('投标有效期不足150天的，投标将被否决。')
+        document.add_heading('第六章 投标文件格式', 1)
+        document.add_paragraph('一、技术方案')
+        document.add_paragraph('【据实编制】')
+        record = framework_service.create(self.store, {'name': '循环', 'filename': '采购.docx',
+                                                       'data': upload(document), 'outline_choice': True})
+        self.redline = next(r for r in record['requirements'] if r['category'] == 'redline')
+        record = framework_service.revise(self.store, record['id'], {
+            'revision': record['revision'], 'items': record['requirements'], 'confirmed': True,
+            'notes_acknowledged': True, 'acknowledged_removed_ids': []}, 'requirements')
+        record = framework_service.revise(self.store, record['id'], {
+            'revision': record['revision'], 'text': '1. 技术方案\n1.1 服务保障'}, 'outline')
+        self.project = framework_service.confirm(self.store, record['id'], {'revision': record['revision']})
+        self.chapter = next(r['id'] for r in self.store.require('framework', record['id'])['outline']
+                            if r['text'].endswith('服务保障'))
+        # Step 3 done: text materials reviewed (none apply), so step 4 may start.
+        with self.store.lock:
+            project = self.store.prepare_text_materials(self.project['id'], text_first=True)
+            self.store.update_mappings(self.project['id'], {
+                'mapping_revision': project['mapping_revision'],
+                'mappings': [{'id': m['id'], 'confirmed': True} for m in project['mappings']]})
+            current = self.store.require('project', self.project['id'])
+            current['text_review_confirmed'] = True
+            self.store.put('project', current)
+            self.store.db.commit()
+
+    def request(self, **extra):
+        project = self.store.require('project', self.project['id'])
+        pack = self.store.get('writing_cases', project['id']) or {'revision': 0}
+        return dict(mapping_revision=self.store.mapping_revision(project), revision=project.get('chapter_revision', 0),
+                    case_revision=pack['revision'], **extra)
+
+    def draft(self, context, model=None):
+        return dict(chapters=[dict(chapter_id=row['id'], text='本节说明服务保障安排与响应流程。',
+                                   requirement_ids=row.get('requirement_ids', []),
+                                   source_refs=[context['case_sources'][0]['id']], material_refs=[],
+                                   missing_items=[], conflicts=[]) for row in context['chapters']], notes=[])
+
+    def test_unmet_redline_is_rewritten_by_kimi_and_rechecked(self):
+        self.store.writing.upload(self.project['id'], self.request(files=[{
+            'name': '案例.txt', 'data': base64.b64encode('历史项目按时提供服务保障。'.encode()).decode()}]))
+        rid, calls = self.redline['id'], []
+
+        def kimi(system, content, schema, model=None, **_):
+            calls.append((model, 'repair' if '修正员' in system else 'review'))
+            if '修正员' in system:
+                chapter = next(row for row in content['chapters'] if row['id'] == self.chapter)
+                return {'items': [dict(chapter_id=self.chapter, issue_ids=[rid], source_ids=[], summary='补充承诺',
+                                       text=chapter['text'] + '\n我方承诺投标有效期为150天。')]}
+            text = next((row['text'] for row in content['chapters'] if row['id'] == self.chapter), '')
+            if '150天' in text:
+                return {'items': [dict(id=rid, verdict='satisfied', reason='已承诺', evidence='我方承诺投标有效期为150天。',
+                                       chapter_ids=[self.chapter], suggestion='')]}
+            return {'items': [dict(id=rid, verdict='risk', reason='未承诺有效期', evidence='',
+                                   chapter_ids=[self.chapter], suggestion='补充有效期承诺')]}
+
+        with patch('writing_model.complete_json', side_effect=kimi), \
+                patch('writing_model.generate', side_effect=self.draft):
+            self.store.writing.start(self.project['id'], self.request(chat=True))
+        job = self.store.writing.describe(self.project['id'])['job']
+        self.assertEqual('completed', job['status'], job.get('error'))
+        kimi_id = 'moonshotai/kimi-k3.1-pro'
+        self.assertEqual([(kimi_id, 'review'), (kimi_id, 'repair'), (kimi_id, 'review')], calls)
+        row = next(r for r in job['chapters'] if r['chapter_id'] == self.chapter)
+        self.assertIn('我方承诺投标有效期为150天', row['text'])
+        self.assertEqual([rid], row['redline_revisions'][0]['issue_ids'])
+
+    def test_repair_stops_after_two_rounds(self):
+        self.store.writing.upload(self.project['id'], self.request(files=[{
+            'name': '案例.txt', 'data': base64.b64encode('历史项目按时提供服务保障。'.encode()).decode()}]))
+        rid, calls = self.redline['id'], []
+
+        def stubborn(system, content, schema, model=None, **_):
+            calls.append('repair' if '修正员' in system else 'review')
+            if '修正员' in system:
+                chapter = next(row for row in content['chapters'] if row['id'] == self.chapter)
+                return {'items': [dict(chapter_id=self.chapter, issue_ids=[rid], source_ids=[], summary='再改',
+                                       text=chapter['text'] + '\n我方将按要求响应。')]}
+            return {'items': [dict(id=rid, verdict='risk', reason='仍未满足', evidence='',
+                                   chapter_ids=[self.chapter], suggestion='补充')]}
+
+        with patch('writing_model.complete_json', side_effect=stubborn), \
+                patch('writing_model.generate', side_effect=self.draft):
+            self.store.writing.start(self.project['id'], self.request(chat=True))
+        job = self.store.writing.describe(self.project['id'])['job']
+        self.assertEqual('completed', job['status'], job.get('error'))
+        self.assertEqual(['review', 'repair', 'review', 'repair', 'review'], calls)
+        self.assertTrue(job['result']['pending_count'] >= 1)
 
 
 class RelativeTaxPeriodMessageTests(unittest.TestCase):

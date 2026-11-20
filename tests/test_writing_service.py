@@ -179,22 +179,47 @@ class WritingServiceTests(unittest.TestCase):
         self.assertEqual(picture.getvalue(), writing_visuals.image_path(
             self.store, new['id'], source['id']).read_bytes())
 
-    def test_chat_generated_supplement_requires_exact_case_evidence(self):
-        scan = {'items': [dict(id='red-1', status='risk', text='交付验收',
-                               findings=['缺少交付检查'], linked_chapter_ids=['BidSection1'])]}
-        texts = {'BidSection1': '现有正文。'}
-        generated = [{'chapter_id': 'BidSection1'}]
-        source = {'id': 'case-1', 'text': '历史案例按清单逐项验收。'}
-        reply = dict(issue_id='red-1', chapter_id='BidSection1', source_id='case-1',
-                     quote='未出现的项目承诺', addition='历史案例按清单逐项验收。')
-        with patch('writing_model.complete_json', return_value={'items': [reply]}):
-            self.assertEqual([], writing_chat.repair(texts, generated, scan, {}, [source], 'mock-model'))
-        self.assertEqual('现有正文。', texts['BidSection1'])
-        reply['quote'] = '历史案例按清单逐项验收'
-        with patch('writing_model.complete_json', return_value={'items': [reply]}):
-            self.assertEqual([('BidSection1', 'case-1')],
-                writing_chat.repair(texts, generated, scan, {}, [source], 'mock-model'))
-        self.assertIn('历史案例按清单逐项验收', texts['BidSection1'])
+    def repair_call(self, reply, texts, generated=None, sources=()):
+        scan = {'items': [dict(id='red-1', status='risk', text='投标有效期：150天',
+                               findings=['正文未承诺投标有效期'], linked_chapter_ids=['BidSection2'])]}
+        with patch('writing_model.complete_json', return_value={'items': [reply]}) as call:
+            result = writing_chat.repair(texts, generated or [{'chapter_id': 'BidSection2'}], scan,
+                                         {'red-1': {'verdict': 'risk', 'chapter_ids': ['BidSection2']}},
+                                         list(sources), 'moonshotai/kimi-k3.1-pro')
+        return result, call
+
+    def test_redline_repair_rewrites_ai_chapter_with_commitment(self):
+        texts = {'BidSection2': '本节说明项目实施安排与服务保障措施。'}
+        reply = dict(chapter_id='BidSection2', issue_ids=['red-1'], source_ids=[], summary='补充有效期承诺',
+                     text='本节说明项目实施安排与服务保障措施。\n我方承诺投标有效期为150天。')
+        result, call = self.repair_call(reply, texts)
+        self.assertEqual([dict(chapter_id='BidSection2', issue_ids=['red-1'], source_ids=[],
+                               summary='补充有效期承诺')], result)
+        self.assertIn('我方承诺投标有效期为150天', texts['BidSection2'])
+        self.assertEqual('moonshotai/kimi-k3.1-pro', call.call_args.kwargs['model'])
+        self.assertIn('承诺', call.call_args.args[0])
+
+    def test_redline_repair_rejects_invented_numbers_and_destructive_rewrites(self):
+        original = '本节说明项目实施安排与服务保障措施，并列明人员职责。'
+        for text in ['本节说明项目实施安排与服务保障措施。我方承诺投入专职人员15名，投标有效期150天。',  # 15 invented
+                     '承诺150天。']:  # drops most of the chapter
+            texts = {'BidSection2': original}
+            reply = dict(chapter_id='BidSection2', issue_ids=['red-1'], source_ids=[], summary='', text=text)
+            self.assertEqual([], self.repair_call(reply, texts)[0])
+            self.assertEqual(original, texts['BidSection2'])
+        # A number quoted from a cited case is allowed.
+        texts = {'BidSection2': original}
+        case = {'id': 'case-1', 'text': '历史项目配置专职人员15名。'}
+        reply = dict(chapter_id='BidSection2', issue_ids=['red-1'], source_ids=['case-1'], summary='',
+                     text=original + '\n参考历史案例经验配置专职人员15名，我方承诺投标有效期为150天。')
+        self.assertEqual(['case-1'], self.repair_call(reply, texts, sources=[case])[0][0]['source_ids'])
+
+    def test_redline_repair_never_touches_chapters_not_generated_by_ai(self):
+        texts = {'BidSection1': '业务人员手写正文，说明服务保障。', 'BidSection2': '本节说明服务保障。'}
+        reply = dict(chapter_id='BidSection1', issue_ids=['red-1'], source_ids=[], summary='',
+                     text='业务人员手写正文，说明服务保障。我方承诺投标有效期为150天。')
+        self.assertEqual([], self.repair_call(reply, texts)[0])
+        self.assertEqual('业务人员手写正文，说明服务保障。', texts['BidSection1'])
 
     def test_generation_is_candidate_only_and_skips_original_forms(self):
         self.upload()
