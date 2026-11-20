@@ -1429,9 +1429,25 @@ class Store(SpecialLibrary):
         snapshot = copy.deepcopy((project, materials, categories, mappings, mode))
         snapshot[0]['export_mapping_revision'] = self.mapping_revision(project)
         snapshot[0]['export_framework_revision'] = (framework or {}).get('revision')
+        snapshot[0]['imported_technical'] = self.imported_technical(project, framework)
         if redline_export is not None:
             snapshot[0]['redline_export'] = copy.deepcopy(redline_export)
         return snapshot
+
+    @staticmethod
+    def imported_technical(project, framework):
+        """Content the custom outline DOCX already had under 技术方案 headings (resumes, screenshots...).
+
+        Chapters with saved body text use that text; the others keep the uploaded content in place of
+        the 【待编】 placeholder, so 半成品/初稿 exports never drop what the user prepared."""
+        from writing_chat import substantive
+        imported = (framework or {}).get('_writing_technical') or {}
+        saved = project.get('chapter_texts') or {}
+        sections = {ident: entry for ident, entry in (imported.get('sections') or {}).items()
+                    if entry.get('positions') and not substantive(str(saved.get(ident) or ''))}
+        if not sections:
+            return None
+        return {'storage': imported['storage'], 'sha256': imported['sha256'], 'sections': sections}
 
     def stage_snapshot(self, key, body=None):
         """Pin the same checked state used by the preview and actual download."""
@@ -1461,16 +1477,20 @@ class Store(SpecialLibrary):
             by_chapter.setdefault(row.get('chapter_id'), []).append(row)
         framework_service.metric_module()
         from outline_check import decimal_headings
+        from writing_chat import substantive
+        imported = self.imported_technical(project, framework) or {'sections': {}}
         chapters = []
         for row, (number, title) in zip(framework['outline'], decimal_headings(framework['outline'])):
             associated = by_chapter.get(row['id'], [])
             text = str(project.get('chapter_texts', {}).get(row['id'], '') or '').strip()
+            entry = imported['sections'].get(row['id'])
+            has_import = bool(entry and (substantive(entry.get('text') or '') or entry.get('media')))
             if row.get('not_applicable') or (associated and all(r.get('confirmed') and r['status'] == 'skipped'
                                                                for r in associated)):
                 status = 'skipped'
             elif (not row.get('locked_format') and
                   all(r.get('confirmed') and r['status'] == 'ready' for r in associated) and
-                  ((text and not re.search(r'【待(?:补|编|确认)', text))
+                  ((text and not re.search(r'【待(?:补|编|确认)', text)) or has_import
                    or (associated and not re.search(r'技术方案|报价|业绩|服务经验', row['text'])))):
                 status = 'completed'
             else:
@@ -1486,7 +1506,9 @@ class Store(SpecialLibrary):
                     'filled_material_count': sum(not r.get('preserve_original') for r in selected),
                     'other_pending_materials': [r['title'] for r in by_chapter.get('', [])
                                                 if not r.get('confirmed') or r['status'] == 'blocked']}
-        return copy.deepcopy((dict(project, stage_overview=overview, export_mapping_revision=token), materials, categories, selected, 'stage'))
+        return copy.deepcopy((dict(project, stage_overview=overview, export_mapping_revision=token,
+                                   imported_technical=self.imported_technical(project, framework)),
+                              materials, categories, selected, 'stage'))
 
     def export(self, key, body, snapshot=None, progress=None):
         import engine
@@ -1504,6 +1526,17 @@ class Store(SpecialLibrary):
                                             procurement_audit=project.get('procurement_audit'),
                                             chapter_visuals=project.get('chapter_visuals'),
                                             resolve_image=lambda ident: writing_visuals.image_path(self, key, ident))
+            imported = project.get('imported_technical')
+            if imported:
+                if progress:
+                    progress(95, '正在保留自定义目录中已有的技术方案内容')
+                raw = self.path(imported['storage']).read_bytes()
+                if hashlib.sha256(raw).hexdigest() != imported['sha256']:
+                    raise ValueError('自定义目录原件发生变化，请重新导入目录后再导出。')
+                import writing_chat
+                writing_chat.insert_imported(str(output), raw, imported['sections'])
+                result.setdefault('warnings', []).append(
+                    f'已保留自定义目录中 {len(imported["sections"])} 个技术方案章节的原有内容（含图片、表格），请核对。')
             redline_summary = project.get('redline_export')
             if redline_summary and not redline_summary.get('complete'):
                 result.setdefault('warnings', []).append(

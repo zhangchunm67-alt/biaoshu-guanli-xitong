@@ -56,10 +56,12 @@ def imported_sections(raw, rows):
                     paragraphs.append(value)
                     if not form:
                         authored.add(index)
+        media = any(body[i].tag == qn('w:tbl') or list(body[i].iter(qn('w:drawing')))
+                    or list(body[i].iter(qn('w:pict'))) for i in positions)
         if any(list(body[i].iter(qn('w:drawing'))) or list(body[i].iter(qn('w:pict'))) for i in positions):
             authored.add(index)
         if positions:
-            fragments[index] = {'positions': positions, 'text': '\n'.join(paragraphs)}
+            fragments[index] = {'positions': positions, 'text': '\n'.join(paragraphs), 'media': media}
     # Lock descendants even when the substantive content is only in a subheading.
     protected = {}
     for index, row in enumerate(rows):
@@ -103,17 +105,24 @@ def insert_imported(output, source, sections):
             continue
         fragment = Document(io.BytesIO(source))
         body = fragment.element.body
-        existing_tables = set()
+        existing_tables, existing_paragraphs = set(), set()
         for element in anchor.itersiblings():
             if element in anchors.values():
                 break
             if element.tag == qn('w:tbl'):
                 existing_tables.add(tuple(t.text for t in element.iter(qn('w:t'))))
+            elif element.tag == qn('w:p'):
+                value = ''.join(t.text or '' for t in element.iter(qn('w:t'))).strip()
+                if value:
+                    existing_paragraphs.add(value)
         for i, element in enumerate(list(body)):
             if element.tag == qn('w:sectPr'):
                 continue
+            # The buyer's original form already brings its table and notes; keep only what the user added.
+            value = ''.join(t.text or '' for t in element.iter(qn('w:t'))).strip() if element.tag == qn('w:p') else ''
             if (i not in positions or (element.tag == qn('w:tbl')
-                    and tuple(t.text for t in element.iter(qn('w:t'))) in existing_tables)):
+                    and tuple(t.text for t in element.iter(qn('w:t'))) in existing_tables)
+                    or (value and value in existing_paragraphs and not list(element.iter(qn('w:drawing'))))):
                 body.remove(element)
                 continue
             for mark in list(element.iter(qn('w:bookmarkStart'))) + list(element.iter(qn('w:bookmarkEnd'))):
