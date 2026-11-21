@@ -25,7 +25,7 @@ CHAT_MAX_OUTPUT_TOKENS = 32000
 RESPONSES_MAX_OUTPUT_TOKENS = 16000
 CHAPTER_FIELDS = {'chapter_id', 'text', 'requirement_ids', 'source_refs',
                   'material_refs', 'missing_items', 'conflicts', 'visuals'}
-CONTEXT_FIELDS = ('project', 'chapters', 'requirements', 'procurement_sources',
+CONTEXT_FIELDS = ('project', 'chapters', 'outline', 'requirements', 'procurement_sources',
                   'case_sources', 'materials', 'business_notes')
 MODEL_LABELS = {
     'deepseek/deepseek-v4.1-flash-1017': 'DeepSeek · 日常跑量',
@@ -222,6 +222,7 @@ notes 说明原因，系统会拒绝将其作为可采纳正文。
 
 输出仅为约定的 JSON，不输出 Markdown 代码围栏。每个输入 chapter.id 恰好输出一次，
 chapter_id 原样保留，按输入顺序排列；同名章节按 id 和 path 区分。
+outline 是全书目录（只有章节 id 和完整路径），仅用于“详见”等交叉引用，不为其中未列入 chapters 的章节输出内容。
 text 是面向采购方的中文候选纯文本，保留必要的【待补】和【待确认】标记，
 正文段落用换行分开。不要包含 HTML、Markdown 表格、文件修改指令或原表替换指令。
 visuals 按阅读顺序返回图表，以 after 指定放在第几个非空段落后（从 1 起）。
@@ -273,7 +274,12 @@ def _context(context):
     clean = {name: context.get(name, '' if name == 'business_notes' else []) for name in CONTEXT_FIELDS}
     if not isinstance(clean['project'], dict) or not isinstance(clean['business_notes'], str):
         raise ValueError('写作输入的项目或业务补充结构无效。')
+    if not clean['outline']:
+        del clean['outline']  # Older callers send no directory; do not add an empty field.
     chapters = _registry(clean['chapters'], '章节')
+    outline = _registry(clean.get('outline', []), '目录')
+    if any(not isinstance(row.get('path'), str) for row in outline.values()) or not set(chapters) <= set(outline or chapters):
+        raise ValueError('写作输入的目录结构无效。')
     if not 1 <= len(chapters) <= MAX_CHAPTERS:
         raise ValueError('每次正文写作需要 1 至 8 个已确认章节。')
     requirements = _registry(clean['requirements'], '要求')

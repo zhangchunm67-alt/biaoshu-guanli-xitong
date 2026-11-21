@@ -183,6 +183,29 @@ class OutlineWorkflowTests(unittest.TestCase):
         self.assertEqual('missing', next(row for row in project['mappings'] if row['id'] == ident)['action'])
 
 
+class RequirementBindingTests(unittest.TestCase):
+    def test_only_scoring_and_technical_requirements_fall_back_to_the_technical_chapter(self):
+        from outline_workflow import bind_plan_requirements
+
+        def req(ident, category, context, index=900):
+            return dict(id=ident, category=category,
+                        references=[dict(part='主件', index=index, context=context)])
+        plan = {'blocks': [dict(kind='heading', text='九、技术方案', source_indices=[1124]),
+                           dict(kind='heading', text='四、资格证明文件', source_indices=[1002])]}
+        requirements = [
+            req('score', 'score', '第三章 评标办法 › 评标办法前附表 › 3、详细评审标准', 387),
+            req('spec-tech', 'spec', '第五章 技术规范书 › 二、服务内容', 924),
+            req('spec-needs', 'spec', '第四章 采购需求', 800),
+            req('deadline', 'spec', '第一章 招标公告 › 六、投标文件的递交', 160),
+            req('deposit', 'spec', '第二章 投标人须知 › 投标人须知前附表', 205),
+            req('site-visit', 'spec', '2.2 踏勘现场', 251),
+            req('located', 'spec', '第二章 投标人须知 › 投标人须知前附表', 1002),
+        ]
+        technical, qualification = bind_plan_requirements(plan, requirements)['blocks']
+        self.assertEqual(['score', 'spec-tech', 'spec-needs'], technical['requirement_ids'])
+        self.assertEqual(['located'], qualification['requirement_ids'])
+
+
 class MaterialConflictTests(unittest.TestCase):
     def test_same_chapter_duplicate_requires_decision_and_cross_chapter_reuse_is_allowed(self):
         headings = [

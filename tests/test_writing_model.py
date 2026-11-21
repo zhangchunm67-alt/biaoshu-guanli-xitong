@@ -99,6 +99,18 @@ class WritingModelTests(unittest.TestCase):
         self.assertNotIn(self.key, request.data.decode())
         self.assertEqual(self.context, json.loads(body['input']))
 
+    def test_outline_is_sent_for_cross_references_and_must_cover_target_chapters(self):
+        self.context['outline'] = [{'id': 'BidSection1', 'path': '包一/服务方案'},
+                                   {'id': 'BidSection2', 'path': '包二/服务方案'},
+                                   {'id': 'BidSection9', 'path': '包二/舆情处理应急响应方案'}]
+        with patch('writing_model.urllib.request.urlopen', return_value=self.response()) as call:
+            writing_model.generate(self.context)
+        body = json.loads(call.call_args.args[0].data)
+        self.assertEqual(self.context['outline'], json.loads(body['input'])['outline'])
+        self.assertIn('outline 是全书目录', body['instructions'])
+        self.context['outline'] = [{'id': 'BidSection1', 'path': '包一/服务方案'}]
+        self.assert_rejected(self.response(), '目录结构无效')
+
     def test_visuals_require_real_case_images_and_consistent_rows_and_anchors(self):
         for block in [dict(kind='image', after=1, caption='历史样张', image_id='case1'),
                       dict(kind='flow', after=7, caption='流程', steps=['提交','复核']),

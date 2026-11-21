@@ -320,10 +320,11 @@ def findings(scan, checked, candidates, mappings, revised_ids=()):
         details = item['findings'] + ([ai['suggestion']] if ai.get('suggestion') else item['hints'])
         for detail in details:
             pending.append((item['label'], detail))
-    for row in candidates:
-        for detail in [*row['missing_items'], *row['conflicts'],
-                       *re.findall(r'【待(?:补|确认|编)[^】]*】', row['text'])]:
-            pending.append((row['chapter_id'], detail))
+    chapter_items = [(row['chapter_id'], detail) for row in candidates
+                     for detail in [*row['missing_items'], *row['conflicts'],
+                                    *re.findall(r'【待(?:补|确认|编)[^】]*】', row['text'])]]
+    # Items that may disqualify the bid come first, whether the writer filed them as gaps or conflicts.
+    pending.extend(sorted(chapter_items, key=lambda item: not item[1].startswith('【废标风险】')))
     for mapping in mappings:
         if mapping['status'] != 'ready' or (not mapping.get('confirmed') and not mapping.get('preserve_original')):
             pending.append((mapping['title'], '核对是否需要补齐、恢复或确认该材料。'))
@@ -408,7 +409,11 @@ def write_notes(path, project, framework, texts, candidates, materials, pack, pe
         if req.get('category') != 'score':
             continue
         doc.add_paragraph(req['text'])
-        linked = [row['id'] for row in outline if req['id'] in row.get('requirement_ids', [])]
+        # Prefer the chapters whose candidate text claims this scoring item; sub-chapters often
+        # inherit it from 技术方案 and are where the item is actually answered.
+        answered = {row['chapter_id'] for row in candidates if req['id'] in row.get('requirement_ids', [])}
+        linked = [row['id'] for row in outline if row['id'] in answered] or \
+                 [row['id'] for row in outline if req['id'] in row.get('requirement_ids', [])]
         if linked:
             for key in linked:
                 item = by_chapter.get(key, {})

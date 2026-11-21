@@ -1,13 +1,17 @@
 """Case-image OCR using PP-OCR models (PaddleOCR lineage).
 
-Primary runtime is RapidOCR ONNX — same PP-OCR detectors/recognizers as
-PaddleOCR, stable on Apple Silicon. Optional native paddleocr remains as a
+Primary runtime is RapidOCR on ONNX Runtime — same PP-OCR detectors/recognizers
+as PaddleOCR, with the models shipped inside the package so nothing is downloaded.
+``rapidocr`` 3.x supports Python 3.13; an existing ``rapidocr_onnxruntime`` install
+(Python 3.12 and older) keeps working. Optional native paddleocr remains as a
 subprocess fallback. Set BID_CASE_OCR=off to disable.
 """
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -33,12 +37,21 @@ def enabled() -> bool:
     return value not in {'0', 'off', 'false', 'no'}
 
 
+RAPID_MODULES = ('rapidocr', 'rapidocr_onnxruntime')
+
+
+def _rapid_module() -> str | None:
+    for name in RAPID_MODULES:
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return name
+        except (ImportError, ValueError):
+            continue
+    return None
+
+
 def _has_rapidocr() -> bool:
-    try:
-        import rapidocr_onnxruntime  # noqa: F401
-        return True
-    except Exception:
-        return False
+    return _rapid_module() is not None
 
 
 def _has_paddleocr() -> bool:
@@ -86,8 +99,13 @@ def _rapid_engine():
         if _rapid is not None or _rapid_error is not None:
             return _rapid
         try:
-            from rapidocr_onnxruntime import RapidOCR
-            _rapid = RapidOCR()
+            module = _rapid_module()
+            if module is None:
+                raise ImportError('RapidOCR is not installed')
+            engine_class = __import__(module, fromlist=['RapidOCR']).RapidOCR
+            # Keep model-loading chatter out of server logs; rapidocr 3.x resets the level from its config.
+            logging.getLogger('RapidOCR').setLevel(logging.WARNING)
+            _rapid = engine_class(params={'Global.log_level': 'warning'}) if module == 'rapidocr' else engine_class()
         except Exception as exc:
             _rapid_error = exc
             _rapid = None
@@ -101,17 +119,17 @@ def _recognize_rapid(raw: bytes) -> str:
     try:
         import numpy as np
         image = _prepare_image(raw)
-        result, _ = engine(np.array(image))
-        if not result:
-            return ''
-        lines = []
-        for row in result:
-            text = row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else None
-            if isinstance(text, str) and text.strip():
-                lines.append(text.strip())
-        return '\n'.join(lines).strip()
+        return _rapid_text(engine(np.array(image)))
     except Exception:
         return ''
+
+
+def _rapid_text(output) -> str:
+    """rapidocr 3.x returns an object with ``txts``; rapidocr_onnxruntime returns (rows, elapse)."""
+    texts = getattr(output, 'txts', None)
+    if texts is None and isinstance(output, tuple) and output:
+        texts = [row[1] for row in output[0] or [] if isinstance(row, (list, tuple)) and len(row) > 1]
+    return '\n'.join(text.strip() for text in texts or [] if isinstance(text, str) and text.strip()).strip()
 
 
 def _recognize_paddle_subprocess(raw: bytes) -> str:
@@ -150,7 +168,7 @@ def recognize_image(raw: bytes) -> str:
     if _has_rapidocr():
         text = _recognize_rapid(raw)
         if text or not _has_paddleocr():
-            _backend = 'rapidocr-onnxruntime'
+            _backend = _rapid_module()
             return text
     if _has_paddleocr():
         _backend = 'paddleocr'

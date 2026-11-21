@@ -110,6 +110,20 @@ def indexed_catalog(document, nodes, automatic):
     return anchors, {n.index for n in top}
 
 
+TECHNICAL_CONTEXT = re.compile(r'技术|需求|采购要求|服务要求|服务内容|工作内容|服务标准|项目概况|项目要求|实施要求')
+PROCEDURAL_CONTEXT = re.compile(r'招标公告|投标邀请|采购公告|投标人须知|供应商须知|响应人须知|评标办法|评审办法')
+
+
+def answered_in_technical_part(req):
+    """Scoring items and technical/service requirements belong in 技术方案; bidder-instruction
+    clauses (submission, deposit, opening, objections) are handled in their own forms."""
+    if req['category'] == 'score':
+        return True
+    contexts = [ref.get('context') or '' for ref in req['references'] if ref.get('part') == '主件']
+    return any(TECHNICAL_CONTEXT.search(c) and not PROCEDURAL_CONTEXT.search(c.split('›')[0])
+               for c in contexts)
+
+
 def bind_plan_requirements(plan, requirements):
     blocks = plan['blocks']
     headings = [b for b in blocks if b['kind'] == 'heading']
@@ -119,7 +133,7 @@ def bind_plan_requirements(plan, requirements):
     for req in requirements:
         indices = {ref.get('index') for ref in req['references'] if ref.get('part') == '主件'}
         matches = [heading for heading in headings if indices.intersection(heading.get('source_indices', []))]
-        if not matches and req['category'] in {'spec', 'score'} and tech:
+        if not matches and req['category'] in {'spec', 'score'} and tech and answered_in_technical_part(req):
             matches = [tech]
         for heading in matches:
             heading['requirement_ids'].append(req['id'])

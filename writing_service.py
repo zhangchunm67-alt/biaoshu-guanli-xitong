@@ -447,7 +447,7 @@ class WritingService:
         outline = {r['id']:r for r in framework.get('outline', [])}
         protected = writing_chat.protected_ids(project, framework) if chat else set()
         baseline = {row['chapter_id']:row['text'] for row in previous.get('chapters', [])} if previous else {}
-        parents, chapters, skipped = [], [], []
+        parents, chapters, skipped, directory = [], [], [], []
         evidence_only = re.compile(r'^(?:营业执照|法定代表人.*身份证明|.*身份证(?:复印件)?|.*授权委托书|'
                                    r'.*授权书|.*报价(?:单|表|一览表)|审计报告|纳税证明|社保证明|指定格式与待补附件)$')
         narrative = re.compile(r'方案|实施|执行|技术(?:响应|应答)|服务(?:内容|响应|能力|组织|流程)|'
@@ -457,6 +457,10 @@ class WritingService:
                 parents.pop()
             parents.append(row)
             spec = outline.get(row['id'], {})
+            path = ' / '.join(p['title'] for p in parents)
+            if not spec.get('not_applicable'):
+                # Titles only: lets the model cite real sibling chapters without sending their text.
+                directory.append({'id': row['id'], 'path': path})
             if chat and (row['id'] in protected or spec.get('not_applicable')):
                 skipped.append(row['title'])
                 continue
@@ -469,8 +473,13 @@ class WritingService:
                 skipped.append(row['title'])
                 continue
             row.pop('visuals', None)  # The editable text already contains the visual content.
-            chapters.append(dict(row, text=row['text'] or baseline.get(row['id'], ''), path=' / '.join(p['title'] for p in parents),
-                requirement_ids=spec.get('requirement_ids', []), original_text=originals.get(row['id'], ''),
+            # Unlocated requirements are bound to the parent heading (for example 技术方案); a
+            # sub-chapter added under it must still see them, or a later batch is sent without any.
+            requirement_ids = spec.get('requirement_ids') or next(
+                (outline[p['id']]['requirement_ids'] for p in reversed(parents[:-1])
+                 if outline.get(p['id'], {}).get('requirement_ids')), [])
+            chapters.append(dict(row, text=row['text'] or baseline.get(row['id'], ''), path=path,
+                requirement_ids=list(requirement_ids), original_text=originals.get(row['id'], ''),
                 locked_format=bool(spec.get('locked_format')),
                 has_table=bool(spec.get('locked_format')) or any(b['kind'] == 'table' for b in blocks)))
         if not chapters and not (chat and protected):
@@ -507,7 +516,7 @@ class WritingService:
         req_ids = {i for c in chapters for i in c['requirement_ids']}
         requirements = [r for r in framework.get('requirements', []) if r['id'] in req_ids]
         source_ids = {ref.get('source_id', ref.get('id')) for r in requirements for ref in r.get('references', [])}
-        context = dict(project={'id':key,'name':project['name']}, chapters=chapters,
+        context = dict(project={'id':key,'name':project['name']}, chapters=chapters, outline=directory,
             category_names=category_names,
             requirements=requirements, procurement_sources=[s for s in framework.get('sources', []) if s['id'] in source_ids],
             case_sources=case_sources, materials=materials, business_notes=notes)

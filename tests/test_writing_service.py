@@ -546,6 +546,65 @@ class WritingServiceTests(unittest.TestCase):
             self.assertNotIn('unreferenced-source', referenced)
         self.assertEqual({second_source['id']}, {source['id'] for source in model.call_args_list[1].args[0]['procurement_sources']})
 
+    def test_sub_chapters_inherit_parent_requirements_and_every_batch_sees_the_outline(self):
+        project = self.store.require('project', 'project-a')
+        template = self.store.path(project['template_storage'])
+        document = Document(template)
+        document.styles.add_style('BFHeading2', 1)
+        framework = self.store.require('framework', project['framework_id'])
+        framework['requirements'].append(dict(id='req-tech', text='发现舆情后1小时内告知采购人。',
+                                              references=[{'id': framework['sources'][0]['id']}]))
+        rows = [('BidSection6', '技术方案', 'BFHeading1', ['req-tech'])] + [
+            ('BidSection' + str(n), '评分子章节' + str(n), 'BFHeading2', []) for n in range(7, 14)]
+        for number, (ident, title, style, requirement_ids) in enumerate(rows, 6):
+            paragraph = document.add_paragraph(title, style)
+            bookmark = OxmlElement('w:bookmarkStart')
+            bookmark.set(qn('w:name'), ident); bookmark.set(qn('w:id'), str(number))
+            paragraph._p.append(bookmark)
+            framework['outline'].append(dict(id=ident, title=title, requirement_ids=requirement_ids, locked_format=False))
+            framework['_plan']['blocks'].extend([dict(kind='heading', bookmark=ident), dict(kind='slot', text='待编')])
+        document.save(template)
+        project['template_hash'] = hashlib.sha256(template.read_bytes()).hexdigest()
+        self.store.put('project', project); self.store.put('framework', framework); self.store.db.commit()
+        self.upload()
+        job, model = self.generate()
+        self.assertEqual('completed', job['status'])
+        contexts = [call.args[0] for call in model.call_args_list]
+        self.assertEqual(2, len(contexts))
+        children = {'BidSection' + str(n) for n in range(7, 14)}
+        late = [row for row in contexts[1]['chapters'] if row['id'] in children]
+        self.assertTrue(late, 'the second batch must contain sub-chapters')
+        for row in late:
+            self.assertEqual(['req-tech'], row['requirement_ids'])
+            self.assertTrue(row['path'].startswith('技术方案 / 评分子章节'))
+        self.assertIn('req-tech', {row['id'] for row in contexts[1]['requirements']})
+        self.assertTrue(contexts[1]['procurement_sources'])
+        expected = ['BidSection' + str(n) for n in range(1, 14)]
+        for context in contexts:
+            self.assertEqual(expected, [row['id'] for row in context['outline']])
+            self.assertNotIn('text', context['outline'][0])
+
+    def test_disqualification_risks_lead_the_pending_list_and_index_uses_answering_chapters(self):
+        candidates = [
+            dict(chapter_id='BidSection1', text='正文【待补：人员名单】', requirement_ids=[],
+                 missing_items=['【待补：人员名单】'], conflicts=['【废标风险】业绩口径不一致']),
+            dict(chapter_id='BidSection2', text='正文', requirement_ids=['req-score'],
+                 missing_items=['【废标风险】缺少代理资质'], conflicts=[])]
+        pending = writing_chat.findings({'items': []}, {}, candidates, [])
+        self.assertEqual(['【废标风险】业绩口径不一致', '【废标风险】缺少代理资质', '【待补：人员名单】'],
+                         [detail for _, detail in pending])
+        outline = [dict(id='BidSection1', text='技术方案', level=1, requirement_ids=['req-score']),
+                   dict(id='BidSection2', text='舆情处理应急响应方案', level=2, requirement_ids=[])]
+        framework = dict(outline=outline, sources=[], requirements=[
+            dict(id='req-score', category='score', text='舆情处理应急响应方案（5分）', references=[])])
+        project = dict(name='评分索引测试', mappings=[])
+        path = Path(self.directory.name) / 'notes.docx'
+        writing_chat.write_notes(path, project, framework, {}, candidates, [], {'sources': []}, pending, set())
+        lines = [p.text for p in Document(path).paragraphs]
+        index = lines[lines.index('评分索引') + 1:]
+        self.assertTrue(any('舆情处理应急响应方案' in line and '技术方案 /' in line for line in index), index)
+        self.assertFalse(any(line.startswith('1. 技术方案　') for line in index), index)
+
     def test_service_plan_with_original_form_can_be_written_without_replacing_form(self):
         project = self.store.require('project', 'project-a')
         template = self.store.path(project['template_storage'])
