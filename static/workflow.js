@@ -93,7 +93,7 @@ const tenderFlow = (() => {
     return `<nav class="wf-stepper wf-stepper-fork" aria-label="投标文件编制步骤">${steps.map((label,i)=>{
       const n=i+2;
       // Keep later steps clickable: setStep sends the user back to the unfinished gate.
-      return `<button type="button" data-wf="step" data-id="${n}" class="wf-step ${n===current?'is-current':available(n)&&n<current?'is-done':''}" ${n===current?'aria-current="step"':''} ${ui.busy?'disabled':''}><span class="wf-number">${i+1}</span><span class="wf-label">${label}</span></button>`;
+      return `<button type="button" data-wf="step" data-id="${n}" class="wf-step ${n===current?'is-current':available(n)&&n<current?'is-done':''}" ${n===current?'aria-current="step"':''} ${ui.busy?'disabled':''}><span class="wf-number">${'一二三'[i]}</span><span class="wf-label">${label}</span></button>`;
     }).join('')}<div class="wf-fork ${ui.step===5?'is-b-current':''}" role="group" aria-label="系统填充后的两条路径">
       <button type="button" data-wf="export" class="wf-step wf-branch wf-branch-a ${exportReady?'is-available':''}" ${!exportReady||ui.busy?'disabled':''} title="${exportReady?'直接导出半成品标书':'完成文字和图片材料核对并保存后可导出半成品标书'}"><span class="wf-number">A</span><span class="wf-label">导出半成品标书</span></button>
       <button type="button" data-wf="step" data-id="5" class="wf-step wf-branch wf-branch-b ${ui.step===5?'is-current':''}" ${ui.step===5?'aria-current="step"':''} ${ui.busy?'disabled':''}><span class="wf-number">B</span><span class="wf-label">${writingStep}</span></button>
