@@ -1206,13 +1206,16 @@ document.addEventListener('change',async e=>{
   if(el.dataset.categoryToggle){if(isCreditCategory(el.dataset.categoryToggle)){el.checked=!!state.data.categories.find(c=>c.id===el.dataset.categoryToggle)?.enabled;el.disabled=true;return;}el.disabled=true;try{await api(`/api/categories/${encodeURIComponent(el.dataset.categoryToggle)}`,{method:'PATCH',body:{enabled:el.checked}});await refreshData();render();toast('栏目状态已更新；已有项目可重新扫描以应用。');}catch(err){el.checked=!el.checked;el.disabled=false;toast(err.message,true);}}
 });
 let searchTimer;
+// One debounce timer per material category: typing in one card must not cancel another card's pending search.
+const projectSearchTimers={};
 document.addEventListener('input',e=>{
   const el=e.target;
   if(el.dataset.projectSearch){
-    clearTimeout(searchTimer);const category=el.dataset.projectSearch,query=el.value,position=el.selectionStart,projectId=state.project.id;
+    const category=el.dataset.projectSearch,query=el.value,position=el.selectionStart,projectId=state.project.id;
+    clearTimeout(projectSearchTimers[category]);
     // Keep the typed text across re-renders (e.g. ticking a material) until its results arrive.
     projectUi.pickerTyped[category]=query;
-    searchTimer=setTimeout(async()=>{try{
+    projectSearchTimers[category]=setTimeout(async()=>{try{
       if(!(await loadProjectPicker(category,1,query))||state.project?.id!==projectId)return;
       render();const next=$$('input[data-project-search]').find(x=>x.dataset.projectSearch===category);next?.focus();try{next?.setSelectionRange(position,position);}catch{}
     }catch(err){toast(err.message,true);}},250);
