@@ -40,14 +40,14 @@ const creditUi = {requesting:false,polling:false,timer:null,error:''};
 const isCreditCategory = id => CREDIT_CATEGORY_IDS.has(id);
 const navs = [{id:'dashboard',label:'工作台',icon:'grid'},{id:'materials',label:'材料库',icon:'folder'},{id:'projects',label:'标书项目',icon:'file'}];
 const specialState={industry:'',category:'',review:'',query:'',page:1,result:{items:[],total:0,counts:{}},cache:new Map()};
-const projectUi={id:null,step:'common',pickers:{},searchDrafts:{},pickerRequests:{},navigation:null};
+const projectUi={id:null,step:'common',pickers:{},pickerRequests:{},pickerTyped:{},navigation:null};
 const locationUi={mappingId:null,projectId:null,result:null,page:1,zoom:1,showMarkers:true,requestId:0};
 // Colleagues submit materials and cases; only the local entry reviews them into the library.
 const contributionUi={status:'pending',result:null,cases:null,caseArchived:false};
 const MATERIAL_VIEWS=['materials','industries','cases','submissions'];
 function isRemote(){return !!state.data?.remote_access?.public;}
 // 远程入口不能维护材料库（服务端同样拒绝）；按钮被点到时给出去处说明。
-const LOCAL_ADMIN_ACTIONS=new Set(['new-material','edit-material','append-files','rotate-file','move-file-up','move-file-down','remove-file','batch-remove-files','new-category','edit-category','new-industry','credit-check','credit-archive']);
+const LOCAL_ADMIN_ACTIONS=new Set(['delete-export','new-material','edit-material','append-files','rotate-file','move-file-up','move-file-down','remove-file','batch-remove-files','new-category','edit-category','new-industry','credit-check','credit-archive']);
 const LOCAL_ADMIN_MESSAGE='材料库维护仅限服务器本机入口；如需新增或更新材料，请点“提交材料”，由本机审核后入库。';
 function remoteBanner(){return isRemote()?`<div class="remote-banner" role="note">${icon('info')}<span>远程入口 · 可编制标书、提交投稿；材料原件查看、材料库维护与含材料导出仅限服务器本机入口</span></div>`:'';}
 function fileSize(bytes){const n=Number(bytes)||0;return n>=1024*1024?`${(n/1024/1024).toFixed(n>=10*1024*1024?0:1)} MB`:`${Math.max(1,Math.round(n/1024))} KB`;}
@@ -63,7 +63,7 @@ function textReviewed(){return !!state.project?.special_selection_confirmed&&(st
 function projectReviewed(){return commonReviewed()&&textReviewed();}
 function cacheProjectMaterials(){for(const m of state.project?.selected_special_materials||[])specialState.cache.set(m.id,m);}
 function resetProjectUi(){
-  projectUi.id=state.project.id;projectUi.pickers={};projectUi.searchDrafts={};projectUi.pickerRequests={};projectUi.navigation=null;projectUi.selected=new Set();cacheProjectMaterials();
+  projectUi.id=state.project.id;projectUi.pickers={};projectUi.pickerRequests={};projectUi.pickerTyped={};projectUi.navigation=null;projectUi.selected=new Set();cacheProjectMaterials();
   projectUi.step=!textReviewed()?'special':!commonReviewed()?'common':projectReviewed()?'export':'special';
 }
 function materialCompletionIssues(target='export'){
@@ -122,16 +122,20 @@ async function guideMaterialCompletion(target='export'){
   toast(`${issues[0].title}：${issues[0].message}`,true);
   return true;
 }
-let pickerRequestSeq=0;
 async function loadProjectPicker(category, page, query){
+  // Searches and refreshes can overlap; only the latest request for a category may update it,
+  // and a refresh started while a search is pending uses that newer query.
   const previous=projectUi.pickers[category]||{page:1,query:''};
-  const search=query??previous.query,request=++pickerRequestSeq;
-  // Only the newest request for a category may replace its list, so a slower earlier search cannot bring back an old query.
-  projectUi.pickerRequests[category]=request;
-  const q=new URLSearchParams({category_id:category,page:page??previous.page,page_size:10,q:search});
+  const pending=projectUi.pickerRequests[category]||{ticket:0,query:previous.query};
+  const wanted=query??pending.query;
+  const ticket=pending.ticket+1;
+  const pickers=projectUi.pickers;
+  projectUi.pickerRequests[category]={ticket,query:wanted};
+  const q=new URLSearchParams({category_id:category,page:page??previous.page,page_size:10,q:wanted});
   const result=await api('/api/materials?'+q);
-  if(projectUi.pickerRequests[category]!==request)return false;
-  projectUi.pickers[category]={...result,query:search};
+  if(projectUi.pickers!==pickers||projectUi.pickerRequests[category]?.ticket!==ticket)return false;
+  projectUi.pickers[category]={...result,query:wanted};
+  if(projectUi.pickerTyped[category]===wanted)delete projectUi.pickerTyped[category];
   return true;
 }
 async function loadProjectPickers(){
@@ -248,7 +252,8 @@ function renderCreditEvidence(evidence) {
 }
 function toast(message, error = false) {
   // 新提示替换旧提示，避免过期的“尚未保存”“尚有 N 条未勾选”等消息叠在一起。
-  for (const old of document.querySelectorAll('#toast-root .toast')) old.remove();
+  // 但成功提示不能顶掉仍在显示的错误（如导出被红线拦截的原因），错误保留到自身到期或被新错误替换。
+  for (const old of document.querySelectorAll('#toast-root .toast')) if (error || !old.classList.contains('error')) old.remove();
   const el = document.createElement('div'); el.className = `toast${error ? ' error' : ''}`; el.setAttribute('role',error ? 'alert' : 'status');
   el.innerHTML = `${icon(error ? 'alert' : 'check')}<span>${esc(message)}</span>`;
   $('#toast-root').append(el); setTimeout(() => el.remove(),error ? 9000 : 4500);
@@ -290,7 +295,7 @@ function render() {
   const calibrationActive=state.view==='calibration'||(state.view==='dashboard'&&tenderFlow.calibrationState().active);
   const nav = navs.find(n => n.id === (calibrationActive?'projects':MATERIAL_VIEWS.includes(state.view)?'materials':state.view)) || navs[0];
   const pendingSubmissions=Number(state.data.stats?.pending_submission_count||0);
-  $('#app').innerHTML = `<div class="app-shell"><button type="button" class="mobile-shade" data-action="toggle-nav" aria-label="关闭导航"></button><aside class="sidebar" aria-label="主导航"><a class="brand" href="#" data-action="navigate" data-view="dashboard"><span class="brand-mark">${icon('layers')}</span><span><span class="brand-title">腾宝 · 标书管理</span></span></a><nav class="nav-items">${navs.map(n=>{const active=(!calibrationActive&&n.id===state.view)||(n.id==='materials'&&MATERIAL_VIEWS.includes(state.view));return `<button type="button" class="nav-button ${active?'active':''}" data-action="navigate" data-view="${n.id}" ${active?'aria-current="page"':''}>${icon(n.icon)}${n.label}${n.id==='projects'?`<span class="nav-count" style="margin-left:auto">${state.data.projects.length}</span>`:''}</button>${n.id==='projects'?`<div class="material-subnav" aria-label="标书项目工具"><button type="button" class="nav-button ${calibrationActive?'active':''}" data-action="workflow-calibration" ${calibrationActive?'aria-current="page"':''}>${icon('refresh')}校准</button></div>`:''}${n.id==='materials'&&active?`<div class="material-subnav" aria-label="材料库分类">${[['materials','图片材料'],['industries','文字材料'],['cases','案例库'],['submissions','投稿入库']].map(([id,label])=>`<button type="button" class="nav-button ${state.view===id?'active':''}" data-action="navigate" data-view="${id}" ${state.view===id?'aria-current="page"':''}>${label}${id==='submissions'&&pendingSubmissions?`<span class="nav-count" style="margin-left:auto">${pendingSubmissions}<span class="sr-only"> 份待审核</span></span>`:''}</button>`).join('')}</div>`:''}`;}).join('')}</nav><div class="sidebar-bottom">${state.data.portal?`<a class="nav-button portal-link" href="${esc(state.data.portal.href)}">${icon('back')}返回商机系统</a>`:''}<div class="sidebar-footnote">${state.data.portal?'文件保存在公司 NAS':'文件保存在本机'}；使用 AI 时，相关文本会发送至所配置的模型服务。</div></div></aside><div class="main-shell"><header class="topbar"><button type="button" class="icon-button mobile-menu" data-action="toggle-nav" aria-label="打开导航">${icon('menu')}</button><div class="breadcrumb"><strong>${nav.label}</strong>${calibrationActive?`${icon('chevron')}<span>校准</span>`:''}${state.project&&state.view==='projects'?`${icon('chevron')}<span>项目核对</span>`:''}</div><div class="topbar-right">${button('新建项目','new-framework',{primary:true,icon:'plus'})}<span class="avatar" aria-label="腾宝">腾</span></div></header>${remoteBanner()}<main id="main-content" class="main-content" tabindex="-1">${renderView()}</main></div></div>`;
+  $('#app').innerHTML = `<div class="app-shell"><button type="button" class="mobile-shade" data-action="toggle-nav" aria-label="关闭导航"></button><aside class="sidebar" aria-label="主导航"><a class="brand" href="#" data-action="navigate" data-view="dashboard" aria-label="腾宝标书编制，返回工作台"><span class="brand-title">腾宝</span><span class="brand-sub">标书编制</span></a><nav class="nav-items">${navs.map(n=>{const active=(!calibrationActive&&n.id===state.view)||(n.id==='materials'&&MATERIAL_VIEWS.includes(state.view));return `<button type="button" class="nav-button ${active?'active':''}" data-action="navigate" data-view="${n.id}" ${active?'aria-current="page"':''}>${icon(n.icon)}${n.label}${n.id==='projects'?`<span class="nav-count" style="margin-left:auto">${state.data.projects.length}<span class="sr-only"> 个项目</span></span>`:''}</button>${n.id==='projects'?`<div class="material-subnav" aria-label="标书项目工具"><button type="button" class="nav-button ${calibrationActive?'active':''}" data-action="workflow-calibration" ${calibrationActive?'aria-current="page"':''}>${icon('refresh')}校准</button></div>`:''}${n.id==='materials'&&active?`<div class="material-subnav" aria-label="材料库分类">${[['materials','图片材料'],['industries','文字材料'],['cases','案例库'],['submissions','投稿入库']].map(([id,label])=>`<button type="button" class="nav-button ${state.view===id?'active':''}" data-action="navigate" data-view="${id}" ${state.view===id?'aria-current="page"':''}>${label}${id==='submissions'&&pendingSubmissions?`<span class="nav-count" style="margin-left:auto">${pendingSubmissions}<span class="sr-only"> 份待审核</span></span>`:''}</button>`).join('')}</div>`:''}`;}).join('')}</nav><div class="sidebar-bottom">${state.data.portal?`<a class="nav-button portal-link" href="${esc(state.data.portal.href)}">${icon('back')}返回商机系统</a>`:''}<div class="sidebar-footnote">${state.data.portal?'文件保存在公司 NAS':'文件保存在本机'}；使用 AI 时，相关文本会发送至所配置的模型服务。</div></div></aside><div class="main-shell"><header class="topbar"><button type="button" class="icon-button mobile-menu" data-action="toggle-nav" aria-label="打开导航">${icon('menu')}</button><div class="breadcrumb"><strong>${nav.label}</strong>${calibrationActive?`${icon('chevron')}<span>校准</span>`:''}${state.project&&state.view==='projects'?`${icon('chevron')}<span>项目核对</span>`:''}</div><div class="topbar-right">${button('新建项目','new-framework',{primary:true,icon:'plus'})}</div></header>${remoteBanner()}<main id="main-content" class="main-content" tabindex="-1">${renderView()}</main></div></div>`;
   $('#app').inert=state.busy;
   updateCreditCard();syncCreditPolling();observeInlineLocations();
 }
@@ -406,7 +411,7 @@ function renderMaterialPicker(m){
   const special=isSpecial(m.category_id),picker=projectUi.pickers[m.category_id],selected=m.material_ids||[];
   const candidates=special?[...(picker?.items||[])]:state.data.materials.filter(x=>(x.category_id===m.category_id||(m.category_id==='authorization'&&x.category_id==='legal_identity'))&&(m.category_id!=='authorization'||['page','side_by_side'].includes(x.mode)));
   if(special)for(const id of selected){if(!candidates.some(x=>x.id===id)){const x=material(id);if(x)candidates.unshift(x);}}
-  return `${special?`<div class="project-picker-search"><input type="search" class="input" data-project-search="${esc(m.category_id)}" aria-label="搜索${esc(m.category_name)}" placeholder="搜索材料、客户、人员或项目" value="${esc(projectUi.searchDrafts[m.category_id]??picker?.query??'')}"></div>`:''}<div class="material-picker" role="group" aria-labelledby="materials-label-${esc(m.id)}">${candidates.length?candidates.map(x=>`<div class="project-material-option"><label class="material-option"><input type="checkbox" data-map-material="${esc(m.id)}" value="${esc(x.id)}" ${selected.includes(x.id)?'checked':''} ${m.action==='skip'?'disabled':''}><span>${esc(x.name)}<small>${esc(x.subject)}${x.years?.length?` · ${esc(x.years.join('、'))}`:''}${special?` · ${esc(x.client_name||x.case_name||'')}`:''}</small></span></label>${special?`<button class="text-button small" data-action="open-material" data-id="${esc(x.id)}">预览</button>`:''}</div>`).join(''):`<div class="picker-empty">${special?(picker?.query?'没有找到符合搜索条件的材料':'此分类暂无材料，可新增材料或明确记录缺项'):'此栏目还没有材料'}</div>`}</div>${special?`<div class="project-picker-pagination">${button('上一页','project-picker-prev',{small:true,category:m.category_id,disabled:!picker||picker.page<=1})}<span class="muted small">${picker?`第 ${picker.page} / ${Math.max(1,Math.ceil(picker.total/picker.page_size))} 页 · 共 ${picker.total} 份`:'加载材料中…'}</span>${button('下一页','project-picker-next',{small:true,category:m.category_id,disabled:!picker||picker.page*picker.page_size>=picker.total})}</div>`:''}`;
+  return `${special?`<div class="project-picker-search"><input type="search" class="input" data-project-search="${esc(m.category_id)}" aria-label="搜索${esc(m.category_name)}" placeholder="搜索材料、客户、人员或项目" value="${esc(projectUi.pickerTyped[m.category_id]??picker?.query??'')}"></div>`:''}<div class="material-picker" role="group" aria-labelledby="materials-label-${esc(m.id)}">${candidates.length?candidates.map(x=>`<div class="project-material-option"><label class="material-option"><input type="checkbox" data-map-material="${esc(m.id)}" value="${esc(x.id)}" ${selected.includes(x.id)?'checked':''} ${m.action==='skip'?'disabled':''}><span>${esc(x.name)}<small>${esc(x.subject)}${x.years?.length?` · ${esc(x.years.join('、'))}`:''}${special?` · ${esc(x.client_name||x.case_name||'')}`:''}</small></span></label>${special?`<button class="text-button small" data-action="open-material" data-id="${esc(x.id)}">预览</button>`:''}</div>`).join(''):`<div class="picker-empty">${special?(picker?.query?'没有找到符合搜索条件的材料':'此分类暂无材料，可新增材料或明确记录缺项'):'此栏目还没有材料'}</div>`}</div>${special?`<div class="project-picker-pagination">${button('上一页','project-picker-prev',{small:true,category:m.category_id,disabled:!picker||picker.page<=1})}<span class="muted small">${picker?`第 ${picker.page} / ${Math.max(1,Math.ceil(picker.total/picker.page_size))} 页 · 共 ${picker.total} 份`:'加载材料中…'}</span>${button('下一页','project-picker-next',{small:true,category:m.category_id,disabled:!picker||picker.page*picker.page_size>=picker.total})}</div>`:''}`;
 }
 function renderLocationRecognition(m) {
   const match=m.location_match||{}, requirement=m.requirement||{};
@@ -567,7 +572,32 @@ function renderMappingPreview(mapping) {
   }).join('')}</div>`;
 }
 function renderExports(exports) {
-  return `<section class="panel export-panel"><div class="panel-heading"><h2>导出历史</h2><span class="count-label">${exports.length} 份记录</span></div>${exports.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>导出文件</th><th>类型</th><th>结果</th><th>导出时间</th><th>下载</th></tr></thead><tbody>${exports.map(e=>`<tr><td class="table-title">${esc(e.filename)}</td><td>${statusBadge(e.mode,e.mode==='stage'?'阶段预览':e.mode==='reviewed'?'核对版':'初稿')}</td><td class="muted">填入 ${e.filled_count||0} · 缺项 ${e.missing_count||0} · 跳过 ${e.skipped_count||0}</td><td class="muted">${date(e.created_at,true)}</td><td><a href="${esc(e.download_url || `/api/exports/${encodeURIComponent(e.id)}/download`)}" download>Word 文件</a> <span class="muted"> / </span> <a href="${esc(e.report_url || `/api/exports/${encodeURIComponent(e.id)}/report`)}" download>核对报告</a></td></tr>`).join('')}</tbody></table></div>`:emptyState('暂无导出记录','','',true,'download')}</section>`;
+  return `<section class="panel export-panel"><div class="panel-heading"><h2>导出历史</h2><span class="count-label">${exports.length} 份记录</span></div>${exports.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>导出文件</th><th>类型</th><th>结果</th><th>导出时间</th><th>下载</th>${isRemote()?'':'<th>操作</th>'}</tr></thead><tbody>${exports.map(e=>`<tr><td class="table-title">${esc(e.filename)}</td><td>${statusBadge(e.mode,e.mode==='stage'?'阶段预览':e.mode==='reviewed'?'核对版':'初稿')}</td><td class="muted">填入 ${e.filled_count||0} · 缺项 ${e.missing_count||0} · 跳过 ${e.skipped_count||0}</td><td class="muted">${date(e.created_at,true)}</td><td><a href="${esc(e.download_url || `/api/exports/${encodeURIComponent(e.id)}/download`)}" download>Word 文件</a> <span class="muted"> / </span> <a href="${esc(e.report_url || `/api/exports/${encodeURIComponent(e.id)}/report`)}" download>核对报告</a></td>${isRemote()?'':`<td>${deleteExportButton(e)}</td>`}</tr>`).join('')}</tbody></table></div>`:emptyState('暂无导出记录','','',true,'download')}</section>`;
+}
+function deleteExportButton(item){
+  return `<button type="button" class="btn small danger" data-action="delete-export" data-id="${esc(item.id)}" data-name="${esc(item.filename||'')}" aria-label="删除导出文件 ${esc(item.filename||'')}">删除</button>`;
+}
+function forgetExport(id){
+  // Drop the deleted export everywhere it is already loaded, so no stale download link remains.
+  const keep=list=>Array.isArray(list)?list.filter(item=>item.id!==id):list;
+  if(state.data)state.data.exports=keep(state.data.exports);
+  if(state.project)state.project.exports=keep(state.project.exports);
+  tenderFlow.forgetExport?.(id);
+  for(const job of exportTasks.jobs)if(job.result?.id===id){
+    const {download_url,report_url,...rest}=job.result;job.result={...rest,deleted:true};
+  }
+  paintExportTasks();
+}
+async function deleteExport(target){
+  const id=target.dataset.id,name=target.dataset.name||'该导出文件';
+  if(!window.confirm(`删除“${name}”？\n\n这份 Word 文件和对应的核对报告会从本机永久删除，无法恢复。原模板、材料、目录和正文不受影响，需要时可以重新导出。`))return;
+  target.disabled=true;
+  try{await api('/api/exports/'+encodeURIComponent(id)+'/delete',{method:'POST',body:{}});}
+  catch(err){target.disabled=false;throw err;}
+  forgetExport(id);
+  toast('已删除导出文件');
+  if(!state.dirty)await refreshData();
+  render();
 }
 
 function openModal(title, subtitle, content, formName, submitLabel, options = {}) {
@@ -895,7 +925,7 @@ async function changeFile(action) {
   catch(e){renderDrawer();throw e;}
 }
 let exportInFlight=false;
-const exportTasks={jobs:[],timer:null,modalId:null,polling:false,visibleIds:new Set(),error:''};
+const exportTasks={jobs:[],timer:null,modalId:null,polling:false,rerun:false,visibleIds:new Set(),error:''};
 function exportRemaining(job){
   if(job.status==='queued')return '排队中';
   if(job.status!=='running')return '';
@@ -904,7 +934,7 @@ function exportRemaining(job){
 function exportTaskContent(job){
   const active=['queued','running'].includes(job.status),result=job.result;
   const warnings=Array.isArray(result?.warnings)?result.warnings.filter(Boolean):[];
-  return `<div class="export-progress-heading"><strong role="status">${esc(job.stage)}</strong><span class="export-elapsed">${esc(exportRemaining(job))}</span></div><progress class="export-progress-bar" aria-label="导出进度" max="100" ${job.status==='queued'?'':`value="${job.progress}"`}></progress>${job.status==='failed'||active?`<p class="muted export-progress-detail">${esc(job.status==='failed'?job.error:'可继续处理其他项目。')}</p>`:''}${warnings.length?`<div class="warning-box export-warnings" role="status"><strong>导出提示</strong><ul>${warnings.map(note=>`<li>${esc(note)}</li>`).join('')}</ul></div>`:''}${result?`<div class="actions"><a class="btn primary" href="${esc(result.download_url)}" download>下载 Word 文件</a><a class="btn" href="${esc(result.report_url)}" download>下载核对报告</a></div>`:''}`;
+  return `<div class="export-progress-heading"><strong role="status">${esc(job.stage)}</strong><span class="export-elapsed">${esc(exportRemaining(job))}</span></div><progress class="export-progress-bar" aria-label="导出进度" max="100" ${job.status==='queued'?'':`value="${job.progress}"`}></progress>${job.status==='failed'||active?`<p class="muted export-progress-detail">${esc(job.status==='failed'?job.error:'可继续处理其他项目。')}</p>`:''}${warnings.length?`<div class="warning-box export-warnings" role="status"><strong>导出提示</strong><ul>${warnings.map(note=>`<li>${esc(note)}</li>`).join('')}</ul></div>`:''}${result?.deleted?'<p class="muted small" role="status">此次导出的 Word 文件已删除，可重新导出。</p>':result?`<div class="actions"><a class="btn primary" href="${esc(result.download_url)}" download>下载 Word 文件</a><a class="btn" href="${esc(result.report_url)}" download>下载核对报告</a></div>`:''}`;
 }
 function paintExportTasks(){
   let dock=$('#export-task-dock');
@@ -927,10 +957,19 @@ function openExportTask(id){
   document.body.append(modal);modal.showModal();
 }
 async function pollExportTasks(){
-  if(exportTasks.polling)return;exportTasks.polling=true;
+  // A poll requested while another is in flight (e.g. right after submitting an export) runs again
+  // as soon as that one finishes, so a just-submitted job is never left waiting for the slow timer.
+  if(exportTasks.polling){exportTasks.rerun=true;return;}
+  exportTasks.polling=true;exportTasks.rerun=false;
   clearTimeout(exportTasks.timer);
   try{
     const jobs=await api('/api/export-jobs');
+    // A job submitted after this read was sent is missing from it; keep tracking it briefly
+    // so its completion still refreshes the project and shows the download link.
+    for(const old of exportTasks.jobs){
+      if(['queued','running'].includes(old.status)&&old.submittedAt&&Date.now()-old.submittedAt<60000
+          &&!jobs.some(job=>job.id===old.id))jobs.unshift(old);
+    }
     // Keep active jobs visible through completion. Earlier results stay in project history.
     for(const job of jobs){
       if(job.status==='queued'||job.status==='running')exportTasks.visibleIds.add(job.id);
@@ -943,6 +982,7 @@ async function pollExportTasks(){
     }
   }catch(error){exportTasks.error='暂时无法读取进度，正在重连；请勿重复提交。';paintExportTasks();}
   exportTasks.polling=false;
+  if(exportTasks.rerun){exportTasks.rerun=false;return pollExportTasks();}
   exportTasks.timer=setTimeout(pollExportTasks,exportTasks.jobs.some(j=>['queued','running'].includes(j.status))?1000:10000);
 }
 async function ensureProjectRedline(project){
@@ -996,7 +1036,7 @@ async function showStagePreview(){
 }
 async function queueExport(id,mode,mapping_revision,stage_revision){
   const job=await api('/api/projects/'+encodeURIComponent(id)+'/export-jobs',{method:'POST',body:{mode,mapping_revision,stage_revision}});
-  exportTasks.visibleIds.add(job.id);exportTasks.jobs=[job,...exportTasks.jobs.filter(j=>j.id!==job.id)];
+  exportTasks.visibleIds.add(job.id);exportTasks.jobs=[{...job,submittedAt:Date.now()},...exportTasks.jobs.filter(j=>j.id!==job.id)];
   paintExportTasks();openExportTask(job.id);await pollExportTasks();
 }
 async function exportProject(sourceButton){
@@ -1026,6 +1066,7 @@ document.addEventListener('click',async e=>{
   try {
     if(isRemote()&&LOCAL_ADMIN_ACTIONS.has(action)){toast(LOCAL_ADMIN_MESSAGE,true);return;}
     if(action==='export-task-open')openExportTask(id);
+    else if(action==='delete-export')await deleteExport(target);
     else if(action==='export-task-dismiss'){exportTasks.visibleIds.delete(id);paintExportTasks();}
     else if(action==='navigate')await navigate(target.dataset.view);
     else if(action==='toggle-nav')$('.app-shell')?.classList.toggle('nav-open');
@@ -1104,7 +1145,7 @@ document.addEventListener('click',async e=>{
     else if(action==='locate-material-issue')focusMaterialCompletionIssue(Number(id));
     else if(action==='project-picker-prev'||action==='project-picker-next'){
       const category=target.dataset.category,picker=projectUi.pickers[category];
-      await loadProjectPicker(category,picker.page+(action==='project-picker-next'?1:-1));render();
+      if(await loadProjectPicker(category,picker.page+(action==='project-picker-next'?1:-1)))render();
     }
     else if(action==='project-materials')await navigate('materials',target.dataset.category);
     else if(action==='save-project'){target.disabled=true;await saveProject();}
@@ -1165,24 +1206,19 @@ document.addEventListener('change',async e=>{
   if(el.dataset.categoryToggle){if(isCreditCategory(el.dataset.categoryToggle)){el.checked=!!state.data.categories.find(c=>c.id===el.dataset.categoryToggle)?.enabled;el.disabled=true;return;}el.disabled=true;try{await api(`/api/categories/${encodeURIComponent(el.dataset.categoryToggle)}`,{method:'PATCH',body:{enabled:el.checked}});await refreshData();render();toast('栏目状态已更新；已有项目可重新扫描以应用。');}catch(err){el.checked=!el.checked;el.disabled=false;toast(err.message,true);}}
 });
 let searchTimer;
+// One debounce timer per material category: typing in one card must not cancel another card's pending search.
 const projectSearchTimers={};
 document.addEventListener('input',e=>{
   const el=e.target;
   if(el.dataset.projectSearch){
     const category=el.dataset.projectSearch,query=el.value,position=el.selectionStart,projectId=state.project.id;
-    // Keep the typed text at once: a render before the debounced search runs (for example after ticking a material) must not restore the previous query.
-    projectUi.searchDrafts[category]=query;
     clearTimeout(projectSearchTimers[category]);
-    projectSearchTimers[category]=setTimeout(async()=>{
-      if(state.project?.id!==projectId)return;
-      try{
-        const applied=await loadProjectPicker(category,1,query);
-        // Newer typing has its own pending search, which renders when it finishes.
-        if(state.project?.id!==projectId||projectUi.searchDrafts[category]!==query)return;
-        delete projectUi.searchDrafts[category];render();if(!applied)return;
-        const next=$$('input[data-project-search]').find(x=>x.dataset.projectSearch===category);next?.focus();try{next?.setSelectionRange(position,position);}catch{}
-      }catch(err){if(state.project?.id===projectId&&projectUi.searchDrafts[category]===query)delete projectUi.searchDrafts[category];toast(err.message,true);}
-    },250);
+    // Keep the typed text across re-renders (e.g. ticking a material) until its results arrive.
+    projectUi.pickerTyped[category]=query;
+    projectSearchTimers[category]=setTimeout(async()=>{try{
+      if(!(await loadProjectPicker(category,1,query))||state.project?.id!==projectId)return;
+      render();const next=$$('input[data-project-search]').find(x=>x.dataset.projectSearch===category);next?.focus();try{next?.setSelectionRange(position,position);}catch{}
+    }catch(err){toast(err.message,true);}},250);
   }
   if(el.closest('form[data-form="material"]'))queueMaterialValidation(el.closest('form'));
   if(el.id==='special-search'){clearTimeout(searchTimer);const position=el.selectionStart;specialState.query=el.value;specialState.page=1;searchTimer=setTimeout(async()=>{try{await loadSpecial();render();const next=$('#special-search');next?.focus();try{next?.setSelectionRange(position,position);}catch{}}catch(error){toast(error.message,true);}},250);}

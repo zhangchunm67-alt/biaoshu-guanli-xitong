@@ -130,9 +130,13 @@ finally:s.server_close();s.store.close()
     await insurance.locator('.mapping-preview img').last().waitFor();
     assert.equal(await insuranceSearch.inputValue(),'保险核对材料11');
     releaseSearch();await searched;await page.unroute(heldSearch);
+    // Ticking re-renders the card after an async fetch; clear the search only once that render
+    // has replaced the input, or the clear lands on a detached element and is lost.
+    await insurance.locator('.mapping-preview img').last().waitFor();
+    await insurance.locator('input[data-map-material][value="'+materials.ids[11]+'"]:enabled').waitFor();
     // Clearing the box only counts once the unfiltered list has come back.
     await Promise.all([page.waitForResponse(pickerSearch('')),insuranceSearch.fill('')]);
-    await insurance.locator('.mapping-preview img').last().waitFor();
+    await insurance.getByText('共 12 份').waitFor();
     assert.equal(await insurance.locator('.mapping-preview img').count(),2);
     // Conditional copy must keep actionable warnings and keyboard focus intact.
     await insurance.locator('.mapping-preview-page').first().click();
@@ -197,6 +201,30 @@ finally:s.server_close();s.store.close()
     const report=await (await page.request.get(base+project.exports[0].report_url)).json();
     assert.equal(report.materials.length,10);
     assert.equal(report.export.filled_count,9);
+    // Deleting an export asks first: cancelling keeps it, confirming removes the Word file and its report.
+    await page.locator('#export-task-modal #export-background').click();
+    await page.locator('#export-task-modal').waitFor({state:'detached'});
+    await page.screenshot({path:path.join(root,'export-history.png'),fullPage:true});
+    const deleteButton=page.locator('[data-action="delete-export"][data-id="'+project.exports[0].id+'"]');
+    let prompt='';
+    page.once('dialog',dialog=>{prompt=dialog.message();dialog.dismiss();});
+    await deleteButton.click();
+    assert.match(prompt,/永久删除/);
+    assert.equal(await deleteButton.isVisible(),true);
+    assert.equal((await page.request.get(base+download)).ok(),true);
+    page.once('dialog',dialog=>dialog.accept());
+    await deleteButton.click();
+    await deleteButton.waitFor({state:'detached'});
+    assert.equal(await page.getByRole('link',{name:'Word 文件',exact:true}).count(),0);
+    assert.equal((await page.request.get(base+download)).status(),404);
+    assert.equal((await page.request.get(base+project.exports[0].report_url)).status(),404);
+    const afterDelete=await (await page.request.get(base+'/api/projects/'+project.id)).json();
+    assert.deepEqual(afterDelete.exports,[]);
+    // The background task keeps its summary but no longer offers the deleted file.
+    await page.locator('[data-action="export-task-open"]').first().click();
+    await page.locator('#export-task-modal').getByText('Word 文件已删除').waitFor();
+    assert.equal(await page.locator('#export-task-modal a[download]').count(),0);
+    await page.locator('#export-task-modal #export-background').click();
     await page.reload();
     await page.locator('[data-action="open-project"][data-id="'+project.id+'"]').first().click();
     await page.getByRole('button',{name:'导出',exact:true}).waitFor();

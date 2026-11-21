@@ -29,6 +29,7 @@
 - POST /api/projects/:id/export {mode:'draft'|'reviewed'} -> export。draft 不要求逐项材料确认，允许缺项/跳过并在报告/文档标明；所有模式拒绝材料或位置错误，reviewed 要求全部就绪且确认。框架项目的 draft 与 reviewed 均要求废标红线全部过关（规则无风险且 AI 通过项可自动确认）；未过关时 400。
 - GET /api/exports/:id/download -> docx
 - GET /api/exports/:id/report -> 可下载 JSON 核对报告（含来源、结果、缺项；不要绝对路径）
+- POST /api/exports/:id/delete `{}` -> `{id, project_id, deleted: true}`；删除该导出的 Word 与核对报告并移除记录，不可恢复；仅本机入口或门户管理员（远程入口 403）。引用该导出的后台任务保留摘要、去掉下载链接并标记 `deleted`；项目最后一份导出删除后状态从“已导出”回到核对状态。
 
 ## 对象
 

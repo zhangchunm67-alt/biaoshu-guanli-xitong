@@ -15,8 +15,8 @@ else
   .venv/bin/python3 -m pip install -r requirements.txt
   APP_PYTHON="$PWD/.venv/bin/python3"
 fi
-if ! "$APP_PYTHON" -c 'import olefile, pypdf, pypdfium2' 2>/dev/null; then
-  echo '正在补齐 Word 导入和原页预览组件。'
+if ! "$APP_PYTHON" scripts/check_deps.py requirements.txt; then
+  echo '正在补齐运行依赖（首次或更新后）。'
   "$APP_PYTHON" -m pip install -r requirements.txt
 fi
 if [[ ! -f .env.oray ]]; then

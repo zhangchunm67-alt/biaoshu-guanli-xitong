@@ -33,7 +33,7 @@ import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageOps
 
-from access_guard import AuditLog, LoginGuard, LoginLocked, Sessions
+from access_guard import DEVICE_TTL, AuditLog, DeviceTrust, LoginGuard, LoginLocked, Sessions
 from contributions import Contributions
 from credit_service import CreditService, MANAGED_IDS
 from errors import ConflictError
@@ -57,9 +57,11 @@ REQUEST_READ_TIMEOUT = 30
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 IMAGE_FORMATS = {'PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF'}
 ACCESS_COOKIE = 'bid_session'
+DEVICE_COOKIE = 'bid_device'
 MIN_TOKEN_LENGTH = 12
 PLACEHOLDER_TOKENS = {'请改成足够长的口令', 'changeme', 'password'}
 LOGIN_PATH = '/login'
+BOOTSTRAP_EXPORTS = 20
 
 
 class AuthRequired(PermissionError):
@@ -742,9 +744,12 @@ class Store(SpecialLibrary):
         historical = framework_service.archived_project_ids(self)
         projects = [self.project_summary(v) for v in reversed(self.all('project')) if v['id'] not in historical]
         exports = list(reversed(self.all('export')))
+        export_count = len(exports)
+        # 每个项目的导出记录随项目详情返回；首页只带最近的若干条，避免数据随使用时间无限增长。
+        exports = exports[:BOOTSTRAP_EXPORTS]
         source = self.get('meta', 'source_status') or {'state': 'not_imported', 'message': '此数据目录未导入示例材料'}
         source.pop('id', None)
-        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': self.all('industry'), 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(self.is_special(m) and not m.get('archived') for m in self.all('material')), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': len(exports), 'source_status': source, **self.contributions.stats()}}
+        return {'categories': categories, 'materials': materials, 'projects': projects, 'exports': exports, 'industries': self.all('industry'), 'credit_automation': self.credit.status(), 'stats': {'special_material_count': sum(self.is_special(m) and not m.get('archived') for m in self.all('material')), 'category_count': sum(c['layer'] == 'common' for c in categories), 'material_count': len(materials), 'file_count': sum(len(m['files']) for m in materials), 'project_count': len(projects), 'export_count': export_count, 'source_status': source, **self.contributions.stats()}}
 
     @staticmethod
     def project_summary(project):
@@ -1424,9 +1429,25 @@ class Store(SpecialLibrary):
         snapshot = copy.deepcopy((project, materials, categories, mappings, mode))
         snapshot[0]['export_mapping_revision'] = self.mapping_revision(project)
         snapshot[0]['export_framework_revision'] = (framework or {}).get('revision')
+        snapshot[0]['imported_technical'] = self.imported_technical(project, framework)
         if redline_export is not None:
             snapshot[0]['redline_export'] = copy.deepcopy(redline_export)
         return snapshot
+
+    @staticmethod
+    def imported_technical(project, framework):
+        """Content the custom outline DOCX already had under 技术方案 headings (resumes, screenshots...).
+
+        Chapters with saved body text use that text; the others keep the uploaded content in place of
+        the 【待编】 placeholder, so 半成品/初稿 exports never drop what the user prepared."""
+        from writing_chat import substantive
+        imported = (framework or {}).get('_writing_technical') or {}
+        saved = project.get('chapter_texts') or {}
+        sections = {ident: entry for ident, entry in (imported.get('sections') or {}).items()
+                    if entry.get('positions') and not substantive(str(saved.get(ident) or ''))}
+        if not sections:
+            return None
+        return {'storage': imported['storage'], 'sha256': imported['sha256'], 'sections': sections}
 
     def stage_snapshot(self, key, body=None):
         """Pin the same checked state used by the preview and actual download."""
@@ -1456,16 +1477,20 @@ class Store(SpecialLibrary):
             by_chapter.setdefault(row.get('chapter_id'), []).append(row)
         framework_service.metric_module()
         from outline_check import decimal_headings
+        from writing_chat import substantive
+        imported = self.imported_technical(project, framework) or {'sections': {}}
         chapters = []
         for row, (number, title) in zip(framework['outline'], decimal_headings(framework['outline'])):
             associated = by_chapter.get(row['id'], [])
             text = str(project.get('chapter_texts', {}).get(row['id'], '') or '').strip()
+            entry = imported['sections'].get(row['id'])
+            has_import = bool(entry and (substantive(entry.get('text') or '') or entry.get('media')))
             if row.get('not_applicable') or (associated and all(r.get('confirmed') and r['status'] == 'skipped'
                                                                for r in associated)):
                 status = 'skipped'
             elif (not row.get('locked_format') and
                   all(r.get('confirmed') and r['status'] == 'ready' for r in associated) and
-                  ((text and not re.search(r'【待(?:补|编|确认)', text))
+                  ((text and not re.search(r'【待(?:补|编|确认)', text)) or has_import
                    or (associated and not re.search(r'技术方案|报价|业绩|服务经验', row['text'])))):
                 status = 'completed'
             else:
@@ -1481,7 +1506,9 @@ class Store(SpecialLibrary):
                     'filled_material_count': sum(not r.get('preserve_original') for r in selected),
                     'other_pending_materials': [r['title'] for r in by_chapter.get('', [])
                                                 if not r.get('confirmed') or r['status'] == 'blocked']}
-        return copy.deepcopy((dict(project, stage_overview=overview, export_mapping_revision=token), materials, categories, selected, 'stage'))
+        return copy.deepcopy((dict(project, stage_overview=overview, export_mapping_revision=token,
+                                   imported_technical=self.imported_technical(project, framework)),
+                              materials, categories, selected, 'stage'))
 
     def export(self, key, body, snapshot=None, progress=None):
         import engine
@@ -1499,6 +1526,17 @@ class Store(SpecialLibrary):
                                             procurement_audit=project.get('procurement_audit'),
                                             chapter_visuals=project.get('chapter_visuals'),
                                             resolve_image=lambda ident: writing_visuals.image_path(self, key, ident))
+            imported = project.get('imported_technical')
+            if imported:
+                if progress:
+                    progress(95, '正在保留自定义目录中已有的技术方案内容')
+                raw = self.path(imported['storage']).read_bytes()
+                if hashlib.sha256(raw).hexdigest() != imported['sha256']:
+                    raise ValueError('自定义目录原件发生变化，请重新导入目录后再导出。')
+                import writing_chat
+                writing_chat.insert_imported(str(output), raw, imported['sections'])
+                result.setdefault('warnings', []).append(
+                    f'已保留自定义目录中 {len(imported["sections"])} 个技术方案章节的原有内容（含图片、表格），请核对。')
             redline_summary = project.get('redline_export')
             if redline_summary and not redline_summary.get('complete'):
                 result.setdefault('warnings', []).append(
@@ -1551,6 +1589,35 @@ class Store(SpecialLibrary):
             output.unlink(missing_ok=True)
             report_file.unlink(missing_ok=True)
             raise
+
+
+    def delete_export(self, key):
+        """删除一份导出的 Word 及其核对报告；导出记录同时移除，原模板与材料不受影响。"""
+        item = self.require('export', key)
+        for job in self.all('export_job'):
+            # 右下角导出任务仍可查看结果摘要，但不再提供已删除文件的下载链接。
+            result = job.get('result')
+            if isinstance(result, dict) and result.get('id') == key:
+                job['result'] = {key_: value for key_, value in result.items()
+                                 if key_ not in {'download_url', 'report_url'}}
+                job['result']['deleted'] = True
+                self.put('export_job', job)
+        self.db.execute('DELETE FROM objects WHERE kind=? AND id=?', ('export', key))
+        project = self.get('project', item.get('project_id', ''))
+        if (project and project.get('status') == '已导出'
+                and not any(v['project_id'] == project['id'] for v in self.all('export'))):
+            # 该项目已没有导出文件，状态回到核对结果，避免列表仍显示“已导出”。
+            project['status'] = '已确认' if self.project_reviewed(project) else '待确认'
+            project['updated_at'] = now()
+            self.put('project', project)
+        self.db.commit()
+        # 数据库记录先移除，再删文件；文件删除失败时页面不再显示失效链接。
+        for suffix in ('.docx', '.json'):
+            try:
+                self.path(f'exports/{key}{suffix}').unlink(missing_ok=True)
+            except OSError:
+                pass
+        return {'id': key, 'project_id': item.get('project_id'), 'deleted': True}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1761,23 +1828,46 @@ class Handler(BaseHTTPRequestHandler):
         # compare_digest 只接受 ASCII 字符串；统一转字节，中文口令才能正常比较。
         return secrets.compare_digest(candidate.encode('utf-8'), expected.encode('utf-8'))
 
-    def access_authenticated(self):
-        token = getattr(self.server, 'access_token', None)
-        if not token:
-            return True
+    def request_cookie(self, name):
         cookie = SimpleCookie()
         try:
             cookie.load(self.headers.get('Cookie', ''))
         except Exception:
-            cookie = SimpleCookie()
-        morsel = cookie.get(ACCESS_COOKIE)
-        if morsel and self.server.sessions.valid(unquote(morsel.value)):
+            return None
+        morsel = cookie.get(name)
+        return unquote(morsel.value) if morsel else None
+
+    def trusted_device(self):
+        """已用正确口令登录过的浏览器编号；没有或无效时返回 None。"""
+        trust = getattr(self.server, 'device_trust', None)
+        if not trust:
+            return None
+        return trust.device(self.request_cookie(DEVICE_COOKIE), getattr(self.server, 'access_token', None))
+
+    @staticmethod
+    def bearer_candidates(value):
+        """HTTP 头按 Latin-1 解码；中文口令可直接以 UTF-8 发送，或先做百分号编码。"""
+        values = [value]
+        try:
+            values.append(value.encode('latin-1').decode('utf-8'))
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        if '%' in value:
+            values.append(unquote(value, errors='strict') if value.isascii() else value)
+        return list(dict.fromkeys(values))
+
+    def access_authenticated(self):
+        token = getattr(self.server, 'access_token', None)
+        if not token:
+            return True
+        session = self.request_cookie(ACCESS_COOKIE)
+        if session and self.server.sessions.valid(session):
             return True
         auth = self.headers.get('Authorization', '')
         if auth.startswith('Bearer '):
             guard, source = self.server.login_guard, self.client_source()
             guard.check(source)
-            if self.token_matches(auth[7:]):
+            if any(self.token_matches(value) for value in self.bearer_candidates(auth[7:])):
                 guard.success(source)
                 return True
             guard.failure(source)
@@ -1821,9 +1911,12 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
         forwarded_proto = (self.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
         ttl = int(self.server.sessions.ttl)
         attrs = f'{ACCESS_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}'
+        device = (f'{DEVICE_COOKIE}={self.server.device_trust.issue(self.server.access_token)}; '
+                  f'Path=/; HttpOnly; SameSite=Lax; Max-Age={DEVICE_TTL}')
         if forwarded_proto == 'https':
             attrs += '; Secure'
-        return [('Set-Cookie', attrs)]
+            device += '; Secure'
+        return [('Set-Cookie', attrs), ('Set-Cookie', device)]
 
     def handle_login(self):
         if self.command == 'GET' or self.command == 'HEAD':
@@ -1853,21 +1946,26 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             token = payload.get('token', '') if isinstance(payload, dict) else ''
         else:
             raise ValueError('请使用登录表单提交口令')
-        guard, source = self.server.login_guard, self.client_source()
+        guard = self.server.login_guard
+        device = self.trusted_device()
+        # 花生壳穿透后所有同事的来源地址相同；登录过的浏览器按设备单独计数，
+        # 不会因陌生来源反复输错而被一起锁住。
+        source, trusted = (f'device:{device}', True) if device else (self.client_source(), False)
+        trusted_hint = '' if trusted else '（曾在本浏览器登录成功的同事不受此限制）'
         try:
-            guard.check(source)
+            guard.check(source, trusted=trusted)
         except LoginLocked as exc:
-            self.audit('login', result='locked')
-            return self.login_page(str(exc), 429)
+            self.audit('login', result='locked', trusted_device=trusted)
+            return self.login_page(str(exc) + trusted_hint, 429)
         if not self.token_matches(token):
-            remaining = guard.failure(source)
-            self.audit('login', result='failed')
+            remaining = guard.failure(source, trusted=trusted)
+            self.audit('login', result='failed', trusted_device=trusted)
             if remaining:
                 return self.login_page(f'口令不正确，还可尝试 {remaining} 次；如忘记口令，请联系本机管理员。', 401)
             try:
-                guard.check(source)
+                guard.check(source, trusted=trusted)
             except LoginLocked as exc:
-                return self.login_page(str(exc), 429)
+                return self.login_page(str(exc) + trusted_hint, 429)
             return self.login_page('口令不正确，请联系本机管理员。', 401)
         guard.success(source)
         self.audit('login', result='ok')
@@ -2076,6 +2174,10 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
                     (method == 'POST' and len(bits) == 4 and bits[3] == 'files')):
                 self.require_local_admin()
                 store.require_material_revision(store.require('material', bits[2]), body)
+            if method == 'POST' and len(bits) == 4 and bits[:2] == ['api', 'exports'] and bits[3] == 'delete':
+                # 导出文件含营业执照、身份证等材料，只能在本机入口或门户管理员处管理。
+                self.require_intranet_files()
+                return self.json_response(store.delete_export(bits[2]))
             if method == 'POST' and len(bits) == 4 and bits[:2] == ['api', 'submissions'] and bits[3] in {'accept', 'reject'}:
                 self.require_reviewer()
                 decide = store.contributions.accept if bits[3] == 'accept' else store.contributions.reject
@@ -2192,6 +2294,8 @@ button{{width:100%;padding:11px 12px;border:0;border-radius:8px;background:#0f76
             self.validate_origin(False)
             self.require_access()
         except AuthRequired as exc:
+            # 未登录请求的正文没有读取；关闭连接，避免正文被当成下一个请求解析。
+            self.close_connection = True
             if path.startswith('/api/') or self.behind_proxy():
                 return self.request_error(exc)
             return self.login_page(str(exc), 401)
@@ -2377,6 +2481,7 @@ def _attach_server(httpd, *, store, bind_host, public, token, access_mode=None, 
     httpd.login_guard = LoginGuard()
     httpd.sessions = Sessions()
     httpd.audit_log = AuditLog(store.root)
+    httpd.device_trust = DeviceTrust(store.root) if token else None
     httpd.access_token = token
     httpd.access_mode = access_mode
     httpd.intranet_port = intranet_port

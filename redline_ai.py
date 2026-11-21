@@ -9,12 +9,16 @@ complete acknowledgment set.
 from __future__ import annotations
 
 import re
+import threading
 from datetime import datetime, timezone
 
 import redline_scan
 import writing_model
 
 MAX_REVIEW_CHARS = 400000
+# 同一项目同时只运行一次模型核对；重复点击不会重复调用模型、产生额外费用。
+_RUNNING = set()
+_RUNNING_LOCK = threading.Lock()
 VERDICTS = {'satisfied', 'risk', 'unclear'}
 
 INSTRUCTIONS = '''你是投标文件废标红线核对员。输入 JSON 中，redlines 是招标文件解读阶段逐条提取的废标/否决条款，chapters 是已保存的投标正文（含章节路径），materials 是材料核对摘要，system_findings 是本地规则扫描提示。
@@ -162,10 +166,27 @@ def review(store, key):
     The model call runs without the store lock; only the snapshot and publish steps
     hold it, so a slow model cannot freeze other requests.
     """
+    marker = (id(store), key)
+    with _RUNNING_LOCK:
+        if marker in _RUNNING:
+            raise ValueError('本项目的 AI 红线核对正在进行，请稍候刷新查看结果，无需重复提交。')
+        _RUNNING.add(marker)
+    try:
+        return _review(store, key)
+    finally:
+        with _RUNNING_LOCK:
+            _RUNNING.discard(marker)
+
+
+def _review(store, key):
     with store.lock:
         project, framework = redline_scan._context(store, key)
         current = redline_scan.evaluate(project, framework, redline_scan.material_versions(store))
-        context = build_context(project, framework, current)
+        import writing_chat
+        imported = writing_chat.imported_texts(project, framework)
+        context = build_context(dict(project, chapter_texts={**imported, **{
+            k: v for k, v in (project.get('chapter_texts') or {}).items() if str(v or '').strip()}}),
+            framework, current)
         redline_ids = {row['id'] for row in context['redlines']}
         if not redline_ids:
             raise ValueError('本项目未识别到废标红线条款，无需 AI 核对。')
@@ -178,7 +199,7 @@ def review(store, key):
         input_token = current['input_token']
         chapter_ids = {row['id'] for row in context['chapters']}
         chapter_texts = {row['id']: row['text'] for row in context['chapters']}
-    result = writing_model.complete_json(INSTRUCTIONS, context, SCHEMA)
+    result = writing_model.complete_json(INSTRUCTIONS, context, SCHEMA, model=writing_model.redline_model())
     cleaned = _clean_items(result, redline_ids, chapter_ids, chapter_texts)
     with store.lock:
         project, framework = redline_scan._context(store, key)

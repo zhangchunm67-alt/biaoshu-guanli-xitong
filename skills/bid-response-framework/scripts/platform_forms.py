@@ -32,7 +32,7 @@ def volume_items(nodes):
         for item in nodes[i+1:]:
             if not item.full:
                 continue
-            label = re.split(r'[（(]', item.text, 1)[0].strip(' ：:')
+            label = re.split(r'[（(]', item.text, maxsplit=1)[0].strip(' ：:')
             if (item.tag != 'p' or VOLUME.fullmatch(item.text) or len(label) > 42
                     or re.search(r'[。；，：:]', label)):
                 break

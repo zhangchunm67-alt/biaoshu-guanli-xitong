@@ -93,7 +93,7 @@ const tenderFlow = (() => {
     return `<nav class="wf-stepper wf-stepper-fork" aria-label="投标文件编制步骤">${steps.map((label,i)=>{
       const n=i+2;
       // Keep later steps clickable: setStep sends the user back to the unfinished gate.
-      return `<button type="button" data-wf="step" data-id="${n}" class="wf-step ${n===current?'is-current':available(n)&&n<current?'is-done':''}" ${n===current?'aria-current="step"':''} ${ui.busy?'disabled':''}><span class="wf-number">${i+1}</span><span class="wf-label">${label}</span></button>`;
+      return `<button type="button" data-wf="step" data-id="${n}" class="wf-step ${n===current?'is-current':available(n)&&n<current?'is-done':''}" ${n===current?'aria-current="step"':''} ${ui.busy?'disabled':''}><span class="wf-number">${'一二三'[i]}</span><span class="wf-label">${label}</span></button>`;
     }).join('')}<div class="wf-fork ${ui.step===5?'is-b-current':''}" role="group" aria-label="系统填充后的两条路径">
       <button type="button" data-wf="export" class="wf-step wf-branch wf-branch-a ${exportReady?'is-available':''}" ${!exportReady||ui.busy?'disabled':''} title="${exportReady?'直接导出半成品标书':'完成文字和图片材料核对并保存后可导出半成品标书'}"><span class="wf-number">A</span><span class="wf-label">导出半成品标书</span></button>
       <button type="button" data-wf="step" data-id="5" class="wf-step wf-branch wf-branch-b ${ui.step===5?'is-current':''}" ${ui.step===5?'aria-current="step"':''} ${ui.busy?'disabled':''}><span class="wf-number">B</span><span class="wf-label">${writingStep}</span></button>
@@ -668,7 +668,7 @@ const tenderFlow = (() => {
           ${wfButton('查看内部阶段预览','stage-preview',{subtle:true})}
           ${wfButton('导出待补初稿','formal-export',{id:'draft',subtle:true})}
           ${wfButton('导出已核对版','formal-export',{id:'reviewed',primary:true})}
-        </div>${(state.project.exports||[]).length?`<ul>${state.project.exports.map(item=>`<li><a href="${esc(item.download_url)}" download>${esc(item.filename)}</a> <a href="${esc(item.report_url)}">核对报告</a></li>`).join('')}</ul>`:''}
+        </div>${(state.project.exports||[]).length?`<ul class="wf-export-list">${state.project.exports.map(item=>`<li><a href="${esc(item.download_url)}" download>${esc(item.filename)}</a> <a href="${esc(item.report_url)}">核对报告</a> ${deleteExportButton(item)}</li>`).join('')}</ul>`:''}
       </section>`:'');
   }
   let chatTimer=null;
@@ -1259,6 +1259,8 @@ const tenderFlow = (() => {
       if(ui.edits.size)await saveDrafts();
       const scan=await api(redlineUrl(state.project.id)+'/ai-review',{method:'POST',body:{}});
       if(ui!==currentUi)return;
+      // A status read started before this review may still be in flight; it must not overwrite the result.
+      redlineRequest++;
       bindRedline(scan,ui.redline);
       toast(scan.complete?'AI 红线核对完成，合格项已自动过关。'
         :`AI 红线核对完成；仍有 ${scan.pending_count||0} 条待修复材料、补正文或人工覆盖。`);
@@ -1282,6 +1284,7 @@ const tenderFlow = (() => {
     try{
       const scan=await api(redlineUrl(state.project.id),{method:'POST',body:{
         mapping_revision:ui.redline.mapping_revision,review_revision:ui.redline.review_revision,acknowledged}});
+      redlineRequest++;
       bindRedline(scan);
       if(!quiet)toast(ui.redline.complete?'废标红线已全部通过。':`已保存；仍有 ${ui.redline.pending_count} 条红线待确认。`);
     }catch(err){
@@ -1548,7 +1551,9 @@ const tenderFlow = (() => {
         const submit=form.querySelector('button[type=submit]');submit.disabled=true;
         try{
           await api(draftsUrl(key),{method:'PATCH',body:{revision:editor.revision,mapping_revision:ui.chat?.mapping_revision||state.project.mapping_revision,chapters:[{id:form.elements.chapter.value,text:form.elements.text.value}]}});
-          submit.disabled=false;closeModal();await readChat();toast('正文已保存。');
+          submit.disabled=false;closeModal();
+          // Confirm the save at once; a later toast (e.g. an export blocked by redlines) must not be overwritten by it.
+          toast('正文已保存。');await readChat();
         }catch(err){toast(err.message,true);}
         finally{submit.disabled=false;}
       };
@@ -1825,5 +1830,8 @@ const tenderFlow = (() => {
   function projectArchives() {
     return archiveLinks(ui.library.flatMap(r=>r.legacy_projects||[]));
   }
-  return {view,enter,url,resumeProject,beforeLeave,setStep,projectArchives,isPreview:()=>ui.step===3&&!ui.archive&&!ui.calibrationOpen,calibrationState,loadLibrary,calibrationProjects,openCalibration,ensureRedlineForExport};
+  function forgetExport(id){
+    if(ui.archive?.project?.exports)ui.archive.project.exports=ui.archive.project.exports.filter(item=>item.id!==id);
+  }
+  return {view,enter,url,resumeProject,beforeLeave,setStep,projectArchives,isPreview:()=>ui.step===3&&!ui.archive&&!ui.calibrationOpen,calibrationState,loadLibrary,calibrationProjects,openCalibration,ensureRedlineForExport,forgetExport};
 })();
